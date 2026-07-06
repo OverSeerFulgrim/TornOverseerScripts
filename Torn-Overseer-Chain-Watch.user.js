@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.1.2
+// @version      0.1.3
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
@@ -13,6 +13,8 @@
 // @connect      localhost
 // @connect      127.0.0.1
 // @run-at       document-end
+// @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
+// @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // ==/UserScript==
 
 (function () {
@@ -21,7 +23,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.1.2";
+  const VERSION = "0.1.3";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
@@ -34,6 +36,7 @@
     anonKey: "tocw_anon_key",
     sessionToken: "tocw_session_token",
     collapsed: "tocw_collapsed",
+    position: "tocw_position",
   };
 
   const state = {
@@ -82,6 +85,42 @@
   function readBool(key, fallback) {
     const value = gmGet(key, fallback);
     return typeof value === "boolean" ? value : fallback;
+  }
+
+  function readPosition() {
+    const value = gmGet(STORE.position, null);
+    if (!value || typeof value !== "object") return null;
+    const left = Number(value.left);
+    const top = Number(value.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    return { left, top };
+  }
+
+  function clampPosition(left, top, width = 260, height = 120) {
+    const margin = 8;
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    return {
+      left: Math.min(Math.max(margin, left), maxLeft),
+      top: Math.min(Math.max(margin, top), maxTop),
+    };
+  }
+
+  function applyPanelPosition(box) {
+    const position = readPosition();
+    if (!position) return;
+    const rect = box.getBoundingClientRect();
+    const next = clampPosition(position.left, position.top, rect.width || 260, rect.height || 120);
+    box.style.left = `${next.left}px`;
+    box.style.top = `${next.top}px`;
+    box.style.right = "auto";
+    box.style.bottom = "auto";
+  }
+
+  function savePanelPosition(box) {
+    const rect = box.getBoundingClientRect();
+    const next = clampPosition(rect.left, rect.top, rect.width, rect.height);
+    gmSet(STORE.position, next);
   }
 
   function pdaApiKey() {
@@ -452,7 +491,8 @@
       #tocw button.primary, #tocw-modal button.primary { background: #ff3b45; border-color: #ff3b45; }
       #tocw button.small { padding: 4px 7px; font-size: 11px; }
       #tocw button:disabled { opacity: .55; cursor: wait; }
-      .tocw-head { padding: 14px 14px 10px; border-bottom: 1px solid #25384d; }
+      .tocw-head { padding: 14px 14px 10px; border-bottom: 1px solid #25384d; cursor: move; touch-action: none; user-select: none; }
+      .tocw-head button { cursor: pointer; }
       .tocw-title { font-size: 19px; font-weight: 800; margin: 0 0 5px; }
       .tocw-muted { color: #9eb4ce; font-size: 12px; line-height: 1.35; }
       .tocw-pills { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
@@ -479,7 +519,13 @@
       .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; }
       .tocw-table th, .tocw-table td { text-align: right; padding: 5px 4px; border-top: 1px solid #25384d; }
       .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; }
-      #tocw.collapsed { width: 260px; }
+      #tocw.collapsed { width: 210px; max-height: none; overflow: visible; }
+      #tocw.collapsed .tocw-head { padding: 10px; border-bottom: 0; }
+      #tocw.collapsed .tocw-pills { margin-bottom: 6px; }
+      #tocw.collapsed .tocw-pills .tocw-pill:nth-child(n+2) { display: none; }
+      #tocw.collapsed .tocw-title { font-size: 16px; margin-bottom: 2px; }
+      #tocw.collapsed .tocw-muted { max-width: 126px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #tocw.collapsed #tocw-collapse { padding: 5px 8px; font-size: 12px; }
       #tocw.collapsed .tocw-body { display: none; }
       #tocw-backdrop {
         position: fixed;
@@ -527,7 +573,47 @@
       const box = document.createElement("div");
       box.id = "tocw";
       document.body.appendChild(box);
+      applyPanelPosition(box);
     }
+  }
+
+  function bindDrag(box) {
+    const handle = document.getElementById("tocw-drag-handle");
+    if (!handle || handle.dataset.bound === "1") return;
+    handle.dataset.bound = "1";
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button != null && event.button !== 0) return;
+      if (event.target?.closest?.("button, input, textarea, select, a, summary")) return;
+      const rect = box.getBoundingClientRect();
+      const offsetX = event.clientX - rect.left;
+      const offsetY = event.clientY - rect.top;
+      box.style.left = `${rect.left}px`;
+      box.style.top = `${rect.top}px`;
+      box.style.right = "auto";
+      box.style.bottom = "auto";
+      handle.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+
+      const move = (moveEvent) => {
+        const next = clampPosition(
+          moveEvent.clientX - offsetX,
+          moveEvent.clientY - offsetY,
+          box.offsetWidth,
+          box.offsetHeight,
+        );
+        box.style.left = `${next.left}px`;
+        box.style.top = `${next.top}px`;
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        savePanelPosition(box);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointercancel", up, { once: true });
+    });
   }
 
   function render() {
@@ -551,7 +637,7 @@
     const { current, next } = currentAndNextShift();
 
     box.innerHTML = `
-      <div class="tocw-head">
+      <div class="tocw-head" id="tocw-drag-handle" title="Drag to move Chain Watch">
         <div class="tocw-pills">
           <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE TORN API" : "SCHEDULED"}</span>
           <span class="tocw-pill">SITE SYNC</span>
@@ -594,6 +680,7 @@
     for (const btn of box.querySelectorAll("[data-tocw-action]")) {
       btn.addEventListener("click", () => void handleAction(btn));
     }
+    bindDrag(box);
     if (state.settingsOpen) {
       if (!document.getElementById("tocw-modal")) renderSettings();
     } else {
