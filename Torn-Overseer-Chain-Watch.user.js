@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.1.1
+// @version      0.1.2
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
@@ -21,9 +21,10 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.1.1";
+  const VERSION = "0.1.2";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
+  const PDA_API_KEY = "###PDA-APIKEY###";
   const COMMENT = "TornOverseerChainWatch";
   const BONUS_MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000];
 
@@ -83,11 +84,15 @@
     return typeof value === "boolean" ? value : fallback;
   }
 
+  function pdaApiKey() {
+    return PDA_API_KEY && !PDA_API_KEY.includes("###") ? PDA_API_KEY.trim() : "";
+  }
+
   function settings() {
     const functionsUrl = readString(STORE.functionsUrl).trim() || DEFAULT_FUNCTIONS_URL;
     const anonKey = readString(STORE.anonKey).trim() || DEFAULT_ANON_KEY;
     return {
-      tornKey: readString(STORE.tornKey).trim(),
+      tornKey: readString(STORE.tornKey).trim() || pdaApiKey(),
       functionsUrl,
       anonKey,
       sessionToken: readString(STORE.sessionToken).trim(),
@@ -116,7 +121,55 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  function parseHttpJson(status, responseText, url) {
+    let parsed = null;
+    try {
+      parsed = responseText ? JSON.parse(responseText) : null;
+    } catch {
+      throw new Error(`Non-JSON response from ${url}`);
+    }
+    if (status < 200 || status >= 300) {
+      const msg =
+        parsed && typeof parsed === "object" && typeof parsed.error === "string"
+          ? parsed.error
+          : `Request failed (${status})`;
+      throw new Error(msg);
+    }
+    return parsed;
+  }
+
+  async function requestJsonWithTornPda(url, options = {}) {
+    const method = options.method || "GET";
+    const headers = options.headers || {};
+    const data = options.body == null ? undefined : JSON.stringify(options.body);
+    const post = window.PDA_httpPost;
+    const get = window.PDA_httpGet;
+    const res = method === "POST"
+      ? await post(url, headers, data || "")
+      : await get(url, headers);
+    const status = Number(res?.status ?? res?.statusCode ?? 200);
+    const responseText = String(res?.responseText ?? res?.body ?? res ?? "");
+    return parseHttpJson(status, responseText, url);
+  }
+
+  async function requestJsonWithFetch(url, options = {}) {
+    const method = options.method || "GET";
+    const headers = options.headers || {};
+    const body = options.body == null ? undefined : JSON.stringify(options.body);
+    const res = await fetch(url, { method, headers, body });
+    const text = await res.text();
+    return parseHttpJson(res.status, text, url);
+  }
+
   function requestJson(url, options = {}) {
+    if (
+      typeof window.PDA_httpGet === "function" &&
+      ((options.method || "GET") === "GET" || typeof window.PDA_httpPost === "function")
+    ) {
+      return requestJsonWithTornPda(url, options);
+    }
+    if (typeof GM_xmlhttpRequest !== "function") return requestJsonWithFetch(url, options);
+
     const method = options.method || "GET";
     const headers = options.headers || {};
     const data = options.body == null ? undefined : JSON.stringify(options.body);
@@ -128,22 +181,11 @@
         data,
         timeout: options.timeout || 25000,
         onload: (res) => {
-          let parsed = null;
           try {
-            parsed = res.responseText ? JSON.parse(res.responseText) : null;
-          } catch {
-            reject(new Error(`Non-JSON response from ${url}`));
-            return;
+            resolve(parseHttpJson(res.status, res.responseText, url));
+          } catch (error) {
+            reject(error);
           }
-          if (res.status < 200 || res.status >= 300) {
-            const msg =
-              parsed && typeof parsed === "object" && typeof parsed.error === "string"
-                ? parsed.error
-                : `Request failed (${res.status})`;
-            reject(new Error(msg));
-            return;
-          }
-          resolve(parsed);
         },
         onerror: () => reject(new Error(`Network error calling ${url}`)),
         ontimeout: () => reject(new Error(`Timed out calling ${url}`)),
@@ -774,7 +816,7 @@
         Data Sharing: Torn API requests go to api.torn.com; shift signup goes to your configured Overseer backend.
         Purpose: scheduled chain countdown, watcher shifts, live chain timer, and read-only chain summaries.
       </p>
-      <label>Torn API key
+      <label>Torn API key ${pdaApiKey() ? "(from TornPDA)" : ""}
         <input id="tocw-set-torn-key" type="password" value="${escapeHtml(cfg.tornKey)}" autocomplete="off" />
       </label>
       <label>Site session token
