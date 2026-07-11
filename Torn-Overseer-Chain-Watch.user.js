@@ -1,20 +1,18 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.1.3
+// @version      0.1.5
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
+// @author       OverSeerFulgrim
+// @license      MIT
+// @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @connect      api.torn.com
 // @connect      ijolgywtybadfuvyopeg.supabase.co
-// @connect      *.supabase.co
-// @connect      localhost
-// @connect      127.0.0.1
 // @run-at       document-end
-// @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
-// @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // ==/UserScript==
 
 (function () {
@@ -23,7 +21,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.1.3";
+  const VERSION = "0.1.5";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
@@ -971,8 +969,8 @@
     const launcher = document.createElement("button");
     launcher.id = "tocw-launcher";
     launcher.type = "button";
-    launcher.textContent = "CW";
-    launcher.title = "Open Chain Watch";
+    launcher.textContent = "TO";
+    launcher.title = "Open Torn Overseer";
     launcher.style.cssText = [
       "position:fixed",
       "left:58px",
