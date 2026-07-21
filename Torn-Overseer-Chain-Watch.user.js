@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.2.0
+// @version      0.3.0
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -9,6 +9,7 @@
 // @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @match        https://www.torn.com/*
+// @match        https://torn-overseer-v2.pages.dev/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -24,8 +25,11 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.2.0";
+  const VERSION = "0.3.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
+  // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
+  // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
+  const OVERSEER_HOST = "torn-overseer-v2.pages.dev";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
@@ -37,6 +41,9 @@
     functionsUrl: "tocw_functions_url",
     anonKey: "tocw_anon_key",
     sessionToken: "tocw_session_token",
+    signupToken: "tocw_signup_token",
+    claimSecret: "tocw_claim_secret",
+    signupIdentity: "tocw_signup_identity",
     collapsed: "tocw_collapsed",
     position: "tocw_position",
   };
@@ -44,7 +51,9 @@
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
   // in page (torn.com) localStorage, which the site's own scripts can read. If GM
   // storage is unavailable we refuse to persist them rather than leak to the page.
-  const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
+  // The signup token is a capability (posted in faction chat, but still) and the claim
+  // secret proves ownership of a slot, so both are GM-only too.
+  const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken, STORE.signupToken, STORE.claimSecret]);
 
   function hasGmStorage() {
     return typeof GM_getValue === "function" && typeof GM_setValue === "function";
@@ -55,6 +64,7 @@
     error: null,
     notice: null,
     watch: null,
+    signup: null,
     chain: null,
     attacks: null,
     fetchedAt: null,
@@ -181,7 +191,71 @@
       functionsUrl,
       anonKey,
       sessionToken: readString(STORE.sessionToken).trim(),
+      signupToken: readString(STORE.signupToken).trim(),
     };
+  }
+
+  function isOverseerSite() {
+    return location.host === OVERSEER_HOST;
+  }
+
+  // Grab the capability token from a /chain/e/:token link the user opened on the
+  // Overseer site and stash it in (shared) GM storage so the torn.com panel picks it
+  // up. Token entry is never manual — this is the one-click bind.
+  function captureSignupToken() {
+    const m = location.pathname.match(/\/chain\/e\/([^/?#]+)/);
+    if (!m) return null;
+    let token = m[1];
+    try {
+      token = decodeURIComponent(m[1]);
+    } catch {
+      /* keep raw */
+    }
+    token = String(token).trim();
+    if (token && token.length <= 128) {
+      gmSet(STORE.signupToken, token);
+      return token;
+    }
+    return null;
+  }
+
+  // Pull a token out of a pasted signup LINK or a raw token (last-resort manual entry).
+  function extractSignupToken(input) {
+    const s = String(input || "").trim();
+    if (!s) return "";
+    const m = s.match(/\/chain\/e\/([^/?#]+)/);
+    let token = m ? m[1] : s;
+    try {
+      token = decodeURIComponent(token);
+    } catch {
+      /* keep raw */
+    }
+    return String(token).trim().slice(0, 128);
+  }
+
+  // A per-device claim secret so ONLY this device can release its own slot claims.
+  function ensureClaimSecret() {
+    let secret = readString(STORE.claimSecret).trim();
+    if (secret.length >= 8) return secret;
+    const bytes = new Uint8Array(16);
+    (self.crypto || window.crypto).getRandomValues(bytes);
+    secret = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    gmSet(STORE.claimSecret, secret);
+    return secret;
+  }
+
+  function getSignupIdentity() {
+    const value = gmGet(STORE.signupIdentity, null);
+    return value && typeof value === "object" ? value : null;
+  }
+
+  // Which surface the panel shows: a connected session (manager/member) wins; else a
+  // captured signup token drives anon token mode; else nothing to show yet.
+  function panelMode() {
+    const cfg = settings();
+    if (cfg.sessionToken) return "session";
+    if (cfg.signupToken) return "token";
+    return "none";
   }
 
   // Returns true if the secrets (key + session) were persisted; false means GM
@@ -368,6 +442,20 @@
     }
   }
 
+  // Public chain-signup capability API — header-less (Content-Type only), token in the
+  // body, NO session or Torn key. This is the anon token-mode path.
+  async function callSignup(action, extra = {}) {
+    const cfg = settings();
+    const token = cfg.signupToken;
+    if (!token) throw new Error("No signup link captured yet.");
+    const base = (cfg.functionsUrl || DEFAULT_FUNCTIONS_URL).replace(/\/+$/, "");
+    return requestJson(`${base}/chain-signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: { action, token, ...extra },
+    });
+  }
+
   async function connectSiteFromTornKey() {
     const cfg = settings();
     if (!cfg.tornKey) throw new Error("Add your Torn API key first.");
@@ -400,6 +488,26 @@
       modifier: num(c.modifier) ?? 0,
       cooldown: num(c.cooldown) ?? 0,
       fetchedAt: Date.now(),
+    };
+  }
+
+  // Convert the server-served live_chain block (token mode) into the same shape
+  // parseChain produces, anchoring the countdown to when the SERVER cached it so the
+  // client timer stays honest without a Torn key.
+  function signupLiveChain(res) {
+    const lc = res && res.live_chain && res.live_chain.chain;
+    if (!lc || typeof lc !== "object") return null;
+    const current = num(lc.current) ?? 0;
+    const timeout = num(lc.timeout) ?? 0;
+    const cachedAt = res.live_chain.fetched_at ? new Date(res.live_chain.fetched_at).getTime() : NaN;
+    return {
+      active: current > 0 && timeout > 0,
+      current,
+      max: num(lc.max) ?? 0,
+      timeout,
+      modifier: num(lc.modifier) ?? 0,
+      cooldown: num(lc.cooldown) ?? 0,
+      fetchedAt: Number.isFinite(cachedAt) ? cachedAt : Date.now(),
     };
   }
 
@@ -451,6 +559,10 @@
     render();
     try {
       const cfg = settings();
+      const mode = panelMode();
+      // Clear the inactive surface so a mode switch never renders stale data.
+      if (mode === "token") state.watch = null;
+      else state.signup = null;
       const tasks = [];
       if (cfg.tornKey) {
         tasks.push(
@@ -474,7 +586,7 @@
             }),
         );
       }
-      if (cfg.functionsUrl && cfg.anonKey && cfg.sessionToken) {
+      if (mode === "session") {
         tasks.push(
           callFunction("chain-watch", { action: "get" })
             .then((res) => {
@@ -483,6 +595,23 @@
             .catch((e) => {
               state.watch = null;
               state.error = e.message || "Could not load Chain Watch schedule.";
+            }),
+        );
+      }
+      if (mode === "token") {
+        tasks.push(
+          callSignup("get")
+            .then((res) => {
+              state.signup = res;
+              // No Torn key → drive the chain HUD from the server live-chain block.
+              if (!cfg.tornKey) {
+                state.chain = signupLiveChain(res);
+                state.fetchedAt = Date.now();
+              }
+            })
+            .catch((e) => {
+              state.signup = null;
+              state.error = e.message || "Could not load the signup sheet.";
             }),
         );
       }
@@ -725,7 +854,8 @@
     box.classList.toggle("collapsed", state.collapsed);
 
     const cfg = settings();
-    const event = state.watch?.event || null;
+    const event = state.watch?.event || state.signup?.event || null;
+    const mode = panelMode();
     const chain = state.chain;
     const live = Boolean(chain?.active);
     const currentHits = chain?.current || 0;
@@ -749,7 +879,7 @@
     box.innerHTML = `
       <div class="tocw-head" id="tocw-drag-handle" title="Drag to move Chain Watch">
         <div class="tocw-pills">
-          <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE TORN API" : "SCHEDULED"}</span>
+          <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE" : "SCHEDULED"}</span>
           <span class="tocw-pill">SITE SYNC</span>
           <span class="tocw-pill">READ-ONLY</span>
         </div>
@@ -765,7 +895,13 @@
         ${state.error ? `<div class="tocw-alert bad">${escapeHtml(state.error)}</div>` : ""}
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
         ${versionAlert}
-        ${!cfg.tornKey || !cfg.sessionToken ? `<div class="tocw-alert">Add your Torn API key, connect the site session, then refresh.</div>` : ""}
+        ${mode === "token"
+          ? `<div class="tocw-alert">Signed in via link${event ? ` — ${escapeHtml(event.title)}` : ""}. No Torn key or session needed.</div>`
+          : mode === "none"
+            ? `<div class="tocw-alert">Open a chain-watch signup link, or add your Torn API key and connect the site session in Settings.</div>`
+            : !cfg.sessionToken
+              ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
+              : ""}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
         <div class="tocw-actions">
@@ -873,6 +1009,7 @@
   }
 
   function renderShifts() {
+    if (panelMode() === "token") return renderSignupShifts();
     const shifts = state.watch?.shifts || [];
     const viewer = state.watch?.viewer || {};
     if (!state.watch?.event) return "";
@@ -937,7 +1074,103 @@
     `;
   }
 
+  // --- Token mode (anon signup via link) --------------------------------------
+
+  function renderSignupShifts() {
+    const signup = state.signup;
+    if (!signup || !signup.event) return "";
+    const shifts = signup.shifts || [];
+    const identity = getSignupIdentity();
+    const canClaim = Boolean(signup.can_claim);
+    return `
+      <div class="tocw-card">
+        <div class="tocw-card-title">Chainwatch shifts</div>
+        ${identity && identity.name ? `<div class="tocw-muted">Signing up as ${escapeHtml(identity.name)}${identity.id == null ? " (unverified)" : ""}</div>` : ""}
+        ${shifts.map((shift) => `
+          <div class="tocw-row">
+            <div class="tocw-muted">${shiftLabel(shift)}</div>
+            ${renderSignupSlot(shift, "main", canClaim, identity)}
+            ${renderSignupSlot(shift, "backup", canClaim, identity)}
+          </div>
+        `).join("")}
+        ${!canClaim ? `<div class="tocw-muted">Signups are closed for this chain.</div>` : ""}
+      </div>
+    `;
+  }
+
+  function renderSignupSlot(shift, role, canClaim, identity) {
+    const slot = (role === "backup" ? shift.backup : shift.main) || {};
+    const roleLabel = role === "backup" ? "Backup" : "Main";
+    const filled = Boolean(slot.filled);
+    const locked = Boolean(slot.locked);
+    const mine = filled && identity && identity.id != null && Number(slot.watcher_id) === Number(identity.id);
+    const btn = (act, label) => `<button class="small" data-tocw-action="${act}" data-shift="${shift.id}" data-role="${role}">${label}</button>`;
+
+    const actions = [];
+    if (!locked && canClaim) {
+      if (!filled) actions.push(btn("signup", "Sign up"));
+      else if (mine) actions.push(btn("release", "Leave"));
+    }
+
+    const who = filled
+      ? `<span class="tocw-dot ${statusClass(slot.online_status)}"></span>${escapeHtml(slot.watcher_name || `ID ${slot.watcher_id}`)}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
+      : locked
+        ? `<span class="tocw-muted">Locked</span>`
+        : `<span class="tocw-muted">Open</span>`;
+
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
+        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
+        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
+        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
+      </div>
+    `;
+  }
+
+  // Pick (once) who this device is signing up as, from the event roster. A roster
+  // match is a VERIFIED claim (player_id); anything else is an unverified free-name
+  // claim. Remembered in GM storage so later claims/releases reuse it.
+  function resolveSignupIdentity() {
+    const existing = getSignupIdentity();
+    if (existing && existing.name) return existing;
+    const roster = state.signup?.roster || [];
+    const input = prompt("Sign up as — type your Torn name exactly as it appears on the faction roster:");
+    if (input == null) return null;
+    const name = input.trim();
+    if (!name) return null;
+    const match = roster.find((m) => String(m.name).toLowerCase() === name.toLowerCase());
+    const identity = match ? { id: match.id, name: match.name } : { id: null, name: name.slice(0, 40) };
+    gmSet(STORE.signupIdentity, identity);
+    return identity;
+  }
+
+  async function handleSignupAction(btn) {
+    const action = btn.getAttribute("data-tocw-action");
+    const shiftId = Number(btn.getAttribute("data-shift"));
+    const role = btn.getAttribute("data-role") === "backup" ? "backup" : "main";
+    try {
+      if (action === "signup") {
+        const identity = resolveSignupIdentity();
+        if (!identity) return;
+        const extra = { shift_id: shiftId, role, claim_secret: ensureClaimSecret() };
+        if (identity.id != null) extra.player_id = identity.id;
+        else extra.free_name = identity.name;
+        state.signup = await callSignup("claim", extra);
+        state.notice = role === "backup" ? "Backup slot claimed." : "Shift claimed.";
+      } else if (action === "release") {
+        state.signup = await callSignup("release", { shift_id: shiftId, role, claim_secret: ensureClaimSecret() });
+        state.notice = "Slot released.";
+      }
+      render();
+    } catch (e) {
+      state.error = e.message || "Action failed.";
+      render();
+    }
+  }
+
   async function handleAction(btn) {
+    // Token mode uses the public chain-signup endpoints, not the session chain-watch.
+    if (panelMode() === "token") return handleSignupAction(btn);
     const action = btn.getAttribute("data-tocw-action");
     const shiftId = Number(btn.getAttribute("data-shift"));
     const role = btn.getAttribute("data-role") === "backup" ? "backup" : "main";
@@ -1020,7 +1253,7 @@
   }
 
   async function copySummary() {
-    const event = state.watch?.event;
+    const event = state.watch?.event || state.signup?.event;
     const chain = state.chain;
     const { current, next } = currentAndNextShift();
     const lines = [
@@ -1065,6 +1298,20 @@
       <label>Site session token
         <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
       </label>
+      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+        <div style="font-weight:700;">Signup link (token mode)</div>
+        <div class="tocw-muted" style="margin:4px 0 8px;">
+          ${cfg.signupToken
+            ? "Linked to a signup event. Just open the link leadership posts to switch events — no key needed."
+            : "Open a chain-watch signup link (from faction chat) once to bind this panel. No key or session needed."}
+        </div>
+        <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
+          <label style="margin:0;">Paste a link or token (fallback)
+            <input id="tocw-set-signup" value="" autocomplete="off" placeholder="https://${OVERSEER_HOST}/chain/e/…" />
+          </label>
+          <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
+        </div>
+      </div>
       <details style="margin-top:10px;">
         <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Advanced backend settings</summary>
         <div class="grid" style="margin-top:10px;">
@@ -1098,11 +1345,22 @@
     backdrop.addEventListener("click", close);
     document.getElementById("tocw-modal-close")?.addEventListener("click", close);
     document.getElementById("tocw-modal-save")?.addEventListener("click", () => {
-      if (saveSettings(collect())) {
-        state.notice = "Settings saved.";
+      const ok = saveSettings(collect());
+      // Last-resort manual link entry: bind a pasted signup link/token.
+      const pasted = extractSignupToken(valueOf("tocw-set-signup"));
+      if (pasted) gmSet(STORE.signupToken, pasted);
+      if (ok) {
+        state.notice = pasted ? "Signup link saved." : "Settings saved.";
       } else {
         state.error = "Install Tampermonkey or use Torn PDA — your key and session can't be stored securely otherwise, so they were not saved.";
       }
+      close();
+    });
+    document.getElementById("tocw-signup-clear")?.addEventListener("click", () => {
+      gmSet(STORE.signupToken, "");
+      gmSet(STORE.signupIdentity, null);
+      state.signup = null;
+      state.notice = "Signup link cleared.";
       close();
     });
     document.getElementById("tocw-modal-connect")?.addEventListener("click", async () => {
@@ -1158,9 +1416,34 @@
     document.body.appendChild(launcher);
   }
 
+  // On the Overseer site we ONLY capture the signup token from a /chain/e/:token link
+  // and hand off to the torn.com panel — never render our own UI over the site's app.
+  function bootOverseerCapture() {
+    migrateSecretsFromLocalStorage();
+    const token = captureSignupToken();
+    if (token) showCaptureToast();
+  }
+
+  function showCaptureToast() {
+    if (document.getElementById("tocw-capture-toast")) return;
+    const toast = document.createElement("div");
+    toast.id = "tocw-capture-toast";
+    toast.textContent = "Chain Watch: this event is now linked in your in-game panel. Open Torn to sign up from the game.";
+    toast.style.cssText =
+      "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;" +
+      "max-width:min(92vw,420px);background:#111;color:#fff;border:1px solid #3a3a3a;border-radius:10px;" +
+      "padding:12px 16px;font:14px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.4);";
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 8000);
+  }
+
   function boot() {
     if (!document.body) {
       setTimeout(boot, 100);
+      return;
+    }
+    if (isOverseerSite()) {
+      bootOverseerCapture();
       return;
     }
     console.info("[Torn Overseer Chain Watch] loaded", location.href);
