@@ -31,9 +31,11 @@ automatically — you don't paste one.
 
 You have two ways in; pick whichever fits.
 
-**Token mode (no key, no account) —** open a chain-watch signup **link** that leadership posts in
-faction chat once. The panel binds to that event and works with no Torn key and no Overseer
-session: sign up for shifts, watch the live chain, see the leaderboard. This is the simplest path.
+**Link mode —** open a chain-watch signup **link** that leadership posts in faction chat once.
+The panel binds to that event. **Viewing** the sheet, live chain, and leaderboard needs no key.
+**Signing up** authenticates with your limited Torn key (Torn PDA provides it automatically) so
+your claim is recorded as a verified member of the correct faction — no account or site signup
+needed. Add the key once in **Settings** and the link handles the rest.
 
 **Session mode (managers / full schedule) —**
 

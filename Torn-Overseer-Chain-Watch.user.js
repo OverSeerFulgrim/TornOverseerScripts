@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.5.0
+// @version      0.6.0
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard. No Torn API key needed for data — the Overseer backend serves it.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -24,7 +24,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.5.0";
+  const VERSION = "0.6.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -231,28 +231,21 @@
     return String(token).trim().slice(0, 128);
   }
 
-  // A per-device claim secret so ONLY this device can release its own slot claims.
-  function ensureClaimSecret() {
-    let secret = readString(STORE.claimSecret).trim();
-    if (secret.length >= 8) return secret;
-    const bytes = new Uint8Array(16);
-    (self.crypto || window.crypto).getRandomValues(bytes);
-    secret = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-    gmSet(STORE.claimSecret, secret);
-    return secret;
-  }
-
   function getSignupIdentity() {
     const value = gmGet(STORE.signupIdentity, null);
     return value && typeof value === "object" ? value : null;
   }
 
-  // Which surface the panel shows: a connected session (manager/member) wins; else a
-  // captured signup token drives anon token mode; else nothing to show yet.
+  // Which surface the panel shows. A captured signup link drives WHICH event, so it
+  // wins (token mode): viewing is open, and signing up authenticates with the key
+  // (session) to record a VERIFIED, faction-checked claim for that event. Without a
+  // link, a session shows the faction's current event (session mode, full manager
+  // controls). Managers who captured a link can Clear it in Settings to get those
+  // controls back. Nothing configured yet -> none.
   function panelMode() {
     const cfg = settings();
-    if (cfg.sessionToken) return "session";
     if (cfg.signupToken) return "token";
+    if (cfg.sessionToken) return "session";
     return "none";
   }
 
@@ -416,16 +409,32 @@
 
   // Public chain-signup capability API — header-less (Content-Type only), token in the
   // body, NO session or Torn key. This is the anon token-mode path.
-  async function callSignup(action, extra = {}) {
+  // Public chain-signup call. Viewing is header-less (anonymous). For a claim/release
+  // the caller passes a sessionToken -> we add X-Session-Token so the backend records
+  // a VERIFIED, faction-checked member claim (never anonymous free-text from here).
+  async function callSignup(action, extra = {}, sessionToken) {
     const cfg = settings();
     const token = cfg.signupToken;
     if (!token) throw new Error("No signup link captured yet.");
     const base = (cfg.functionsUrl || DEFAULT_FUNCTIONS_URL).replace(/\/+$/, "");
+    const headers = { "Content-Type": "application/json" };
+    if (sessionToken) headers["X-Session-Token"] = sessionToken;
     return requestJson(`${base}/chain-signup`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: { action, token, ...extra },
     });
+  }
+
+  // The session (from the Torn key) is what verifies a signup. Return it, minting one
+  // from the stored/PDA key on demand; if there's no key, tell the member to add one.
+  async function ensureVerifiedSession() {
+    const cfg = settings();
+    if (cfg.sessionToken) return cfg.sessionToken;
+    if (!cfg.tornKey) {
+      throw new Error("Add your Torn API key in Settings to sign up — it verifies you're in the faction.");
+    }
+    return await connectSiteFromTornKey();
   }
 
   async function connectSiteFromTornKey() {
@@ -445,6 +454,11 @@
       throw new Error("The site did not return a session token.");
     }
     gmSet(STORE.sessionToken, res.sessionToken);
+    // Remember who the key belongs to (returned by connect-torn-key) so token mode
+    // can show "signed in as X" and know which slots are yours — no Torn call needed.
+    if (res.player && res.player.id != null) {
+      gmSet(STORE.signupIdentity, { id: Number(res.player.id), name: res.player.name || `ID ${res.player.id}` });
+    }
     return res.sessionToken;
   }
 
@@ -818,7 +832,7 @@
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
         ${versionAlert}
         ${mode === "token"
-          ? `<div class="tocw-alert">Signed in via link${event ? ` — ${escapeHtml(event.title)}` : ""}. No Torn key or session needed.</div>`
+          ? `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""}. Anyone can view; signing up verifies you with your Torn key.</div>`
           : mode === "none"
             ? `<div class="tocw-alert">Open a chain-watch signup link, or add your Torn API key and connect the site session in Settings.</div>`
             : !cfg.sessionToken
@@ -1037,7 +1051,11 @@
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">Chainwatch shifts</div>
-        ${identity && identity.name ? `<div class="tocw-muted">Signing up as ${escapeHtml(identity.name)}${identity.id == null ? " (unverified)" : ""}</div>` : ""}
+        ${identity && identity.name
+          ? `<div class="tocw-muted">Signed in as ${escapeHtml(identity.name)} ✓</div>`
+          : canClaim
+            ? `<div class="tocw-muted">Signing up verifies you with your Torn key${settings().tornKey || settings().sessionToken ? "" : " — add it in Settings"}.</div>`
+            : ""}
         ${shifts.map((shift) => `
           <div class="tocw-row">
             <div class="tocw-muted">${shiftLabel(shift)}</div>
@@ -1079,38 +1097,21 @@
     `;
   }
 
-  // Pick (once) who this device is signing up as, from the event roster. A roster
-  // match is a VERIFIED claim (player_id); anything else is an unverified free-name
-  // claim. Remembered in GM storage so later claims/releases reuse it.
-  function resolveSignupIdentity() {
-    const existing = getSignupIdentity();
-    if (existing && existing.name) return existing;
-    const roster = state.signup?.roster || [];
-    const input = prompt("Sign up as — type your Torn name exactly as it appears on the faction roster:");
-    if (input == null) return null;
-    const name = input.trim();
-    if (!name) return null;
-    const match = roster.find((m) => String(m.name).toLowerCase() === name.toLowerCase());
-    const identity = match ? { id: match.id, name: match.name } : { id: null, name: name.slice(0, 40) };
-    gmSet(STORE.signupIdentity, identity);
-    return identity;
-  }
-
   async function handleSignupAction(btn) {
     const action = btn.getAttribute("data-tocw-action");
     const shiftId = Number(btn.getAttribute("data-shift"));
     const role = btn.getAttribute("data-role") === "backup" ? "backup" : "main";
     try {
+      // Both claim and release authenticate with the key/session: the backend records
+      // (and later releases) a verified member claim under the real Torn id, and
+      // rejects a session whose faction doesn't match this event's faction.
       if (action === "signup") {
-        const identity = resolveSignupIdentity();
-        if (!identity) return;
-        const extra = { shift_id: shiftId, role, claim_secret: ensureClaimSecret() };
-        if (identity.id != null) extra.player_id = identity.id;
-        else extra.free_name = identity.name;
-        state.signup = await callSignup("claim", extra);
-        state.notice = role === "backup" ? "Backup slot claimed." : "Shift claimed.";
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("claim", { shift_id: shiftId, role }, session);
+        state.notice = role === "backup" ? "Backup slot claimed (verified)." : "Shift claimed (verified).";
       } else if (action === "release") {
-        state.signup = await callSignup("release", { shift_id: shiftId, role, claim_secret: ensureClaimSecret() });
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("release", { shift_id: shiftId, role }, session);
         state.notice = "Slot released.";
       }
       render();
@@ -1264,8 +1265,8 @@
         <div style="font-weight:700;">Signup link (token mode)</div>
         <div class="tocw-muted" style="margin:4px 0 8px;">
           ${cfg.signupToken
-            ? "Linked to a signup event. Just open the link leadership posts to switch events — no key needed."
-            : "Open a chain-watch signup link (from faction chat) once to bind this panel. No key or session needed."}
+            ? "Linked to a signup event. Open the link leadership posts to switch events. Viewing is open; signing up uses your Torn key to verify your faction."
+            : "Open a chain-watch signup link (from faction chat) once to bind this panel. Viewing needs no key; signing up verifies you with your key."}
         </div>
         <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
           <label style="margin:0;">Paste a link or token (fallback)
