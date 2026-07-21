@@ -531,8 +531,17 @@
     return { target, toGo: target - current };
   }
 
+  function localTime(iso) {
+    if (!iso) return "--";
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return "--";
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+
   function shiftLabel(shift) {
-    return `${tctTime(shift.shift_start)}-${tctTime(shift.shift_end).replace(" TCT", "")}`;
+    const tct = `${tctTime(shift.shift_start)}-${tctTime(shift.shift_end).replace(" TCT", "")}`;
+    const local = `${localTime(shift.shift_start)}-${localTime(shift.shift_end)}`;
+    return `${tct} <span class="tocw-muted">· ${local} your time</span>`;
   }
 
   function statusClass(status) {
@@ -876,25 +885,54 @@
   }
 
   function renderShiftRow(shift, viewer) {
-    const assigned = shift.watcher_id != null;
-    const own = Number(shift.watcher_id) === Number(viewer.player_id);
-    const canManage = Boolean(viewer.can_manage);
-    const tone = statusClass(shift.watcher_online_status);
-    const actions = assigned
-      ? [
-          canManage ? `<button class="small" data-tocw-action="assign" data-shift="${shift.id}">Change</button>` : "",
-          canManage || own ? `<button class="small" data-tocw-action="clear" data-shift="${shift.id}">${own && !canManage ? "Leave" : "Clear"}</button>` : "",
-        ].join("")
-      : canManage
-        ? `<button class="small" data-tocw-action="assign" data-shift="${shift.id}">Assign</button>`
-        : `<button class="small" data-tocw-action="signup" data-shift="${shift.id}">Sign up</button>`;
     return `
       <div class="tocw-row">
         <div class="tocw-muted">${shiftLabel(shift)}</div>
-        <div>
-          ${assigned ? `<span class="tocw-dot ${tone}"></span>${escapeHtml(shift.watcher_name || `ID ${shift.watcher_id}`)} <span class="tocw-muted">${escapeHtml(shift.watcher_online_status || "")}</span>` : `<span class="tocw-muted">Open</span>`}
-        </div>
-        <div>${actions}</div>
+        ${renderSlot(shift, "main", viewer)}
+        ${renderSlot(shift, "backup", viewer)}
+      </div>
+    `;
+  }
+
+  // One watcher slot (main or backup) with its own claim/leave/assign/lock actions.
+  // Locked slots are read-only for members (backend enforces too); a manager sees an
+  // Unlock button. Every action button carries data-role so handleAction targets the
+  // right slot.
+  function renderSlot(shift, role, viewer) {
+    const isBackup = role === "backup";
+    const watcherId = isBackup ? shift.backup_watcher_id : shift.watcher_id;
+    const watcherName = isBackup ? shift.backup_watcher_name : shift.watcher_name;
+    const onlineStatus = isBackup ? shift.backup_watcher_online_status : shift.watcher_online_status;
+    const locked = Boolean(isBackup ? shift.backup_locked : shift.locked);
+    const assigned = watcherId != null;
+    const own = assigned && Number(watcherId) === Number(viewer.player_id);
+    const canManage = Boolean(viewer.can_manage);
+    const roleLabel = isBackup ? "Backup" : "Main";
+    const btn = (act, label) => `<button class="small" data-tocw-action="${act}" data-shift="${shift.id}" data-role="${role}">${label}</button>`;
+
+    const actions = [];
+    if (locked) {
+      if (canManage) actions.push(btn("unlock", "Unlock"));
+    } else if (assigned) {
+      if (canManage) actions.push(btn("assign", "Change"));
+      if (canManage || own) actions.push(btn("clear", own && !canManage ? "Leave" : "Clear"));
+      if (canManage) actions.push(btn("lock", "Lock"));
+    } else {
+      actions.push(canManage ? btn("assign", "Assign") : btn("signup", "Sign up"));
+      if (canManage) actions.push(btn("lock", "Lock"));
+    }
+
+    const who = assigned
+      ? `<span class="tocw-dot ${statusClass(onlineStatus)}"></span>${escapeHtml(watcherName || `ID ${watcherId}`)} <span class="tocw-muted">${escapeHtml(onlineStatus || "")}</span>`
+      : locked
+        ? `<span class="tocw-muted">Locked</span>`
+        : `<span class="tocw-muted">Open</span>`;
+
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
+        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
+        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
+        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
       </div>
     `;
   }
@@ -902,6 +940,7 @@
   async function handleAction(btn) {
     const action = btn.getAttribute("data-tocw-action");
     const shiftId = Number(btn.getAttribute("data-shift"));
+    const role = btn.getAttribute("data-role") === "backup" ? "backup" : "main";
     // Locked out until the script is updated — the backend advertised a higher
     // min_script_version, so mutations may be rejected or behave unexpectedly.
     if (state.scriptTooOld) {
@@ -912,17 +951,24 @@
     }
     try {
       if (action === "signup") {
-        state.watch = await callFunction("chain-watch", { action: "signup", shift_id: shiftId });
-        state.notice = "Shift claimed.";
+        state.watch = await callFunction("chain-watch", { action: "signup", shift_id: shiftId, role });
+        state.notice = role === "backup" ? "Backup slot claimed." : "Shift claimed.";
       } else if (action === "assign") {
         const watcherId = promptWatcherId();
         if (!watcherId) return;
-        state.watch = await callFunction("chain-watch", { action: "assign", shift_id: shiftId, watcher_id: watcherId });
-        state.notice = "Shift assigned.";
+        state.watch = await callFunction("chain-watch", { action: "assign", shift_id: shiftId, watcher_id: watcherId, role });
+        state.notice = "Slot assigned.";
       } else if (action === "clear") {
-        if (!confirm("Clear this chainwatch shift?")) return;
-        state.watch = await callFunction("chain-watch", { action: "clear", shift_id: shiftId });
-        state.notice = "Shift cleared.";
+        if (!confirm("Clear this chainwatch slot?")) return;
+        state.watch = await callFunction("chain-watch", { action: "clear", shift_id: shiftId, role });
+        state.notice = "Slot cleared.";
+      } else if (action === "lock" || action === "unlock") {
+        state.watch = await callFunction("chain-watch", {
+          action: action === "lock" ? "lock_slot" : "unlock_slot",
+          shift_id: shiftId,
+          role,
+        });
+        state.notice = action === "lock" ? "Slot locked." : "Slot unlocked.";
       } else if (action === "schedule") {
         const scheduled = promptSchedule();
         if (!scheduled) return;
