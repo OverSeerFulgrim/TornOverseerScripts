@@ -1,16 +1,19 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.1.5
-// @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
+// @version      0.6.0
+// @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard. No Torn API key needed for data — the Overseer backend serves it.
 // @author       OverSeerFulgrim
 // @license      MIT
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
+// @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
+// @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @match        https://www.torn.com/*
+// @match        https://torn-overseer-v2.pages.dev/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @connect      api.torn.com
+// @grant        GM_deleteValue
 // @connect      ijolgywtybadfuvyopeg.supabase.co
 // @run-at       document-end
 // ==/UserScript==
@@ -21,11 +24,14 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.1.5";
+  const VERSION = "0.6.0";
+  const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
+  // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
+  // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
+  const OVERSEER_HOST = "torn-overseer-v2.pages.dev";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
-  const COMMENT = "TornOverseerChainWatch";
   const BONUS_MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000];
 
   const STORE = {
@@ -33,19 +39,35 @@
     functionsUrl: "tocw_functions_url",
     anonKey: "tocw_anon_key",
     sessionToken: "tocw_session_token",
+    signupToken: "tocw_signup_token",
+    claimSecret: "tocw_claim_secret",
+    signupIdentity: "tocw_signup_identity",
     collapsed: "tocw_collapsed",
     position: "tocw_position",
   };
+
+  // Secrets must live in the userscript manager's per-script GM storage ONLY — never
+  // in page (torn.com) localStorage, which the site's own scripts can read. If GM
+  // storage is unavailable we refuse to persist them rather than leak to the page.
+  // The signup token is a capability (posted in faction chat, but still) and the claim
+  // secret proves ownership of a slot, so both are GM-only too.
+  const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken, STORE.signupToken, STORE.claimSecret]);
+
+  function hasGmStorage() {
+    return typeof GM_getValue === "function" && typeof GM_setValue === "function";
+  }
 
   const state = {
     loading: false,
     error: null,
     notice: null,
     watch: null,
+    signup: null,
     chain: null,
     attacks: null,
     fetchedAt: null,
     settingsOpen: false,
+    scriptTooOld: false,
     collapsed: readBool(STORE.collapsed, false),
   };
 
@@ -55,6 +77,9 @@
     } catch {
       /* ignore */
     }
+    // Secrets are NEVER read from page localStorage — a value there would be a leak,
+    // not a source of truth. Non-secret UI prefs may still fall back to localStorage.
+    if (SECRET_KEYS.has(key)) return fallback;
     try {
       const raw = localStorage.getItem(key);
       return raw == null ? fallback : JSON.parse(raw);
@@ -63,16 +88,47 @@
     }
   }
 
+  // Returns true if the value was persisted. A secret is written to GM storage only;
+  // if GM storage is missing we return false (caller surfaces it) rather than writing
+  // the secret to page-readable localStorage.
   function gmSet(key, value) {
     try {
       if (typeof GM_setValue === "function") {
         GM_setValue(key, value);
-        return;
+        return true;
       }
     } catch {
       /* ignore */
     }
-    localStorage.setItem(key, JSON.stringify(value));
+    if (SECRET_KEYS.has(key)) return false;
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // One-time migration: if a previous version stashed a secret in page localStorage,
+  // move it into GM storage and scrub it from the page as soon as GM storage exists.
+  function migrateSecretsFromLocalStorage() {
+    if (!hasGmStorage()) return;
+    for (const key of SECRET_KEYS) {
+      let raw;
+      try {
+        raw = localStorage.getItem(key);
+      } catch {
+        continue;
+      }
+      if (raw == null) continue;
+      try {
+        const existing = GM_getValue(key, "");
+        if (!existing) GM_setValue(key, JSON.parse(raw));
+        localStorage.removeItem(key);
+      } catch {
+        /* ignore a malformed legacy value */
+      }
+    }
   }
 
   function readString(key, fallback = "") {
@@ -133,14 +189,78 @@
       functionsUrl,
       anonKey,
       sessionToken: readString(STORE.sessionToken).trim(),
+      signupToken: readString(STORE.signupToken).trim(),
     };
   }
 
+  function isOverseerSite() {
+    return location.host === OVERSEER_HOST;
+  }
+
+  // Grab the capability token from a /chain/e/:token link the user opened on the
+  // Overseer site and stash it in (shared) GM storage so the torn.com panel picks it
+  // up. Token entry is never manual — this is the one-click bind.
+  function captureSignupToken() {
+    const m = location.pathname.match(/\/chain\/e\/([^/?#]+)/);
+    if (!m) return null;
+    let token = m[1];
+    try {
+      token = decodeURIComponent(m[1]);
+    } catch {
+      /* keep raw */
+    }
+    token = String(token).trim();
+    if (token && token.length <= 128) {
+      gmSet(STORE.signupToken, token);
+      return token;
+    }
+    return null;
+  }
+
+  // Pull a token out of a pasted signup LINK or a raw token (last-resort manual entry).
+  function extractSignupToken(input) {
+    const s = String(input || "").trim();
+    if (!s) return "";
+    const m = s.match(/\/chain\/e\/([^/?#]+)/);
+    let token = m ? m[1] : s;
+    try {
+      token = decodeURIComponent(token);
+    } catch {
+      /* keep raw */
+    }
+    return String(token).trim().slice(0, 128);
+  }
+
+  function getSignupIdentity() {
+    const value = gmGet(STORE.signupIdentity, null);
+    return value && typeof value === "object" ? value : null;
+  }
+
+  // Which surface the panel shows. A captured signup link drives WHICH event, so it
+  // wins (token mode): viewing is open, and signing up authenticates with the key
+  // (session) to record a VERIFIED, faction-checked claim for that event. Without a
+  // link, a session shows the faction's current event (session mode, full manager
+  // controls). Managers who captured a link can Clear it in Settings to get those
+  // controls back. Nothing configured yet -> none.
+  function panelMode() {
+    const cfg = settings();
+    if (cfg.signupToken) return "token";
+    if (cfg.sessionToken) return "session";
+    return "none";
+  }
+
+  // Returns true if the secrets (key + session) were persisted; false means GM
+  // storage is unavailable and they were deliberately NOT written to the page.
   function saveSettings(next) {
-    gmSet(STORE.tornKey, (next.tornKey || "").trim());
+    const pda = pdaApiKey();
+    let tornKey = (next.tornKey || "").trim();
+    // Never persist the PDA-injected key — TornPDA provides it fresh each load.
+    if (pda && tornKey === pda) tornKey = "";
+    const okKey = gmSet(STORE.tornKey, tornKey);
     gmSet(STORE.functionsUrl, (next.functionsUrl || DEFAULT_FUNCTIONS_URL).trim());
     gmSet(STORE.anonKey, (next.anonKey || DEFAULT_ANON_KEY).trim());
-    gmSet(STORE.sessionToken, (next.sessionToken || "").trim());
+    const okSession = gmSet(STORE.sessionToken, (next.sessionToken || "").trim());
+    return okKey && okSession;
   }
 
   function escapeHtml(value) {
@@ -158,19 +278,51 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  // Semantic-ish version compare (dot-separated integers). -1 if a<b, 0 eq, 1 a>b.
+  function compareVersions(a, b) {
+    const pa = String(a || "0").split(".").map((n) => parseInt(n, 10) || 0);
+    const pb = String(b || "0").split(".").map((n) => parseInt(n, 10) || 0);
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i += 1) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    }
+    return 0;
+  }
+
+  // The min/latest_script_version handshake the backend advertises in its get
+  // response: too old -> the site may reject/misbehave, so lock actions; a newer
+  // latest -> a non-blocking "update available" nudge.
+  function scriptVersionState() {
+    const w = state.watch || {};
+    const min = typeof w.min_script_version === "string" ? w.min_script_version : null;
+    const latest = typeof w.latest_script_version === "string" ? w.latest_script_version : null;
+    return {
+      tooOld: min ? compareVersions(VERSION, min) < 0 : false,
+      updateAvailable: latest ? compareVersions(VERSION, latest) < 0 : false,
+      latest,
+    };
+  }
+
+  function httpError(message, status) {
+    const err = new Error(message);
+    err.status = status;
+    return err;
+  }
+
   function parseHttpJson(status, responseText, url) {
     let parsed = null;
     try {
       parsed = responseText ? JSON.parse(responseText) : null;
     } catch {
-      throw new Error(`Non-JSON response from ${url}`);
+      throw httpError(`Non-JSON response from ${url}`, status);
     }
     if (status < 200 || status >= 300) {
       const msg =
         parsed && typeof parsed === "object" && typeof parsed.error === "string"
           ? parsed.error
           : `Request failed (${status})`;
-      throw new Error(msg);
+      throw httpError(msg, status);
     }
     return parsed;
   }
@@ -189,15 +341,6 @@
     return parseHttpJson(status, responseText, url);
   }
 
-  async function requestJsonWithFetch(url, options = {}) {
-    const method = options.method || "GET";
-    const headers = options.headers || {};
-    const body = options.body == null ? undefined : JSON.stringify(options.body);
-    const res = await fetch(url, { method, headers, body });
-    const text = await res.text();
-    return parseHttpJson(res.status, text, url);
-  }
-
   function requestJson(url, options = {}) {
     if (
       typeof window.PDA_httpGet === "function" &&
@@ -205,7 +348,14 @@
     ) {
       return requestJsonWithTornPda(url, options);
     }
-    if (typeof GM_xmlhttpRequest !== "function") return requestJsonWithFetch(url, options);
+    // No page-context fetch fallback: every API/session call must go through the
+    // userscript manager (GM_xmlhttpRequest) or Torn PDA, so the Torn key and session
+    // token are never exposed to torn.com's own page scripts.
+    if (typeof GM_xmlhttpRequest !== "function") {
+      return Promise.reject(
+        new Error("This script needs Tampermonkey (or Torn PDA) — the browser's own fetch is never used for API or session calls, to keep your Torn key and session private."),
+      );
+    }
 
     const method = options.method || "GET";
     const headers = options.headers || {};
@@ -230,47 +380,61 @@
     });
   }
 
-  async function tornFetch(path, params = {}) {
-    const cfg = settings();
-    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
-    const url = new URL(`https://api.torn.com/v2${path.startsWith("/") ? path : `/${path}`}`);
-    for (const [key, value] of Object.entries(params)) {
-      if (value != null && value !== "") url.searchParams.set(key, String(value));
-    }
-    url.searchParams.set("key", cfg.tornKey);
-    url.searchParams.set("comment", COMMENT);
-    const data = await requestJson(url.toString());
-    if (data && typeof data === "object" && data.error) {
-      const err = data.error;
-      throw new Error(err.error || `Torn API error ${err.code || ""}`.trim());
-    }
-    return data;
-  }
-
-  async function tornLegacyFaction(selections) {
-    const cfg = settings();
-    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
-    const url = new URL("https://api.torn.com/faction/");
-    url.searchParams.set("selections", selections);
-    url.searchParams.set("key", cfg.tornKey);
-    return requestJson(url.toString());
-  }
-
-  async function callFunction(slug, body = {}) {
+  async function callFunction(slug, body = {}, opts = {}) {
     const cfg = settings();
     if (!cfg.functionsUrl || !cfg.anonKey || !cfg.sessionToken) {
       throw new Error("Connect the site session in Settings.");
     }
-    return requestJson(`${cfg.functionsUrl.replace(/\/+$/, "")}/${slug}`, {
+    try {
+      return await requestJson(`${cfg.functionsUrl.replace(/\/+$/, "")}/${slug}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: cfg.anonKey,
+          Authorization: `Bearer ${cfg.anonKey}`,
+          "X-Session-Token": cfg.sessionToken,
+        },
+        body,
+      });
+    } catch (error) {
+      // Session expired or was invalidated → transparently re-mint it from the stored
+      // Torn key once (sliding renewal), then retry. Needs a Torn key to reconnect.
+      if (error && error.status === 401 && !opts.retried && cfg.tornKey) {
+        await connectSiteFromTornKey();
+        return callFunction(slug, body, { retried: true });
+      }
+      throw error;
+    }
+  }
+
+  // Public chain-signup capability API — header-less (Content-Type only), token in the
+  // body, NO session or Torn key. This is the anon token-mode path.
+  // Public chain-signup call. Viewing is header-less (anonymous). For a claim/release
+  // the caller passes a sessionToken -> we add X-Session-Token so the backend records
+  // a VERIFIED, faction-checked member claim (never anonymous free-text from here).
+  async function callSignup(action, extra = {}, sessionToken) {
+    const cfg = settings();
+    const token = cfg.signupToken;
+    if (!token) throw new Error("No signup link captured yet.");
+    const base = (cfg.functionsUrl || DEFAULT_FUNCTIONS_URL).replace(/\/+$/, "");
+    const headers = { "Content-Type": "application/json" };
+    if (sessionToken) headers["X-Session-Token"] = sessionToken;
+    return requestJson(`${base}/chain-signup`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: cfg.anonKey,
-        Authorization: `Bearer ${cfg.anonKey}`,
-        "X-Session-Token": cfg.sessionToken,
-      },
-      body,
+      headers,
+      body: { action, token, ...extra },
     });
+  }
+
+  // The session (from the Torn key) is what verifies a signup. Return it, minting one
+  // from the stored/PDA key on demand; if there's no key, tell the member to add one.
+  async function ensureVerifiedSession() {
+    const cfg = settings();
+    if (cfg.sessionToken) return cfg.sessionToken;
+    if (!cfg.tornKey) {
+      throw new Error("Add your Torn API key in Settings to sign up — it verifies you're in the faction.");
+    }
+    return await connectSiteFromTornKey();
   }
 
   async function connectSiteFromTornKey() {
@@ -290,62 +454,56 @@
       throw new Error("The site did not return a session token.");
     }
     gmSet(STORE.sessionToken, res.sessionToken);
+    // Remember who the key belongs to (returned by connect-torn-key) so token mode
+    // can show "signed in as X" and know which slots are yours — no Torn call needed.
+    if (res.player && res.player.id != null) {
+      gmSet(STORE.signupIdentity, { id: Number(res.player.id), name: res.player.name || `ID ${res.player.id}` });
+    }
     return res.sessionToken;
   }
 
-  function parseChain(raw) {
-    const c = raw?.chain || raw || {};
-    const current = num(c.current) ?? 0;
-    const timeout = num(c.timeout) ?? 0;
+  // The live_chain block the Overseer backend serves on BOTH the session and the
+  // token payloads (identical shape). Convert it to the panel's chain shape,
+  // anchoring the countdown to when the SERVER cached it so the timer stays honest
+  // without a Torn key of our own.
+  function serverLiveChain(res) {
+    const lc = res && res.live_chain && res.live_chain.chain;
+    if (!lc || typeof lc !== "object") return null;
+    const current = num(lc.current) ?? 0;
+    const timeout = num(lc.timeout) ?? 0;
+    const cachedAt = res.live_chain.fetched_at ? new Date(res.live_chain.fetched_at).getTime() : NaN;
     return {
       active: current > 0 && timeout > 0,
       current,
-      max: num(c.maximum ?? c.max) ?? 0,
+      max: num(lc.max) ?? 0,
       timeout,
-      modifier: num(c.modifier) ?? 0,
-      cooldown: num(c.cooldown) ?? 0,
-      fetchedAt: Date.now(),
+      modifier: num(lc.modifier) ?? 0,
+      cooldown: num(lc.cooldown) ?? 0,
+      fetchedAt: Number.isFinite(cachedAt) ? cachedAt : Date.now(),
     };
   }
 
-  function asRows(value) {
-    if (Array.isArray(value)) return value;
-    if (value && typeof value === "object") return Object.values(value);
-    return [];
-  }
-
-  function parseAttacks(raw) {
-    const rows = asRows(raw?.attacks ?? raw);
-    const byId = new Map();
-    let last = null;
-    for (const row of rows) {
-      const attacker = row?.attacker && typeof row.attacker === "object" ? row.attacker : {};
-      const defender = row?.defender && typeof row.defender === "object" ? row.defender : {};
-      const attackerId = num(row?.attacker_id ?? row?.attackerID ?? row?.user_id ?? attacker.id);
-      if (!attackerId || attackerId <= 0) continue;
-      const attackerName = row?.attacker_name || attacker.name || `ID ${attackerId}`;
-      const defenderName = row?.defender_name || defender.name || row?.target_name || "target";
-      const timestamp =
-        num(row?.timestamp_ended ?? row?.ended ?? row?.end ?? row?.timestamp_started ?? row?.started ?? row?.timestamp) ?? 0;
-      const respect =
-        num(row?.respect_gain ?? row?.respect ?? row?.respectGain ?? row?.respect_total ?? row?.respectTotal) ?? 0;
-      const prior = byId.get(attackerId) || {
-        playerId: attackerId,
-        name: attackerName,
-        hits: 0,
-        respect: 0,
-      };
-      prior.hits += 1;
-      prior.respect += respect;
-      byId.set(attackerId, prior);
-      if (timestamp > 0 && (!last || timestamp > last.timestamp)) {
-        last = { attackerName, defenderName, timestamp };
-      }
+  // The hit leaderboard the backend serves (from the attack_outgoing buffer) on
+  // both payloads. It arrives already aggregated + sorted, so the panel just adopts
+  // it — no Torn key, no client-side attack parsing. Null (best-effort failure) or a
+  // between-chains empty list both render as "no data yet".
+  function serverLeaderboard(res) {
+    const block = res && res.leaderboard;
+    if (!block || typeof block !== "object") {
+      return { leaderboard: [], last: null, error: "No leaderboard data yet." };
     }
-    const leaderboard = [...byId.values()]
-      .map((row) => ({ ...row, avg: row.hits > 0 ? row.respect / row.hits : 0 }))
-      .sort((a, b) => b.hits - a.hits || b.respect - a.respect)
-      .slice(0, 8);
+    const rows = Array.isArray(block.leaderboard) ? block.leaderboard : [];
+    const leaderboard = rows.map((r) => ({
+      name: String(r?.name ?? (r?.player_id != null ? `ID ${r.player_id}` : "Unknown")),
+      hits: num(r?.hits) ?? 0,
+      respect: num(r?.respect) ?? 0,
+      avg: num(r?.avg) ?? 0,
+    }));
+    const l = block.last;
+    const ts = l && typeof l === "object" ? num(l.timestamp) : null;
+    const last = ts != null && ts > 0
+      ? { attackerName: String(l.attackerName ?? "?"), defenderName: String(l.defenderName ?? "target"), timestamp: ts }
+      : null;
     return { leaderboard, last, error: null };
   }
 
@@ -355,39 +513,41 @@
     if (manual) state.notice = null;
     render();
     try {
-      const cfg = settings();
+      const mode = panelMode();
+      // Clear the inactive surface so a mode switch never renders stale data.
+      if (mode === "token") state.watch = null;
+      else state.signup = null;
       const tasks = [];
-      if (cfg.tornKey) {
-        tasks.push(
-          tornFetch("/faction/chain")
-            .then((raw) => {
-              state.chain = parseChain(raw);
-              state.fetchedAt = Date.now();
-            })
-            .catch((e) => {
-              state.chain = null;
-              state.error = e.message || "Could not load Torn chain.";
-            }),
-        );
-        tasks.push(
-          tornLegacyFaction("attacks")
-            .then((raw) => {
-              state.attacks = parseAttacks(raw);
-            })
-            .catch((e) => {
-              state.attacks = { leaderboard: [], last: null, error: e.message || "Attack log unavailable." };
-            }),
-        );
-      }
-      if (cfg.functionsUrl && cfg.anonKey && cfg.sessionToken) {
+      // Both modes are fully keyless for data: the chain HUD and the hit leaderboard
+      // come from the Overseer backend (live_chain + leaderboard blocks). A Torn key,
+      // if present, is used ONLY to mint/renew the site session — never to fetch data.
+      if (mode === "session") {
         tasks.push(
           callFunction("chain-watch", { action: "get" })
             .then((res) => {
               state.watch = res;
+              state.chain = serverLiveChain(res);
+              state.attacks = serverLeaderboard(res);
+              state.fetchedAt = Date.now();
             })
             .catch((e) => {
               state.watch = null;
               state.error = e.message || "Could not load Chain Watch schedule.";
+            }),
+        );
+      }
+      if (mode === "token") {
+        tasks.push(
+          callSignup("get")
+            .then((res) => {
+              state.signup = res;
+              state.chain = serverLiveChain(res);
+              state.attacks = serverLeaderboard(res);
+              state.fetchedAt = Date.now();
+            })
+            .catch((e) => {
+              state.signup = null;
+              state.error = e.message || "Could not load the signup sheet.";
             }),
         );
       }
@@ -436,8 +596,17 @@
     return { target, toGo: target - current };
   }
 
+  function localTime(iso) {
+    if (!iso) return "--";
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return "--";
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+
   function shiftLabel(shift) {
-    return `${tctTime(shift.shift_start)}-${tctTime(shift.shift_end).replace(" TCT", "")}`;
+    const tct = `${tctTime(shift.shift_start)}-${tctTime(shift.shift_end).replace(" TCT", "")}`;
+    const local = `${localTime(shift.shift_start)}-${localTime(shift.shift_end)}`;
+    return `${tct} <span class="tocw-muted">· ${local} your time</span>`;
   }
 
   function statusClass(status) {
@@ -621,7 +790,8 @@
     box.classList.toggle("collapsed", state.collapsed);
 
     const cfg = settings();
-    const event = state.watch?.event || null;
+    const event = state.watch?.event || state.signup?.event || null;
+    const mode = panelMode();
     const chain = state.chain;
     const live = Boolean(chain?.active);
     const currentHits = chain?.current || 0;
@@ -634,10 +804,18 @@
     const scheduledSeconds = event ? countdownTo(event.starts_at) : null;
     const { current, next } = currentAndNextShift();
 
+    const vstat = scriptVersionState();
+    state.scriptTooOld = vstat.tooOld;
+    const versionAlert = vstat.tooOld
+      ? `<div class="tocw-alert bad">Chain Watch v${VERSION} is out of date${vstat.latest ? ` (this faction needs v${escapeHtml(vstat.latest)}+)` : ""}. <a href="${UPDATE_URL}" target="_blank" rel="noreferrer noopener">Update the script</a> — actions are disabled until you do.</div>`
+      : vstat.updateAvailable
+        ? `<div class="tocw-alert">Chain Watch v${escapeHtml(vstat.latest)} is available (you have v${VERSION}). <a href="${UPDATE_URL}" target="_blank" rel="noreferrer noopener">Update</a>.</div>`
+        : "";
+
     box.innerHTML = `
       <div class="tocw-head" id="tocw-drag-handle" title="Drag to move Chain Watch">
         <div class="tocw-pills">
-          <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE TORN API" : "SCHEDULED"}</span>
+          <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE" : "SCHEDULED"}</span>
           <span class="tocw-pill">SITE SYNC</span>
           <span class="tocw-pill">READ-ONLY</span>
         </div>
@@ -652,7 +830,14 @@
       <div class="tocw-body">
         ${state.error ? `<div class="tocw-alert bad">${escapeHtml(state.error)}</div>` : ""}
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
-        ${!cfg.tornKey || !cfg.sessionToken ? `<div class="tocw-alert">Add your Torn API key, connect the site session, then refresh.</div>` : ""}
+        ${versionAlert}
+        ${mode === "token"
+          ? `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""}. Anyone can view; signing up verifies you with your Torn key.</div>`
+          : mode === "none"
+            ? `<div class="tocw-alert">Open a chain-watch signup link, or add your Torn API key and connect the site session in Settings.</div>`
+            : !cfg.sessionToken
+              ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
+              : ""}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
         <div class="tocw-actions">
@@ -693,7 +878,10 @@
         <div class="tocw-card-title">${event ? "Next scheduled chain" : "No scheduled chain"}</div>
         <div class="tocw-big">${event ? `Starts in ${duration(seconds)}` : "--"}</div>
         <div class="tocw-muted">${event ? `${escapeHtml(event.title)} - ${tctTime(event.starts_at, true)}` : "Ask a chain-watch manager to schedule one."}</div>
-        ${canManage ? `<button class="small" data-tocw-action="schedule" style="margin-top:8px;">Schedule chain</button>` : ""}
+        ${event && event.status === "draft" && canManage
+          ? `<div class="tocw-muted" style="margin-top:6px;">Draft — <a href="https://${OVERSEER_HOST}/faction/chains" target="_blank" rel="noreferrer noopener">publish it &amp; mint the signup link on the site ↗</a></div>`
+          : ""}
+        ${canManage ? `<button class="small" data-tocw-action="schedule" style="margin-top:8px;">Schedule chain (draft)</button>` : ""}
       </div>
     `;
   }
@@ -759,63 +947,229 @@
     `;
   }
 
+  // A session-mode event whose sheet can no longer change: a frozen finalized
+  // archive, or an imported historical event. Both are immutable server-side
+  // (migration 0091), so every mutating action would 409 — the panel renders
+  // them read-only instead of dangling buttons that only produce errors.
+  function watchEventReadOnly(event) {
+    if (!event) return false;
+    return event.status === "frozen" || event.status === "imported" || Boolean(event.frozen_at);
+  }
+
   function renderShifts() {
+    if (panelMode() === "token") return renderSignupShifts();
+    const event = state.watch?.event;
+    if (!event) return "";
     const shifts = state.watch?.shifts || [];
     const viewer = state.watch?.viewer || {};
-    if (!state.watch?.event) return "";
+    const readOnly = watchEventReadOnly(event);
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">Chainwatch shifts</div>
-        ${shifts.map((shift) => renderShiftRow(shift, viewer)).join("")}
+        ${readOnly ? `<div class="tocw-muted">🔒 ${event.status === "imported" ? "Imported chain" : "Chain finalized"} — this sheet is read-only.</div>` : ""}
+        ${shifts.map((shift) => renderShiftRow(shift, viewer, readOnly)).join("")}
       </div>
     `;
   }
 
-  function renderShiftRow(shift, viewer) {
-    const assigned = shift.watcher_id != null;
-    const own = Number(shift.watcher_id) === Number(viewer.player_id);
-    const canManage = Boolean(viewer.can_manage);
-    const tone = statusClass(shift.watcher_online_status);
-    const actions = assigned
-      ? [
-          canManage ? `<button class="small" data-tocw-action="assign" data-shift="${shift.id}">Change</button>` : "",
-          canManage || own ? `<button class="small" data-tocw-action="clear" data-shift="${shift.id}">${own && !canManage ? "Leave" : "Clear"}</button>` : "",
-        ].join("")
-      : canManage
-        ? `<button class="small" data-tocw-action="assign" data-shift="${shift.id}">Assign</button>`
-        : `<button class="small" data-tocw-action="signup" data-shift="${shift.id}">Sign up</button>`;
+  function renderShiftRow(shift, viewer, readOnly) {
     return `
       <div class="tocw-row">
         <div class="tocw-muted">${shiftLabel(shift)}</div>
-        <div>
-          ${assigned ? `<span class="tocw-dot ${tone}"></span>${escapeHtml(shift.watcher_name || `ID ${shift.watcher_id}`)} <span class="tocw-muted">${escapeHtml(shift.watcher_online_status || "")}</span>` : `<span class="tocw-muted">Open</span>`}
-        </div>
-        <div>${actions}</div>
+        ${renderSlot(shift, "main", viewer, readOnly)}
+        ${renderSlot(shift, "backup", viewer, readOnly)}
       </div>
     `;
   }
 
-  async function handleAction(btn) {
+  // One watcher slot (main or backup) with its own claim/leave/assign/lock actions.
+  // Locked slots are read-only for members (backend enforces too); a manager sees an
+  // Unlock button. Every action button carries data-role so handleAction targets the
+  // right slot.
+  function renderSlot(shift, role, viewer, readOnly) {
+    const isBackup = role === "backup";
+    const watcherId = isBackup ? shift.backup_watcher_id : shift.watcher_id;
+    const watcherName = isBackup ? shift.backup_watcher_name : shift.watcher_name;
+    const onlineStatus = isBackup ? shift.backup_watcher_online_status : shift.watcher_online_status;
+    const locked = Boolean(isBackup ? shift.backup_locked : shift.locked);
+    const assigned = watcherId != null;
+    const own = assigned && Number(watcherId) === Number(viewer.player_id);
+    const canManage = Boolean(viewer.can_manage);
+    const roleLabel = isBackup ? "Backup" : "Main";
+    const btn = (act, label) => `<button class="small" data-tocw-action="${act}" data-shift="${shift.id}" data-role="${role}">${label}</button>`;
+
+    // A finalized/imported event is immutable: show who filled each slot, but no
+    // claim/assign/lock controls (they'd 409 server-side).
+    const actions = [];
+    if (readOnly) {
+      // no actions — read-only archive
+    } else if (locked) {
+      if (canManage) actions.push(btn("unlock", "Unlock"));
+    } else if (assigned) {
+      if (canManage) actions.push(btn("assign", "Change"));
+      if (canManage || own) actions.push(btn("clear", own && !canManage ? "Leave" : "Clear"));
+      if (canManage) actions.push(btn("lock", "Lock"));
+    } else {
+      actions.push(canManage ? btn("assign", "Assign") : btn("signup", "Sign up"));
+      if (canManage) actions.push(btn("lock", "Lock"));
+    }
+
+    const who = assigned
+      ? `<span class="tocw-dot ${statusClass(onlineStatus)}"></span>${escapeHtml(watcherName || `ID ${watcherId}`)} <span class="tocw-muted">${escapeHtml(onlineStatus || "")}</span>`
+      : locked
+        ? `<span class="tocw-muted">Locked</span>`
+        : `<span class="tocw-muted">Open</span>`;
+
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
+        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
+        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
+        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
+      </div>
+    `;
+  }
+
+  // --- Token mode (anon signup via link) --------------------------------------
+
+  function renderSignupShifts() {
+    const signup = state.signup;
+    if (!signup || !signup.event) return "";
+    const shifts = signup.shifts || [];
+    const identity = getSignupIdentity();
+    const canClaim = Boolean(signup.can_claim);
+    const phase = signup.event.phase;
+    // A frozen event is a finalized archive (read-only). Distinguish it from an
+    // ordinary closed/draft sheet so the panel reads as "locked record", not
+    // "you missed signups".
+    const closedNote = canClaim
+      ? ""
+      : phase === "frozen"
+        ? `<div class="tocw-muted">🔒 This chain is finalized — the sheet is read-only.</div>`
+        : phase === "draft"
+          ? `<div class="tocw-muted">This chain hasn't been published yet.</div>`
+          : `<div class="tocw-muted">Signups are closed for this chain.</div>`;
+    return `
+      <div class="tocw-card">
+        <div class="tocw-card-title">Chainwatch shifts</div>
+        ${identity && identity.name
+          ? `<div class="tocw-muted">Signed in as ${escapeHtml(identity.name)} ✓</div>`
+          : canClaim
+            ? `<div class="tocw-muted">Signing up verifies you with your Torn key${settings().tornKey || settings().sessionToken ? "" : " — add it in Settings"}.</div>`
+            : ""}
+        ${shifts.map((shift) => `
+          <div class="tocw-row">
+            <div class="tocw-muted">${shiftLabel(shift)}</div>
+            ${renderSignupSlot(shift, "main", canClaim, identity)}
+            ${renderSignupSlot(shift, "backup", canClaim, identity)}
+          </div>
+        `).join("")}
+        ${closedNote}
+      </div>
+    `;
+  }
+
+  function renderSignupSlot(shift, role, canClaim, identity) {
+    const slot = (role === "backup" ? shift.backup : shift.main) || {};
+    const roleLabel = role === "backup" ? "Backup" : "Main";
+    const filled = Boolean(slot.filled);
+    const locked = Boolean(slot.locked);
+    const mine = filled && identity && identity.id != null && Number(slot.watcher_id) === Number(identity.id);
+    const btn = (act, label) => `<button class="small" data-tocw-action="${act}" data-shift="${shift.id}" data-role="${role}">${label}</button>`;
+
+    const actions = [];
+    if (!locked && canClaim) {
+      if (!filled) actions.push(btn("signup", "Sign up"));
+      else if (mine) actions.push(btn("release", "Leave"));
+    }
+
+    const who = filled
+      ? `<span class="tocw-dot ${statusClass(slot.online_status)}"></span>${escapeHtml(slot.watcher_name || `ID ${slot.watcher_id}`)}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
+      : locked
+        ? `<span class="tocw-muted">Locked</span>`
+        : `<span class="tocw-muted">Open</span>`;
+
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
+        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
+        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
+        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
+      </div>
+    `;
+  }
+
+  async function handleSignupAction(btn) {
     const action = btn.getAttribute("data-tocw-action");
     const shiftId = Number(btn.getAttribute("data-shift"));
+    const role = btn.getAttribute("data-role") === "backup" ? "backup" : "main";
+    try {
+      // Both claim and release authenticate with the key/session: the backend records
+      // (and later releases) a verified member claim under the real Torn id, and
+      // rejects a session whose faction doesn't match this event's faction.
+      if (action === "signup") {
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("claim", { shift_id: shiftId, role }, session);
+        state.notice = role === "backup" ? "Backup slot claimed (verified)." : "Shift claimed (verified).";
+      } else if (action === "release") {
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("release", { shift_id: shiftId, role }, session);
+        state.notice = "Slot released.";
+      }
+      render();
+    } catch (e) {
+      state.error = e.message || "Action failed.";
+      render();
+    }
+  }
+
+  async function handleAction(btn) {
+    // Token mode uses the public chain-signup endpoints, not the session chain-watch.
+    if (panelMode() === "token") return handleSignupAction(btn);
+    const action = btn.getAttribute("data-tocw-action");
+    const shiftId = Number(btn.getAttribute("data-shift"));
+    const role = btn.getAttribute("data-role") === "backup" ? "backup" : "main";
+    // Locked out until the script is updated — the backend advertised a higher
+    // min_script_version, so mutations may be rejected or behave unexpectedly.
+    if (state.scriptTooOld) {
+      state.error = "Update the Chain Watch script to continue — it's too old for the current site.";
+      state.notice = null;
+      render();
+      return;
+    }
+    // A finalized/imported event is immutable server-side; block the doomed call
+    // from a stale button and say why (schedule is exempt — it starts a NEW event).
+    if (action !== "schedule" && watchEventReadOnly(state.watch?.event)) {
+      state.error = "This chain is finalized — the sheet is read-only.";
+      state.notice = null;
+      render();
+      return;
+    }
     try {
       if (action === "signup") {
-        state.watch = await callFunction("chain-watch", { action: "signup", shift_id: shiftId });
-        state.notice = "Shift claimed.";
+        state.watch = await callFunction("chain-watch", { action: "signup", shift_id: shiftId, role });
+        state.notice = role === "backup" ? "Backup slot claimed." : "Shift claimed.";
       } else if (action === "assign") {
         const watcherId = promptWatcherId();
         if (!watcherId) return;
-        state.watch = await callFunction("chain-watch", { action: "assign", shift_id: shiftId, watcher_id: watcherId });
-        state.notice = "Shift assigned.";
+        state.watch = await callFunction("chain-watch", { action: "assign", shift_id: shiftId, watcher_id: watcherId, role });
+        state.notice = "Slot assigned.";
       } else if (action === "clear") {
-        if (!confirm("Clear this chainwatch shift?")) return;
-        state.watch = await callFunction("chain-watch", { action: "clear", shift_id: shiftId });
-        state.notice = "Shift cleared.";
+        if (!confirm("Clear this chainwatch slot?")) return;
+        state.watch = await callFunction("chain-watch", { action: "clear", shift_id: shiftId, role });
+        state.notice = "Slot cleared.";
+      } else if (action === "lock" || action === "unlock") {
+        state.watch = await callFunction("chain-watch", {
+          action: action === "lock" ? "lock_slot" : "unlock_slot",
+          shift_id: shiftId,
+          role,
+        });
+        state.notice = action === "lock" ? "Slot locked." : "Slot unlocked.";
       } else if (action === "schedule") {
         const scheduled = promptSchedule();
         if (!scheduled) return;
-        state.watch = await callFunction("chain-watch", { action: "save_event", ...scheduled });
-        state.notice = "Chain scheduled.";
+        // Create a DRAFT — publishing (and minting the public signup link) stays on the
+        // site, so the script never creates a half-configured live event.
+        state.watch = await callFunction("chain-watch", { action: "save_event", ...scheduled, draft: true });
+        state.notice = "Draft chain created — publish it on the Overseer site to open signups and mint the link.";
       }
       render();
     } catch (e) {
@@ -862,7 +1216,7 @@
   }
 
   async function copySummary() {
-    const event = state.watch?.event;
+    const event = state.watch?.event || state.signup?.event;
     const chain = state.chain;
     const { current, next } = currentAndNextShift();
     const lines = [
@@ -898,15 +1252,29 @@
       <h2 style="margin:0 0 6px;font-size:20px;">Chain Watch Settings</h2>
       <p class="tocw-muted" style="margin:0 0 14px;">
         Data Storage: local script settings plus faction schedule on Torn Overseer.
-        Data Sharing: Torn API requests go to api.torn.com; shift signup goes to your configured Overseer backend.
+        Data Sharing: every request goes to your configured Overseer backend only — never to api.torn.com.
         Purpose: scheduled chain countdown, watcher shifts, live chain timer, and read-only chain summaries.
       </p>
-      <label>Torn API key ${pdaApiKey() ? "(from TornPDA)" : ""}
-        <input id="tocw-set-torn-key" type="password" value="${escapeHtml(cfg.tornKey)}" autocomplete="off" />
+      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— only to connect a site session; never used to fetch data</span>
+        <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
       </label>
       <label>Site session token
         <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
       </label>
+      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+        <div style="font-weight:700;">Signup link (token mode)</div>
+        <div class="tocw-muted" style="margin:4px 0 8px;">
+          ${cfg.signupToken
+            ? "Linked to a signup event. Open the link leadership posts to switch events. Viewing is open; signing up uses your Torn key to verify your faction."
+            : "Open a chain-watch signup link (from faction chat) once to bind this panel. Viewing needs no key; signing up verifies you with your key."}
+        </div>
+        <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
+          <label style="margin:0;">Paste a link or token (fallback)
+            <input id="tocw-set-signup" value="" autocomplete="off" placeholder="https://${OVERSEER_HOST}/chain/e/…" />
+          </label>
+          <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
+        </div>
+      </div>
       <details style="margin-top:10px;">
         <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Advanced backend settings</summary>
         <div class="grid" style="margin-top:10px;">
@@ -940,8 +1308,22 @@
     backdrop.addEventListener("click", close);
     document.getElementById("tocw-modal-close")?.addEventListener("click", close);
     document.getElementById("tocw-modal-save")?.addEventListener("click", () => {
-      saveSettings(collect());
-      state.notice = "Settings saved.";
+      const ok = saveSettings(collect());
+      // Last-resort manual link entry: bind a pasted signup link/token.
+      const pasted = extractSignupToken(valueOf("tocw-set-signup"));
+      if (pasted) gmSet(STORE.signupToken, pasted);
+      if (ok) {
+        state.notice = pasted ? "Signup link saved." : "Settings saved.";
+      } else {
+        state.error = "Install Tampermonkey or use Torn PDA — your key and session can't be stored securely otherwise, so they were not saved.";
+      }
+      close();
+    });
+    document.getElementById("tocw-signup-clear")?.addEventListener("click", () => {
+      gmSet(STORE.signupToken, "");
+      gmSet(STORE.signupIdentity, null);
+      state.signup = null;
+      state.notice = "Signup link cleared.";
       close();
     });
     document.getElementById("tocw-modal-connect")?.addEventListener("click", async () => {
@@ -997,12 +1379,38 @@
     document.body.appendChild(launcher);
   }
 
+  // On the Overseer site we ONLY capture the signup token from a /chain/e/:token link
+  // and hand off to the torn.com panel — never render our own UI over the site's app.
+  function bootOverseerCapture() {
+    migrateSecretsFromLocalStorage();
+    const token = captureSignupToken();
+    if (token) showCaptureToast();
+  }
+
+  function showCaptureToast() {
+    if (document.getElementById("tocw-capture-toast")) return;
+    const toast = document.createElement("div");
+    toast.id = "tocw-capture-toast";
+    toast.textContent = "Chain Watch: this event is now linked in your in-game panel. Open Torn to sign up from the game.";
+    toast.style.cssText =
+      "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;" +
+      "max-width:min(92vw,420px);background:#111;color:#fff;border:1px solid #3a3a3a;border-radius:10px;" +
+      "padding:12px 16px;font:14px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.4);";
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 8000);
+  }
+
   function boot() {
     if (!document.body) {
       setTimeout(boot, 100);
       return;
     }
+    if (isOverseerSite()) {
+      bootOverseerCapture();
+      return;
+    }
     console.info("[Torn Overseer Chain Watch] loaded", location.href);
+    migrateSecretsFromLocalStorage();
     createLauncher();
     try {
       createShell();
