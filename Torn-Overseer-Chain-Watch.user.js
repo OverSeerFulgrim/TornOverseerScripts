@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.4.0
-// @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
+// @version      0.5.0
+// @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard. No Torn API key needed for data — the Overseer backend serves it.
 // @author       OverSeerFulgrim
 // @license      MIT
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
@@ -14,7 +14,6 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
-// @connect      api.torn.com
 // @connect      ijolgywtybadfuvyopeg.supabase.co
 // @run-at       document-end
 // ==/UserScript==
@@ -25,7 +24,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.4.0";
+  const VERSION = "0.5.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -33,7 +32,6 @@
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
-  const COMMENT = "TornOverseerChainWatch";
   const BONUS_MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000];
 
   const STORE = {
@@ -389,32 +387,6 @@
     });
   }
 
-  async function tornFetch(path, params = {}) {
-    const cfg = settings();
-    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
-    const url = new URL(`https://api.torn.com/v2${path.startsWith("/") ? path : `/${path}`}`);
-    for (const [key, value] of Object.entries(params)) {
-      if (value != null && value !== "") url.searchParams.set(key, String(value));
-    }
-    url.searchParams.set("key", cfg.tornKey);
-    url.searchParams.set("comment", COMMENT);
-    const data = await requestJson(url.toString());
-    if (data && typeof data === "object" && data.error) {
-      const err = data.error;
-      throw new Error(err.error || `Torn API error ${err.code || ""}`.trim());
-    }
-    return data;
-  }
-
-  async function tornLegacyFaction(selections) {
-    const cfg = settings();
-    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
-    const url = new URL("https://api.torn.com/faction/");
-    url.searchParams.set("selections", selections);
-    url.searchParams.set("key", cfg.tornKey);
-    return requestJson(url.toString());
-  }
-
   async function callFunction(slug, body = {}, opts = {}) {
     const cfg = settings();
     if (!cfg.functionsUrl || !cfg.anonKey || !cfg.sessionToken) {
@@ -476,25 +448,11 @@
     return res.sessionToken;
   }
 
-  function parseChain(raw) {
-    const c = raw?.chain || raw || {};
-    const current = num(c.current) ?? 0;
-    const timeout = num(c.timeout) ?? 0;
-    return {
-      active: current > 0 && timeout > 0,
-      current,
-      max: num(c.maximum ?? c.max) ?? 0,
-      timeout,
-      modifier: num(c.modifier) ?? 0,
-      cooldown: num(c.cooldown) ?? 0,
-      fetchedAt: Date.now(),
-    };
-  }
-
-  // Convert the server-served live_chain block (token mode) into the same shape
-  // parseChain produces, anchoring the countdown to when the SERVER cached it so the
-  // client timer stays honest without a Torn key.
-  function signupLiveChain(res) {
+  // The live_chain block the Overseer backend serves on BOTH the session and the
+  // token payloads (identical shape). Convert it to the panel's chain shape,
+  // anchoring the countdown to when the SERVER cached it so the timer stays honest
+  // without a Torn key of our own.
+  function serverLiveChain(res) {
     const lc = res && res.live_chain && res.live_chain.chain;
     if (!lc || typeof lc !== "object") return null;
     const current = num(lc.current) ?? 0;
@@ -511,44 +469,27 @@
     };
   }
 
-  function asRows(value) {
-    if (Array.isArray(value)) return value;
-    if (value && typeof value === "object") return Object.values(value);
-    return [];
-  }
-
-  function parseAttacks(raw) {
-    const rows = asRows(raw?.attacks ?? raw);
-    const byId = new Map();
-    let last = null;
-    for (const row of rows) {
-      const attacker = row?.attacker && typeof row.attacker === "object" ? row.attacker : {};
-      const defender = row?.defender && typeof row.defender === "object" ? row.defender : {};
-      const attackerId = num(row?.attacker_id ?? row?.attackerID ?? row?.user_id ?? attacker.id);
-      if (!attackerId || attackerId <= 0) continue;
-      const attackerName = row?.attacker_name || attacker.name || `ID ${attackerId}`;
-      const defenderName = row?.defender_name || defender.name || row?.target_name || "target";
-      const timestamp =
-        num(row?.timestamp_ended ?? row?.ended ?? row?.end ?? row?.timestamp_started ?? row?.started ?? row?.timestamp) ?? 0;
-      const respect =
-        num(row?.respect_gain ?? row?.respect ?? row?.respectGain ?? row?.respect_total ?? row?.respectTotal) ?? 0;
-      const prior = byId.get(attackerId) || {
-        playerId: attackerId,
-        name: attackerName,
-        hits: 0,
-        respect: 0,
-      };
-      prior.hits += 1;
-      prior.respect += respect;
-      byId.set(attackerId, prior);
-      if (timestamp > 0 && (!last || timestamp > last.timestamp)) {
-        last = { attackerName, defenderName, timestamp };
-      }
+  // The hit leaderboard the backend serves (from the attack_outgoing buffer) on
+  // both payloads. It arrives already aggregated + sorted, so the panel just adopts
+  // it — no Torn key, no client-side attack parsing. Null (best-effort failure) or a
+  // between-chains empty list both render as "no data yet".
+  function serverLeaderboard(res) {
+    const block = res && res.leaderboard;
+    if (!block || typeof block !== "object") {
+      return { leaderboard: [], last: null, error: "No leaderboard data yet." };
     }
-    const leaderboard = [...byId.values()]
-      .map((row) => ({ ...row, avg: row.hits > 0 ? row.respect / row.hits : 0 }))
-      .sort((a, b) => b.hits - a.hits || b.respect - a.respect)
-      .slice(0, 8);
+    const rows = Array.isArray(block.leaderboard) ? block.leaderboard : [];
+    const leaderboard = rows.map((r) => ({
+      name: String(r?.name ?? (r?.player_id != null ? `ID ${r.player_id}` : "Unknown")),
+      hits: num(r?.hits) ?? 0,
+      respect: num(r?.respect) ?? 0,
+      avg: num(r?.avg) ?? 0,
+    }));
+    const l = block.last;
+    const ts = l && typeof l === "object" ? num(l.timestamp) : null;
+    const last = ts != null && ts > 0
+      ? { attackerName: String(l.attackerName ?? "?"), defenderName: String(l.defenderName ?? "target"), timestamp: ts }
+      : null;
     return { leaderboard, last, error: null };
   }
 
@@ -558,39 +499,22 @@
     if (manual) state.notice = null;
     render();
     try {
-      const cfg = settings();
       const mode = panelMode();
       // Clear the inactive surface so a mode switch never renders stale data.
       if (mode === "token") state.watch = null;
       else state.signup = null;
       const tasks = [];
-      if (cfg.tornKey) {
-        tasks.push(
-          tornFetch("/faction/chain")
-            .then((raw) => {
-              state.chain = parseChain(raw);
-              state.fetchedAt = Date.now();
-            })
-            .catch((e) => {
-              state.chain = null;
-              state.error = e.message || "Could not load Torn chain.";
-            }),
-        );
-        tasks.push(
-          tornLegacyFaction("attacks")
-            .then((raw) => {
-              state.attacks = parseAttacks(raw);
-            })
-            .catch((e) => {
-              state.attacks = { leaderboard: [], last: null, error: e.message || "Attack log unavailable." };
-            }),
-        );
-      }
+      // Both modes are fully keyless for data: the chain HUD and the hit leaderboard
+      // come from the Overseer backend (live_chain + leaderboard blocks). A Torn key,
+      // if present, is used ONLY to mint/renew the site session — never to fetch data.
       if (mode === "session") {
         tasks.push(
           callFunction("chain-watch", { action: "get" })
             .then((res) => {
               state.watch = res;
+              state.chain = serverLiveChain(res);
+              state.attacks = serverLeaderboard(res);
+              state.fetchedAt = Date.now();
             })
             .catch((e) => {
               state.watch = null;
@@ -603,11 +527,9 @@
           callSignup("get")
             .then((res) => {
               state.signup = res;
-              // No Torn key → drive the chain HUD from the server live-chain block.
-              if (!cfg.tornKey) {
-                state.chain = signupLiveChain(res);
-                state.fetchedAt = Date.now();
-              }
+              state.chain = serverLiveChain(res);
+              state.attacks = serverLeaderboard(res);
+              state.fetchedAt = Date.now();
             })
             .catch((e) => {
               state.signup = null;
@@ -1329,10 +1251,10 @@
       <h2 style="margin:0 0 6px;font-size:20px;">Chain Watch Settings</h2>
       <p class="tocw-muted" style="margin:0 0 14px;">
         Data Storage: local script settings plus faction schedule on Torn Overseer.
-        Data Sharing: Torn API requests go to api.torn.com; shift signup goes to your configured Overseer backend.
+        Data Sharing: every request goes to your configured Overseer backend only — never to api.torn.com.
         Purpose: scheduled chain countdown, watcher shifts, live chain timer, and read-only chain summaries.
       </p>
-      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""}
+      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— only to connect a site session; never used to fetch data</span>
         <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
       </label>
       <label>Site session token

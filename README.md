@@ -29,11 +29,23 @@ automatically — you don't paste one.
 
 ### Setup
 
+You have two ways in; pick whichever fits.
+
+**Token mode (no key, no account) —** open a chain-watch signup **link** that leadership posts in
+faction chat once. The panel binds to that event and works with no Torn key and no Overseer
+session: sign up for shifts, watch the live chain, see the leaderboard. This is the simplest path.
+
+**Session mode (managers / full schedule) —**
+
 1. Open the Chain Watch panel → **Settings**.
 2. Add a **limited-access** Torn API key (Torn → Settings → API Keys). A limited key is all the
    script needs — never use a full-access key. On Torn PDA this is provided for you.
 3. Click **Connect site from Torn key** to mint an Overseer session. That's it — the session
    renews itself automatically when it expires.
+
+The Torn key is used **only** to mint and renew that session. All data the panel shows — the
+schedule, live chain, and hit leaderboard — is served by the Overseer backend, so the script
+**never calls `api.torn.com`** and works without a key of its own once a session or link is set.
 
 ### Security
 
@@ -43,8 +55,9 @@ automatically — you don't paste one.
   back to page storage. A key left in page storage by an older version is migrated out on first
   run.
 - The PDA-injected key is never persisted.
-- Every API and session request goes through the userscript manager (or Torn PDA), never the
-  page's own `fetch`, so your credentials are never exposed to the site.
+- Every request goes through the userscript manager (or Torn PDA) to the **Overseer backend
+  only** — never to `api.torn.com`, and never through the page's own `fetch` — so your
+  credentials are never exposed to the site.
 - Use a **limited-access** key. The script and the Overseer backend never require a full key.
 
 ### Contributing
