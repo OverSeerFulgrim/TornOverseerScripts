@@ -942,7 +942,10 @@
         <div class="tocw-card-title">${event ? "Next scheduled chain" : "No scheduled chain"}</div>
         <div class="tocw-big">${event ? `Starts in ${duration(seconds)}` : "--"}</div>
         <div class="tocw-muted">${event ? `${escapeHtml(event.title)} - ${tctTime(event.starts_at, true)}` : "Ask a chain-watch manager to schedule one."}</div>
-        ${canManage ? `<button class="small" data-tocw-action="schedule" style="margin-top:8px;">Schedule chain</button>` : ""}
+        ${event && event.status === "draft" && canManage
+          ? `<div class="tocw-muted" style="margin-top:6px;">Draft — <a href="https://${OVERSEER_HOST}/faction/chains" target="_blank" rel="noreferrer noopener">publish it &amp; mint the signup link on the site ↗</a></div>`
+          : ""}
+        ${canManage ? `<button class="small" data-tocw-action="schedule" style="margin-top:8px;">Schedule chain (draft)</button>` : ""}
       </div>
     `;
   }
@@ -1205,8 +1208,10 @@
       } else if (action === "schedule") {
         const scheduled = promptSchedule();
         if (!scheduled) return;
-        state.watch = await callFunction("chain-watch", { action: "save_event", ...scheduled });
-        state.notice = "Chain scheduled.";
+        // Create a DRAFT — publishing (and minting the public signup link) stays on the
+        // site, so the script never creates a half-configured live event.
+        state.watch = await callFunction("chain-watch", { action: "save_event", ...scheduled, draft: true });
+        state.notice = "Draft chain created — publish it on the Overseer site to open signups and mint the link.";
       }
       render();
     } catch (e) {
