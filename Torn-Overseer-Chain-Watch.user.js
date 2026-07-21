@@ -1,15 +1,18 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.1.5
+// @version      0.2.0
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
 // @author       OverSeerFulgrim
 // @license      MIT
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
+// @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
+// @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_deleteValue
 // @connect      api.torn.com
 // @connect      ijolgywtybadfuvyopeg.supabase.co
 // @run-at       document-end
@@ -21,7 +24,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.1.5";
+  const VERSION = "0.2.0";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
@@ -36,6 +39,15 @@
     collapsed: "tocw_collapsed",
     position: "tocw_position",
   };
+
+  // Secrets must live in the userscript manager's per-script GM storage ONLY — never
+  // in page (torn.com) localStorage, which the site's own scripts can read. If GM
+  // storage is unavailable we refuse to persist them rather than leak to the page.
+  const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
+
+  function hasGmStorage() {
+    return typeof GM_getValue === "function" && typeof GM_setValue === "function";
+  }
 
   const state = {
     loading: false,
@@ -55,6 +67,9 @@
     } catch {
       /* ignore */
     }
+    // Secrets are NEVER read from page localStorage — a value there would be a leak,
+    // not a source of truth. Non-secret UI prefs may still fall back to localStorage.
+    if (SECRET_KEYS.has(key)) return fallback;
     try {
       const raw = localStorage.getItem(key);
       return raw == null ? fallback : JSON.parse(raw);
@@ -63,16 +78,47 @@
     }
   }
 
+  // Returns true if the value was persisted. A secret is written to GM storage only;
+  // if GM storage is missing we return false (caller surfaces it) rather than writing
+  // the secret to page-readable localStorage.
   function gmSet(key, value) {
     try {
       if (typeof GM_setValue === "function") {
         GM_setValue(key, value);
-        return;
+        return true;
       }
     } catch {
       /* ignore */
     }
-    localStorage.setItem(key, JSON.stringify(value));
+    if (SECRET_KEYS.has(key)) return false;
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // One-time migration: if a previous version stashed a secret in page localStorage,
+  // move it into GM storage and scrub it from the page as soon as GM storage exists.
+  function migrateSecretsFromLocalStorage() {
+    if (!hasGmStorage()) return;
+    for (const key of SECRET_KEYS) {
+      let raw;
+      try {
+        raw = localStorage.getItem(key);
+      } catch {
+        continue;
+      }
+      if (raw == null) continue;
+      try {
+        const existing = GM_getValue(key, "");
+        if (!existing) GM_setValue(key, JSON.parse(raw));
+        localStorage.removeItem(key);
+      } catch {
+        /* ignore a malformed legacy value */
+      }
+    }
   }
 
   function readString(key, fallback = "") {
@@ -136,11 +182,18 @@
     };
   }
 
+  // Returns true if the secrets (key + session) were persisted; false means GM
+  // storage is unavailable and they were deliberately NOT written to the page.
   function saveSettings(next) {
-    gmSet(STORE.tornKey, (next.tornKey || "").trim());
+    const pda = pdaApiKey();
+    let tornKey = (next.tornKey || "").trim();
+    // Never persist the PDA-injected key — TornPDA provides it fresh each load.
+    if (pda && tornKey === pda) tornKey = "";
+    const okKey = gmSet(STORE.tornKey, tornKey);
     gmSet(STORE.functionsUrl, (next.functionsUrl || DEFAULT_FUNCTIONS_URL).trim());
     gmSet(STORE.anonKey, (next.anonKey || DEFAULT_ANON_KEY).trim());
-    gmSet(STORE.sessionToken, (next.sessionToken || "").trim());
+    const okSession = gmSet(STORE.sessionToken, (next.sessionToken || "").trim());
+    return okKey && okSession;
   }
 
   function escapeHtml(value) {
@@ -158,19 +211,25 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  function httpError(message, status) {
+    const err = new Error(message);
+    err.status = status;
+    return err;
+  }
+
   function parseHttpJson(status, responseText, url) {
     let parsed = null;
     try {
       parsed = responseText ? JSON.parse(responseText) : null;
     } catch {
-      throw new Error(`Non-JSON response from ${url}`);
+      throw httpError(`Non-JSON response from ${url}`, status);
     }
     if (status < 200 || status >= 300) {
       const msg =
         parsed && typeof parsed === "object" && typeof parsed.error === "string"
           ? parsed.error
           : `Request failed (${status})`;
-      throw new Error(msg);
+      throw httpError(msg, status);
     }
     return parsed;
   }
@@ -189,15 +248,6 @@
     return parseHttpJson(status, responseText, url);
   }
 
-  async function requestJsonWithFetch(url, options = {}) {
-    const method = options.method || "GET";
-    const headers = options.headers || {};
-    const body = options.body == null ? undefined : JSON.stringify(options.body);
-    const res = await fetch(url, { method, headers, body });
-    const text = await res.text();
-    return parseHttpJson(res.status, text, url);
-  }
-
   function requestJson(url, options = {}) {
     if (
       typeof window.PDA_httpGet === "function" &&
@@ -205,7 +255,14 @@
     ) {
       return requestJsonWithTornPda(url, options);
     }
-    if (typeof GM_xmlhttpRequest !== "function") return requestJsonWithFetch(url, options);
+    // No page-context fetch fallback: every API/session call must go through the
+    // userscript manager (GM_xmlhttpRequest) or Torn PDA, so the Torn key and session
+    // token are never exposed to torn.com's own page scripts.
+    if (typeof GM_xmlhttpRequest !== "function") {
+      return Promise.reject(
+        new Error("This script needs Tampermonkey (or Torn PDA) — the browser's own fetch is never used for API or session calls, to keep your Torn key and session private."),
+      );
+    }
 
     const method = options.method || "GET";
     const headers = options.headers || {};
@@ -256,21 +313,31 @@
     return requestJson(url.toString());
   }
 
-  async function callFunction(slug, body = {}) {
+  async function callFunction(slug, body = {}, opts = {}) {
     const cfg = settings();
     if (!cfg.functionsUrl || !cfg.anonKey || !cfg.sessionToken) {
       throw new Error("Connect the site session in Settings.");
     }
-    return requestJson(`${cfg.functionsUrl.replace(/\/+$/, "")}/${slug}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: cfg.anonKey,
-        Authorization: `Bearer ${cfg.anonKey}`,
-        "X-Session-Token": cfg.sessionToken,
-      },
-      body,
-    });
+    try {
+      return await requestJson(`${cfg.functionsUrl.replace(/\/+$/, "")}/${slug}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: cfg.anonKey,
+          Authorization: `Bearer ${cfg.anonKey}`,
+          "X-Session-Token": cfg.sessionToken,
+        },
+        body,
+      });
+    } catch (error) {
+      // Session expired or was invalidated → transparently re-mint it from the stored
+      // Torn key once (sliding renewal), then retry. Needs a Torn key to reconnect.
+      if (error && error.status === 401 && !opts.retried && cfg.tornKey) {
+        await connectSiteFromTornKey();
+        return callFunction(slug, body, { retried: true });
+      }
+      throw error;
+    }
   }
 
   async function connectSiteFromTornKey() {
@@ -901,8 +968,8 @@
         Data Sharing: Torn API requests go to api.torn.com; shift signup goes to your configured Overseer backend.
         Purpose: scheduled chain countdown, watcher shifts, live chain timer, and read-only chain summaries.
       </p>
-      <label>Torn API key ${pdaApiKey() ? "(from TornPDA)" : ""}
-        <input id="tocw-set-torn-key" type="password" value="${escapeHtml(cfg.tornKey)}" autocomplete="off" />
+      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""}
+        <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
       </label>
       <label>Site session token
         <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
@@ -940,8 +1007,11 @@
     backdrop.addEventListener("click", close);
     document.getElementById("tocw-modal-close")?.addEventListener("click", close);
     document.getElementById("tocw-modal-save")?.addEventListener("click", () => {
-      saveSettings(collect());
-      state.notice = "Settings saved.";
+      if (saveSettings(collect())) {
+        state.notice = "Settings saved.";
+      } else {
+        state.error = "Install Tampermonkey or use Torn PDA — your key and session can't be stored securely otherwise, so they were not saved.";
+      }
       close();
     });
     document.getElementById("tocw-modal-connect")?.addEventListener("click", async () => {
@@ -1003,6 +1073,7 @@
       return;
     }
     console.info("[Torn Overseer Chain Watch] loaded", location.href);
+    migrateSecretsFromLocalStorage();
     createLauncher();
     try {
       createShell();
