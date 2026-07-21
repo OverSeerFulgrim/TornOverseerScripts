@@ -25,6 +25,7 @@
   window.__tornOverseerChainWatchLoaded = true;
 
   const VERSION = "0.2.0";
+  const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
@@ -58,6 +59,7 @@
     attacks: null,
     fetchedAt: null,
     settingsOpen: false,
+    scriptTooOld: false,
     collapsed: readBool(STORE.collapsed, false),
   };
 
@@ -209,6 +211,32 @@
   function num(value) {
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
+  }
+
+  // Semantic-ish version compare (dot-separated integers). -1 if a<b, 0 eq, 1 a>b.
+  function compareVersions(a, b) {
+    const pa = String(a || "0").split(".").map((n) => parseInt(n, 10) || 0);
+    const pb = String(b || "0").split(".").map((n) => parseInt(n, 10) || 0);
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i += 1) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    }
+    return 0;
+  }
+
+  // The min/latest_script_version handshake the backend advertises in its get
+  // response: too old -> the site may reject/misbehave, so lock actions; a newer
+  // latest -> a non-blocking "update available" nudge.
+  function scriptVersionState() {
+    const w = state.watch || {};
+    const min = typeof w.min_script_version === "string" ? w.min_script_version : null;
+    const latest = typeof w.latest_script_version === "string" ? w.latest_script_version : null;
+    return {
+      tooOld: min ? compareVersions(VERSION, min) < 0 : false,
+      updateAvailable: latest ? compareVersions(VERSION, latest) < 0 : false,
+      latest,
+    };
   }
 
   function httpError(message, status) {
@@ -701,6 +729,14 @@
     const scheduledSeconds = event ? countdownTo(event.starts_at) : null;
     const { current, next } = currentAndNextShift();
 
+    const vstat = scriptVersionState();
+    state.scriptTooOld = vstat.tooOld;
+    const versionAlert = vstat.tooOld
+      ? `<div class="tocw-alert bad">Chain Watch v${VERSION} is out of date${vstat.latest ? ` (this faction needs v${escapeHtml(vstat.latest)}+)` : ""}. <a href="${UPDATE_URL}" target="_blank" rel="noreferrer noopener">Update the script</a> — actions are disabled until you do.</div>`
+      : vstat.updateAvailable
+        ? `<div class="tocw-alert">Chain Watch v${escapeHtml(vstat.latest)} is available (you have v${VERSION}). <a href="${UPDATE_URL}" target="_blank" rel="noreferrer noopener">Update</a>.</div>`
+        : "";
+
     box.innerHTML = `
       <div class="tocw-head" id="tocw-drag-handle" title="Drag to move Chain Watch">
         <div class="tocw-pills">
@@ -719,6 +755,7 @@
       <div class="tocw-body">
         ${state.error ? `<div class="tocw-alert bad">${escapeHtml(state.error)}</div>` : ""}
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
+        ${versionAlert}
         ${!cfg.tornKey || !cfg.sessionToken ? `<div class="tocw-alert">Add your Torn API key, connect the site session, then refresh.</div>` : ""}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
@@ -865,6 +902,14 @@
   async function handleAction(btn) {
     const action = btn.getAttribute("data-tocw-action");
     const shiftId = Number(btn.getAttribute("data-shift"));
+    // Locked out until the script is updated — the backend advertised a higher
+    // min_script_version, so mutations may be rejected or behave unexpectedly.
+    if (state.scriptTooOld) {
+      state.error = "Update the Chain Watch script to continue — it's too old for the current site.";
+      state.notice = null;
+      render();
+      return;
+    }
     try {
       if (action === "signup") {
         state.watch = await callFunction("chain-watch", { action: "signup", shift_id: shiftId });
