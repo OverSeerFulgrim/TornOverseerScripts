@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.3.0
+// @version      0.4.0
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -25,7 +25,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.3.0";
+  const VERSION = "0.4.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -1011,25 +1011,37 @@
     `;
   }
 
+  // A session-mode event whose sheet can no longer change: a frozen finalized
+  // archive, or an imported historical event. Both are immutable server-side
+  // (migration 0091), so every mutating action would 409 — the panel renders
+  // them read-only instead of dangling buttons that only produce errors.
+  function watchEventReadOnly(event) {
+    if (!event) return false;
+    return event.status === "frozen" || event.status === "imported" || Boolean(event.frozen_at);
+  }
+
   function renderShifts() {
     if (panelMode() === "token") return renderSignupShifts();
+    const event = state.watch?.event;
+    if (!event) return "";
     const shifts = state.watch?.shifts || [];
     const viewer = state.watch?.viewer || {};
-    if (!state.watch?.event) return "";
+    const readOnly = watchEventReadOnly(event);
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">Chainwatch shifts</div>
-        ${shifts.map((shift) => renderShiftRow(shift, viewer)).join("")}
+        ${readOnly ? `<div class="tocw-muted">🔒 ${event.status === "imported" ? "Imported chain" : "Chain finalized"} — this sheet is read-only.</div>` : ""}
+        ${shifts.map((shift) => renderShiftRow(shift, viewer, readOnly)).join("")}
       </div>
     `;
   }
 
-  function renderShiftRow(shift, viewer) {
+  function renderShiftRow(shift, viewer, readOnly) {
     return `
       <div class="tocw-row">
         <div class="tocw-muted">${shiftLabel(shift)}</div>
-        ${renderSlot(shift, "main", viewer)}
-        ${renderSlot(shift, "backup", viewer)}
+        ${renderSlot(shift, "main", viewer, readOnly)}
+        ${renderSlot(shift, "backup", viewer, readOnly)}
       </div>
     `;
   }
@@ -1038,7 +1050,7 @@
   // Locked slots are read-only for members (backend enforces too); a manager sees an
   // Unlock button. Every action button carries data-role so handleAction targets the
   // right slot.
-  function renderSlot(shift, role, viewer) {
+  function renderSlot(shift, role, viewer, readOnly) {
     const isBackup = role === "backup";
     const watcherId = isBackup ? shift.backup_watcher_id : shift.watcher_id;
     const watcherName = isBackup ? shift.backup_watcher_name : shift.watcher_name;
@@ -1050,8 +1062,12 @@
     const roleLabel = isBackup ? "Backup" : "Main";
     const btn = (act, label) => `<button class="small" data-tocw-action="${act}" data-shift="${shift.id}" data-role="${role}">${label}</button>`;
 
+    // A finalized/imported event is immutable: show who filled each slot, but no
+    // claim/assign/lock controls (they'd 409 server-side).
     const actions = [];
-    if (locked) {
+    if (readOnly) {
+      // no actions — read-only archive
+    } else if (locked) {
       if (canManage) actions.push(btn("unlock", "Unlock"));
     } else if (assigned) {
       if (canManage) actions.push(btn("assign", "Change"));
@@ -1085,6 +1101,17 @@
     const shifts = signup.shifts || [];
     const identity = getSignupIdentity();
     const canClaim = Boolean(signup.can_claim);
+    const phase = signup.event.phase;
+    // A frozen event is a finalized archive (read-only). Distinguish it from an
+    // ordinary closed/draft sheet so the panel reads as "locked record", not
+    // "you missed signups".
+    const closedNote = canClaim
+      ? ""
+      : phase === "frozen"
+        ? `<div class="tocw-muted">🔒 This chain is finalized — the sheet is read-only.</div>`
+        : phase === "draft"
+          ? `<div class="tocw-muted">This chain hasn't been published yet.</div>`
+          : `<div class="tocw-muted">Signups are closed for this chain.</div>`;
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">Chainwatch shifts</div>
@@ -1096,7 +1123,7 @@
             ${renderSignupSlot(shift, "backup", canClaim, identity)}
           </div>
         `).join("")}
-        ${!canClaim ? `<div class="tocw-muted">Signups are closed for this chain.</div>` : ""}
+        ${closedNote}
       </div>
     `;
   }
@@ -1181,6 +1208,14 @@
     // min_script_version, so mutations may be rejected or behave unexpectedly.
     if (state.scriptTooOld) {
       state.error = "Update the Chain Watch script to continue — it's too old for the current site.";
+      state.notice = null;
+      render();
+      return;
+    }
+    // A finalized/imported event is immutable server-side; block the doomed call
+    // from a stale button and say why (schedule is exempt — it starts a NEW event).
+    if (action !== "schedule" && watchEventReadOnly(state.watch?.event)) {
+      state.error = "This chain is finalized — the sheet is read-only.";
       state.notice = null;
       render();
       return;
