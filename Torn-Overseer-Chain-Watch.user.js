@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.8.1
-// @description  Scheduled chain countdown, chainwatch shift signup, and a zero-lag live chain timer + hit leaderboard pulled straight from Torn with your key (Overseer backend as fallback). Read-only — never attacks for you.
+// @version      0.9.0
+// @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
@@ -25,7 +25,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.8.1";
+  const VERSION = "0.9.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -47,6 +47,11 @@
   const ATTACKS_MIN_INTERVAL = 6000;
   const SCHEDULE_MIN_INTERVAL = 25000;
 
+  // Watcher alarms: seconds-to-drop at which to sound off (once each, per chain run),
+  // and how early to warn before your own shift starts.
+  const DROP_THRESHOLDS = [60, 30, 10];
+  const SHIFT_WARN_SECS = 300; // 5-minute heads-up before your shift
+
   const STORE = {
     tornKey: "tocw_torn_key",
     functionsUrl: "tocw_functions_url",
@@ -60,6 +65,10 @@
     position: "tocw_position",
     size: "tocw_size",
     launcherPos: "tocw_launcher_pos",
+    alarm: "tocw_alarm",
+    alarmSound: "tocw_alarm_sound",
+    alarmVibrate: "tocw_alarm_vibrate",
+    alarmFlash: "tocw_alarm_flash",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -91,6 +100,16 @@
     // Fully hidden: only the "TO" launcher shows. Distinct from collapsed (which
     // keeps a compact header). Needed on mobile PDA where the panel fills the screen.
     hidden: readBool(STORE.hidden, false),
+    // Watcher alarms (opt-in). Each output channel is independently toggleable.
+    alarm: readBool(STORE.alarm, false),
+    alarmSound: readBool(STORE.alarmSound, true),
+    alarmVibrate: readBool(STORE.alarmVibrate, true),
+    alarmFlash: readBool(STORE.alarmFlash, true),
+    // Fire-once bookkeeping so an alarm sounds at each threshold only once per chain
+    // run / shift (cleared when the drop timer resets on a fresh hit, or the chain ends).
+    firedDrop: new Set(),
+    firedShift: new Set(),
+    lastRemaining: null,
   };
 
   function gmGet(key, fallback) {
@@ -797,12 +816,18 @@
     // The fast poll only pays off when we can read Torn directly (a key) during a live
     // chain; keyless viewers can't beat the backend cache, so they stay on the easy pace.
     const canLive = Boolean(settings().tornKey) && Boolean(state.chain?.active);
-    const delay = state.hidden ? HIDDEN_POLL_MS : canLive ? LIVE_POLL_MS : IDLE_POLL_MS;
+    // Keep polling fast even while hidden IF alarms are armed on a live chain — an alarm
+    // is only as accurate as the last chain fetch, so it must not go stale in a pocket.
+    const delay = canLive && (!state.hidden || state.alarm)
+      ? LIVE_POLL_MS
+      : state.hidden ? HIDDEN_POLL_MS : IDLE_POLL_MS;
     refreshTimer = setTimeout(() => {
-      if (document.visibilityState === "visible" && !state.hidden) {
+      // Poll whenever the TAB is foreground (panel hidden is fine — alarms/data still
+      // need refreshing); a backgrounded tab pauses (browsers throttle it anyway).
+      if (document.visibilityState === "visible") {
         void refreshAll(false); // re-arms the loop in its finally
       } else {
-        scheduleNextRefresh(); // paused (hidden / backgrounded) — keep the loop alive
+        scheduleNextRefresh(); // paused (tab backgrounded) — keep the loop alive
       }
     }, delay);
   }
@@ -866,6 +891,167 @@
     const current = shifts.find((s) => new Date(s.shift_start).getTime() <= now && new Date(s.shift_end).getTime() > now) || null;
     const next = shifts.find((s) => new Date(s.shift_start).getTime() > now) || null;
     return { current, next };
+  }
+
+  // --- Who "you" are, and which of the shifts are yours ------------------------
+
+  // The viewer's Torn id: from the session (session mode) or the cached signup
+  // identity (token mode). Null when we don't know who's watching (nothing personal).
+  function viewerId() {
+    const sid = state.watch?.viewer?.player_id;
+    if (sid != null) return Number(sid);
+    const identity = getSignupIdentity();
+    return identity && identity.id != null ? Number(identity.id) : null;
+  }
+
+  // Every shift the viewer holds (main or backup), across both payload shapes,
+  // sorted by start. Empty when the viewer holds none / is unknown.
+  function viewerShifts() {
+    const vid = viewerId();
+    if (vid == null) return [];
+    const out = [];
+    if (Array.isArray(state.watch?.shifts)) {
+      for (const s of state.watch.shifts) {
+        if (Number(s.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "main" });
+        if (Number(s.backup_watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "backup" });
+      }
+    } else if (Array.isArray(state.signup?.shifts)) {
+      for (const s of state.signup.shifts) {
+        if (s.main && Number(s.main.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "main" });
+        if (s.backup && Number(s.backup.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "backup" });
+      }
+    }
+    return out.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+  }
+
+  // The viewer's currently-active shift (if on watch now) and their next upcoming one.
+  function viewerShiftStatus() {
+    const now = Date.now();
+    const mine = viewerShifts();
+    const active = mine.find((s) => new Date(s.start).getTime() <= now && new Date(s.end).getTime() > now) || null;
+    const next = mine.find((s) => new Date(s.start).getTime() > now) || null;
+    return { active, next };
+  }
+
+  // --- Alarms (opt-in): sound (WebAudio), vibration, and a panel flash ---------
+
+  let audioCtx = null;
+  // Must be primed by a user gesture (the alarm toggle) or the browser/PDA blocks
+  // audio; resuming a suspended context here is what makes later beeps actually play.
+  function primeAudio() {
+    try {
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        audioCtx = new Ctx();
+      }
+      if (audioCtx.state === "suspended") void audioCtx.resume();
+    } catch {
+      audioCtx = null;
+    }
+  }
+
+  function beep(count = 1, freq = 880) {
+    if (!audioCtx) primeAudio();
+    if (!audioCtx) return;
+    try {
+      const t0 = audioCtx.currentTime;
+      for (let i = 0; i < count; i += 1) {
+        const at = t0 + i * 0.18;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "square";
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(0.28, at + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.15);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(at);
+        osc.stop(at + 0.17);
+      }
+    } catch {
+      /* audio can fail on some webviews — never let it break the tick */
+    }
+  }
+
+  function flashPanel(kind) {
+    const box = document.getElementById("tocw");
+    if (!box) return;
+    const cls = kind === "drop" ? "tocw-flash-bad" : "tocw-flash-warn";
+    box.classList.remove(cls);
+    void box.offsetWidth; // restart the animation
+    box.classList.add(cls);
+    setTimeout(() => box.classList.remove(cls), 1500);
+  }
+
+  function fireAlarm(kind, message) {
+    if (state.alarmSound) beep(kind === "drop" ? 3 : 2, kind === "drop" ? 990 : 740);
+    if (state.alarmVibrate) {
+      try {
+        navigator.vibrate?.(kind === "drop" ? [130, 60, 130, 60, 220] : [200, 100, 200]);
+      } catch {
+        /* not supported */
+      }
+    }
+    if (state.alarmFlash) flashPanel(kind);
+    state.notice = message;
+  }
+
+  // Runs every second (even while collapsed/hidden — the whole point is to alert you
+  // when you're NOT looking). Fires each drop threshold once per chain run, re-arming
+  // when a fresh hit pushes the timer back up; warns before + at your shift start.
+  function evaluateAlarms() {
+    if (!state.alarm) return;
+
+    if (state.chain?.active) {
+      const remaining = chainRemaining();
+      // A fresh hit reset the timer upward → re-arm the thresholds for this run.
+      if (state.lastRemaining != null && remaining > state.lastRemaining + 3) state.firedDrop.clear();
+      state.lastRemaining = remaining;
+      for (const t of DROP_THRESHOLDS) {
+        if (remaining > 0 && remaining <= t && !state.firedDrop.has(t)) {
+          state.firedDrop.add(t);
+          fireAlarm("drop", `Chain drops in ${remaining}s — HIT NOW!`);
+          break; // one alert per tick
+        }
+      }
+    } else {
+      state.firedDrop.clear();
+      state.lastRemaining = null;
+    }
+
+    const { active, next } = viewerShiftStatus();
+    if (next) {
+      const secs = countdownTo(next.start);
+      if (secs != null) {
+        const warnKey = `${next.start}:warn`;
+        const nowKey = `${next.start}:now`;
+        if (secs <= SHIFT_WARN_SECS && secs > 30 && !state.firedShift.has(warnKey)) {
+          state.firedShift.add(warnKey);
+          fireAlarm("shift", `Your ${next.role} shift starts in ${Math.max(1, Math.round(secs / 60))}m — get ready.`);
+        }
+        if (secs <= 5 && !state.firedShift.has(nowKey)) {
+          state.firedShift.add(nowKey);
+          fireAlarm("shift", "Your shift is starting now.");
+        }
+      }
+    }
+    if (active) {
+      const liveKey = `${active.start}:live`;
+      if (!state.firedShift.has(liveKey)) {
+        state.firedShift.add(liveKey);
+        fireAlarm("shift", "You're on watch now — keep the chain alive.");
+      }
+    }
+  }
+
+  // Drop-timer urgency: green while comfortable, amber approaching, red (pulsing) close.
+  function timerUrgencyClass(remaining) {
+    if (remaining <= 0) return "";
+    if (remaining <= 30) return "u-bad";
+    if (remaining <= 60) return "u-warn";
+    return "u-ok";
   }
 
   function createShell() {
@@ -944,6 +1130,29 @@
       .tocw-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
       .tocw-progress { height: 8px; background: #0a1018; border-radius: 999px; overflow: hidden; border: 1px solid #28394d; margin-top: 6px; }
       .tocw-progress span { display: block; height: 100%; background: #35b76f; }
+      /* Drop-timer urgency */
+      .tocw-big.u-ok { color: #6ff0a8; }
+      .tocw-big.u-warn { color: #ffcf6b; }
+      .tocw-big.u-bad { color: #ff6d76; animation: tocw-pulse .9s ease-in-out infinite; }
+      @keyframes tocw-pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+      /* Alarm flash on the whole panel */
+      @keyframes tocw-flashbad { 30% { box-shadow: 0 0 0 4px rgba(255,60,72,.9), 0 0 34px rgba(255,60,72,.75); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
+      @keyframes tocw-flashwarn { 30% { box-shadow: 0 0 0 4px rgba(255,190,80,.85), 0 0 30px rgba(255,190,80,.6); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
+      #tocw.tocw-flash-bad { animation: tocw-flashbad 1.4s ease-out; }
+      #tocw.tocw-flash-warn { animation: tocw-flashwarn 1.4s ease-out; }
+      /* Active / your shift row highlight */
+      .tocw-row.active { background: #12233a; border-radius: 6px; box-shadow: inset 3px 0 0 #35b76f; padding-left: 6px; }
+      .tocw-row.mine { box-shadow: inset 3px 0 0 #ff9f43; }
+      .tocw-row.active.mine { background: #1a2740; box-shadow: inset 3px 0 0 #ffce54; }
+      .tocw-you { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 10px; font-weight: 800; background: #ff9f43; color: #201200; vertical-align: middle; }
+      /* Watcher status banner + alarm button */
+      .tocw-watch-banner { padding: 9px 10px; border-radius: 8px; font-weight: 800; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+      .tocw-watch-banner.on { background: #103d2b; color: #d6ffe8; border: 1px solid #2f7d55; }
+      .tocw-watch-banner.soon { background: #1d344f; color: #d9ebff; border: 1px solid #34506f; }
+      .tocw-watch-banner .tocw-shift-time { font-size: 17px; font-weight: 900; }
+      #tocw-alarm.on { background: #ff3b45; border-color: #ff6870; color: #fff; }
+      #tocw-modal .tocw-check { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-weight: 700; color: #cfe0f7; font-size: 12px; }
+      #tocw-modal .tocw-check input { width: auto; }
       .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; }
       .tocw-table th, .tocw-table td { text-align: right; padding: 5px 4px; border-top: 1px solid #25384d; }
       .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; }
@@ -1155,6 +1364,7 @@
             <div class="tocw-muted">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
           </div>
           <div style="display:flex;gap:6px;align-items:flex-start;flex-shrink:0;">
+            <button id="tocw-alarm" class="small ${state.alarm ? "on" : ""}" title="${state.alarm ? "Watcher alarms ON — click to mute" : "Turn on watcher alarms (drop timer + your shift)"}" aria-label="Toggle alarms">${state.alarm ? "🔔" : "🔕"}</button>
             <button id="tocw-collapse" class="small" title="${state.collapsed ? "Expand the panel" : "Minimize to the header"}">${state.collapsed ? "Open" : "Min"}</button>
             <button id="tocw-hide" class="small" title="Hide — reopen with the TO button" aria-label="Hide panel">✕</button>
           </div>
@@ -1171,6 +1381,7 @@
             : !cfg.sessionToken
               ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
               : ""}
+        ${renderWatchBanner()}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
         <div class="tocw-actions">
@@ -1189,6 +1400,18 @@
       if (newBody) newBody.scrollTop = savedScroll;
     }
 
+    document.getElementById("tocw-alarm")?.addEventListener("click", () => {
+      state.alarm = !state.alarm;
+      gmSet(STORE.alarm, state.alarm);
+      if (state.alarm) {
+        primeAudio(); // this click is the user gesture that unlocks audio
+        if (state.alarmSound) beep(1);
+        state.notice = "Watcher alarms on — you'll be alerted near the drop and at your shift.";
+      } else {
+        state.notice = "Watcher alarms muted.";
+      }
+      render();
+    });
     document.getElementById("tocw-collapse")?.addEventListener("click", () => {
       state.collapsed = !state.collapsed;
       gmSet(STORE.collapsed, state.collapsed);
@@ -1232,6 +1455,27 @@
     `;
   }
 
+  // Personal watcher banner: "you're on watch now — ends in X" or "your shift starts
+  // in X". Shown above the chain HUD in every mode so a watcher always knows their
+  // status at a glance. The countdown element is updated in place each second by tick().
+  function renderWatchBanner() {
+    const { active, next } = viewerShiftStatus();
+    if (active) {
+      const ends = Math.max(0, Math.floor((new Date(active.end).getTime() - Date.now()) / 1000));
+      return `<div class="tocw-watch-banner on">
+        <span>🟢 You're on watch now${active.role === "backup" ? " (backup)" : ""}</span>
+        <span>ends in <span class="tocw-shift-time" id="tocw-shift-timer">${duration(ends)}</span></span>
+      </div>`;
+    }
+    if (next) {
+      return `<div class="tocw-watch-banner soon">
+        <span>⏰ Your ${next.role === "backup" ? "backup " : ""}shift</span>
+        <span>starts in <span class="tocw-shift-time" id="tocw-shift-timer">${duration(countdownTo(next.start))}</span></span>
+      </div>`;
+    }
+    return "";
+  }
+
   function renderLive(chain, remaining, bonus, bonusPct, current, next) {
     const attacks = state.attacks || { leaderboard: [], last: null, error: null };
     const currentOffline = current?.watcher_id && current.watcher_online_status !== "Online";
@@ -1241,7 +1485,7 @@
         <div class="tocw-grid">
           <div>
             <div class="tocw-muted">Drop timer</div>
-            <div class="tocw-big" id="tocw-timer">${duration(remaining)}</div>
+            <div class="tocw-big ${timerUrgencyClass(remaining)}" id="tocw-timer">${duration(remaining)}</div>
           </div>
           <div>
             <div class="tocw-muted">Hits</div>
@@ -1319,9 +1563,13 @@
   }
 
   function renderShiftRow(shift, viewer, readOnly) {
+    const now = Date.now();
+    const active = new Date(shift.shift_start).getTime() <= now && new Date(shift.shift_end).getTime() > now;
+    const vid = viewer.player_id != null ? Number(viewer.player_id) : null;
+    const mine = vid != null && (Number(shift.watcher_id) === vid || Number(shift.backup_watcher_id) === vid);
     return `
-      <div class="tocw-row">
-        <div class="tocw-muted">${shiftLabel(shift)}</div>
+      <div class="tocw-row${active ? " active" : ""}${mine ? " mine" : ""}">
+        <div class="tocw-muted">${shiftLabel(shift)}${mine ? `<span class="tocw-you">YOU</span>` : ""}</div>
         ${renderSlot(shift, "main", viewer, readOnly)}
         ${renderSlot(shift, "backup", viewer, readOnly)}
       </div>
@@ -1402,13 +1650,19 @@
           : canClaim
             ? `<div class="tocw-muted">Signing up verifies you with your Torn key${settings().tornKey || settings().sessionToken ? "" : " — add it in Settings"}.</div>`
             : ""}
-        ${shifts.map((shift) => `
-          <div class="tocw-row">
-            <div class="tocw-muted">${shiftLabel(shift)}</div>
+        ${shifts.map((shift) => {
+          const now = Date.now();
+          const active = new Date(shift.shift_start).getTime() <= now && new Date(shift.shift_end).getTime() > now;
+          const vid = identity && identity.id != null ? Number(identity.id) : null;
+          const mine = vid != null && (Number(shift.main?.watcher_id) === vid || Number(shift.backup?.watcher_id) === vid);
+          return `
+          <div class="tocw-row${active ? " active" : ""}${mine ? " mine" : ""}">
+            <div class="tocw-muted">${shiftLabel(shift)}${mine ? `<span class="tocw-you">YOU</span>` : ""}</div>
             ${renderSignupSlot(shift, "main", canClaim, identity)}
             ${renderSignupSlot(shift, "backup", canClaim, identity)}
           </div>
-        `).join("")}
+        `;
+        }).join("")}
         ${closedNote}
       </div>
     `;
@@ -1624,6 +1878,19 @@
           <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
         </div>
       </div>
+      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+        <label class="tocw-check" style="font-size:14px;">
+          <input type="checkbox" id="tocw-set-alarm" ${state.alarm ? "checked" : ""} /> Watcher alarms
+        </label>
+        <div class="tocw-muted" style="margin:2px 0 8px;">
+          Alerts near the chain drop (${DROP_THRESHOLDS.join(" / ")}s) and before + at your own shift.
+          Also toggle with the 🔔 button in the header. Enable it with a click so audio can play.
+        </div>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-sound" ${state.alarmSound ? "checked" : ""} /> Sound (beep)</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-vibrate" ${state.alarmVibrate ? "checked" : ""} /> Vibrate (mobile / PDA)</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-flash" ${state.alarmFlash ? "checked" : ""} /> Visual flash</label>
+        <button id="tocw-alarm-test" class="small" style="margin-top:6px;">Test alarm</button>
+      </div>
       <details style="margin-top:10px;">
         <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Advanced backend settings</summary>
         <div class="grid" style="margin-top:10px;">
@@ -1650,14 +1917,36 @@
       anonKey: valueOf("tocw-set-anon"),
       sessionToken: valueOf("tocw-set-session"),
     });
+    const checked = (id) => Boolean(document.getElementById(id)?.checked);
+    const applyAlarmSettings = () => {
+      const wasOff = !state.alarm;
+      state.alarm = checked("tocw-set-alarm");
+      state.alarmSound = checked("tocw-set-alarm-sound");
+      state.alarmVibrate = checked("tocw-set-alarm-vibrate");
+      state.alarmFlash = checked("tocw-set-alarm-flash");
+      gmSet(STORE.alarm, state.alarm);
+      gmSet(STORE.alarmSound, state.alarmSound);
+      gmSet(STORE.alarmVibrate, state.alarmVibrate);
+      gmSet(STORE.alarmFlash, state.alarmFlash);
+      if (state.alarm && wasOff) primeAudio(); // Save click is a user gesture → unlock audio
+    };
     const close = () => {
       state.settingsOpen = false;
       render();
     };
     backdrop.addEventListener("click", close);
     document.getElementById("tocw-modal-close")?.addEventListener("click", close);
+    document.getElementById("tocw-alarm-test")?.addEventListener("click", () => {
+      primeAudio();
+      if (checked("tocw-set-alarm-sound")) beep(3, 990);
+      if (checked("tocw-set-alarm-vibrate")) {
+        try { navigator.vibrate?.([130, 60, 130, 60, 220]); } catch { /* unsupported */ }
+      }
+      if (checked("tocw-set-alarm-flash")) flashPanel("drop");
+    });
     document.getElementById("tocw-modal-save")?.addEventListener("click", () => {
       const ok = saveSettings(collect());
+      applyAlarmSettings();
       // Last-resort manual link entry: bind a pasted signup link/token.
       const pasted = extractSignupToken(valueOf("tocw-set-signup"));
       if (pasted) gmSet(STORE.signupToken, pasted);
@@ -1816,6 +2105,9 @@
     console.info("[Torn Overseer Chain Watch] loaded", location.href);
     migrateSecretsFromLocalStorage();
     createLauncher();
+    // Persisted-on alarms: browsers block audio until a user gesture, so prime the
+    // audio context on the first tap/click anywhere on the page.
+    if (state.alarm) document.addEventListener("pointerdown", () => primeAudio(), { once: true });
     try {
       createShell();
       render();
@@ -1834,15 +2126,31 @@
   // re-rendering the panel. Full re-renders happen on data polls (which preserve scroll).
   function tick() {
     try {
+      // Alarms run regardless of visibility — they exist to alert you when the panel
+      // is collapsed or hidden and you're not watching it.
+      evaluateAlarms();
       if (state.hidden || state.collapsed) return;
+
       const el = document.getElementById("tocw-timer");
-      if (!el) return;
-      if (state.chain?.active) {
-        el.textContent = duration(chainRemaining());
-      } else {
-        const event = state.watch?.event || state.signup?.event || null;
-        const seconds = event ? countdownTo(event.starts_at) : null;
-        el.textContent = event ? `Starts in ${duration(seconds)}` : "--";
+      if (el) {
+        if (state.chain?.active) {
+          const remaining = chainRemaining();
+          el.textContent = duration(remaining);
+          el.className = `tocw-big ${timerUrgencyClass(remaining)}`;
+        } else {
+          const event = state.watch?.event || state.signup?.event || null;
+          const seconds = event ? countdownTo(event.starts_at) : null;
+          el.textContent = event ? `Starts in ${duration(seconds)}` : "--";
+          el.className = "tocw-big";
+        }
+      }
+
+      // The viewer's own shift countdown ("on watch — ends in / starts in").
+      const shiftEl = document.getElementById("tocw-shift-timer");
+      if (shiftEl) {
+        const { active, next } = viewerShiftStatus();
+        if (active) shiftEl.textContent = duration(Math.max(0, Math.floor((new Date(active.end).getTime() - Date.now()) / 1000)));
+        else if (next) shiftEl.textContent = duration(countdownTo(next.start));
       }
     } catch (error) {
       console.error("[Torn Overseer Chain Watch] tick failed", error);
