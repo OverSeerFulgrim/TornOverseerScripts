@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.13.0
+// @version      0.14.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.13.0";
+  const VERSION = "0.14.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -121,17 +121,20 @@
     alarmVibrate: readBool(STORE.alarmVibrate, true),
     alarmFlash: readBool(STORE.alarmFlash, true),
     alarmNotify: readBool(STORE.alarmNotify, false),
-    dropThresholds: parseThresholds(readString(STORE.alarmThresholds, ""), DEFAULT_DROP_THRESHOLDS),
     alarmVolume: clampVolume(readNumber(STORE.alarmVolume, 0.3)),
     alarmTone: readString(STORE.alarmTone, "beep") || "beep",
     // Keep the screen awake while on watch (mobile/PDA) so the drop alarm can fire.
     wakeLockEnabled: readBool(STORE.wakeLock, true),
     // Compact "on watch" view: giant drop timer + hits + HIT button, nothing else.
     focus: readBool(STORE.focus, false),
-    // Optional personal target hit-count for the chain (0 = off); drives a goal + ETA line.
-    chainGoal: Math.max(0, Math.round(readNumber(STORE.chainGoal, 0))),
-    // Where the HIT button sends you (a shared target list / enemy faction page).
-    hitUrl: readString(STORE.hitUrl, "") || DEFAULT_HIT_URL,
+    // Personal PREFERENCES (raw; "" / 0 = "inherit the faction default"). The effective
+    // value used everywhere is eff*() = your value ?? the faction's ?? the built-in.
+    thresholdsPref: readString(STORE.alarmThresholds, ""),
+    chainGoalPref: Math.max(0, Math.round(readNumber(STORE.chainGoal, 0))),
+    hitUrlPref: readString(STORE.hitUrl, ""),
+    // Faction-wide watcher defaults from the backend get payload (migration 0098), or
+    // null. Leadership sets these once so every member's panel adopts them.
+    factionConfig: null,
     // Auto-enter focus mode while you're the active watcher; speak drop alerts (TTS);
     // flash + chime when a chain-bonus milestone lands.
     autoFocus: readBool(STORE.autoFocus, true),
@@ -167,27 +170,57 @@
 
   // The HIT button href is user-set — only allow http(s) so it can't become a
   // javascript:/data: link; anything else falls back to the default target list.
-  function sanitizeHitUrl(raw) {
+  // An http(s) URL or "" (used by the effective-value merge, which must be able to tell
+  // "nothing set" from a valid URL); the settings save uses sanitizeHitUrl below.
+  function validHttpUrl(raw) {
     const s = String(raw || "").trim();
-    if (!s) return DEFAULT_HIT_URL;
+    if (!s) return "";
     try {
       const u = new URL(s);
       if (u.protocol === "http:" || u.protocol === "https:") return u.href;
     } catch {
       /* not a URL */
     }
-    return DEFAULT_HIT_URL;
+    return "";
   }
 
-  // Parse a "60,30,10" thresholds string into a sorted-desc list of positive ints,
-  // falling back to the default when nothing valid is given.
+  function sanitizeHitUrl(raw) {
+    return validHttpUrl(raw) || DEFAULT_HIT_URL;
+  }
+
+  // Parse a "60,30,10" thresholds string into a sorted-desc list of positive ints.
+  // Returns the fallback when nothing valid is given (fallback may be null → null).
   function parseThresholds(raw, fallback) {
     const parts = String(raw || "")
       .split(/[\s,]+/)
       .map((s) => parseInt(s, 10))
       .filter((n) => Number.isInteger(n) && n > 0 && n <= 3600);
     const uniq = [...new Set(parts)].sort((a, b) => b - a);
-    return uniq.length ? uniq : fallback.slice();
+    return uniq.length ? uniq : (fallback ? fallback.slice() : null);
+  }
+
+  // Clean a faction-supplied threshold array (from watch_config) the same way.
+  function cleanThresholdArray(arr) {
+    if (!Array.isArray(arr)) return null;
+    const nums = arr.map((n) => Math.trunc(Number(n))).filter((n) => Number.isFinite(n) && n > 0 && n <= 3600);
+    const uniq = [...new Set(nums)].sort((a, b) => b - a);
+    return uniq.length ? uniq : null;
+  }
+
+  // Effective values = YOUR preference (if set) ?? the FACTION default ?? the built-in.
+  // "Set" means a non-empty pref for the URL/thresholds, or a positive personal goal.
+  function effHitUrl() {
+    return validHttpUrl(state.hitUrlPref) || validHttpUrl(state.factionConfig?.hit_url) || DEFAULT_HIT_URL;
+  }
+  function effThresholds() {
+    return parseThresholds(state.thresholdsPref, null)
+      || cleanThresholdArray(state.factionConfig?.drop_thresholds)
+      || DEFAULT_DROP_THRESHOLDS.slice();
+  }
+  function effGoal() {
+    if (state.chainGoalPref > 0) return state.chainGoalPref;
+    const fac = Math.trunc(Number(state.factionConfig?.chain_goal)) || 0;
+    return fac > 0 ? fac : 0;
   }
 
   function gmGet(key, fallback) {
@@ -906,6 +939,8 @@
         state.attacks = serverLeaderboard(serverRes);
       }
 
+      // Adopt the faction's watcher defaults (0098) from whichever payload we have.
+      state.factionConfig = state.watch?.watch_config ?? state.signup?.watch_config ?? null;
       updateChainLifecycle();
       state.fetchedAt = Date.now();
 
@@ -1348,7 +1383,7 @@
       // A fresh hit reset the timer upward → re-arm the thresholds for this run.
       if (state.lastRemaining != null && remaining > state.lastRemaining + 3) state.firedDrop.clear();
       state.lastRemaining = remaining;
-      for (const t of state.dropThresholds) {
+      for (const t of effThresholds()) {
         if (remaining > 0 && remaining <= t && !state.firedDrop.has(t)) {
           state.firedDrop.add(t);
           fireAlarm("drop", `Chain drops in ${remaining}s — HIT NOW!`);
@@ -1904,8 +1939,7 @@
   // configured target list (a ranked-war page or shared list) in the same tab.
   function renderHitButton(remaining) {
     const urgent = Boolean(state.chain?.active) && remaining > 0 && remaining <= 60;
-    const url = state.hitUrl || DEFAULT_HIT_URL;
-    return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(url)}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
+    return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(effHitUrl())}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
   }
 
   // Compact "on watch" view: a giant drop timer, hits, your pace, the HIT button, and
@@ -1934,7 +1968,7 @@
   // Optional personal chain goal: progress + an ETA off the faction's recent pace. This
   // is a FACTION-total ETA (the whole chain reaching N), never a personal-bonus claim.
   function renderGoal(chain, attacks) {
-    const goal = state.chainGoal;
+    const goal = effGoal();
     if (!goal || !chain?.active) return "";
     const cur = chain.current || 0;
     const toGo = goal - cur;
@@ -2396,21 +2430,30 @@
             <input id="tocw-set-alarm-volume" type="range" min="0" max="100" value="${Math.round(state.alarmVolume * 100)}" />
           </label>
         </div>
-        <label style="margin-top:8px;">Drop alerts at (seconds to drop)
-          <input id="tocw-set-alarm-thresholds" value="${escapeHtml(state.dropThresholds.join(", "))}" placeholder="60, 30, 10" />
+        <label style="margin-top:8px;">Drop alerts at (seconds to drop) <span class="tocw-muted">— blank = faction default</span>
+          <input id="tocw-set-alarm-thresholds" value="${escapeHtml(state.thresholdsPref)}" placeholder="${escapeHtml((cleanThresholdArray(state.factionConfig?.drop_thresholds) || DEFAULT_DROP_THRESHOLDS).join(", "))}" />
         </label>
         <label class="tocw-check" style="margin-top:8px;"><input type="checkbox" id="tocw-set-wakelock" ${state.wakeLockEnabled ? "checked" : ""} /> Keep screen awake while on watch</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-autofocus" ${state.autoFocus ? "checked" : ""} /> Auto-focus mode when on watch</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-celebrate" ${state.celebrate ? "checked" : ""} /> Celebrate bonus milestones</label>
         <button id="tocw-alarm-test" class="small" style="margin-top:6px;">Test alarm</button>
       </div>
-      <div class="grid" style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
-        <label>Chain goal (hits, 0 = off)
-          <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoal || ""}" placeholder="e.g. 5000" />
-        </label>
-        <label>HIT button target URL
-          <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrl)}" placeholder="${DEFAULT_HIT_URL}" />
-        </label>
+      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+        ${state.factionConfig ? `<div class="tocw-muted" style="margin-bottom:8px;">Your faction has set watcher defaults${settings().sessionToken && state.watch?.viewer?.can_manage ? " — managers can change them below" : ". Leave a field blank to use the faction default."}</div>` : ""}
+        <div class="grid">
+          <label>Chain goal (hits, 0 = off) <span class="tocw-muted">— blank = faction</span>
+            <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoalPref || ""}" placeholder="${Number(state.factionConfig?.chain_goal) > 0 ? Number(state.factionConfig.chain_goal) : "e.g. 5000"}" />
+          </label>
+          <label>HIT button target URL <span class="tocw-muted">— blank = faction</span>
+            <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrlPref)}" placeholder="${escapeHtml(validHttpUrl(state.factionConfig?.hit_url) || DEFAULT_HIT_URL)}" />
+          </label>
+        </div>
+        ${state.watch?.viewer?.can_manage ? `
+          <div style="margin-top:8px;border-top:1px solid #2b3d52;padding-top:8px;">
+            <div style="font-weight:700;">Faction defaults (managers)</div>
+            <div class="tocw-muted" style="margin:2px 0 6px;">Set these once for the whole faction — every member's panel adopts them (each member can still override above).</div>
+            <button id="tocw-save-faction-config" class="small">Save current values as faction defaults</button>
+          </div>` : ""}
       </div>
       <details style="margin-top:10px;">
         <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Advanced backend settings</summary>
@@ -2449,12 +2492,15 @@
       state.alarmFlash = checked("tocw-set-alarm-flash");
       state.alarmNotify = checked("tocw-set-alarm-notify");
       state.wakeLockEnabled = checked("tocw-set-wakelock");
-      state.dropThresholds = parseThresholds(valueOf("tocw-set-alarm-thresholds"), DEFAULT_DROP_THRESHOLDS);
+      // Personal PREFS ("" / 0 = inherit the faction default): normalize to a clean
+      // stored form (parsed thresholds, valid URL or "", non-negative goal).
+      const parsedT = parseThresholds(valueOf("tocw-set-alarm-thresholds"), null);
+      state.thresholdsPref = parsedT ? parsedT.join(", ") : "";
       const tone = valueOf("tocw-set-alarm-tone");
       state.alarmTone = ALARM_TONES.includes(tone) ? tone : "beep";
       state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
-      state.chainGoal = Math.max(0, Math.round(Number(valueOf("tocw-set-goal")) || 0));
-      state.hitUrl = sanitizeHitUrl(valueOf("tocw-set-hit-url"));
+      state.chainGoalPref = Math.max(0, Math.round(Number(valueOf("tocw-set-goal")) || 0));
+      state.hitUrlPref = validHttpUrl(valueOf("tocw-set-hit-url"));
       state.alarmVoice = checked("tocw-set-alarm-voice");
       state.autoFocus = checked("tocw-set-autofocus");
       state.celebrate = checked("tocw-set-celebrate");
@@ -2464,11 +2510,11 @@
       gmSet(STORE.alarmFlash, state.alarmFlash);
       gmSet(STORE.alarmNotify, state.alarmNotify);
       gmSet(STORE.wakeLock, state.wakeLockEnabled);
-      gmSet(STORE.alarmThresholds, state.dropThresholds.join(","));
+      gmSet(STORE.alarmThresholds, state.thresholdsPref);
       gmSet(STORE.alarmTone, state.alarmTone);
       gmSet(STORE.alarmVolume, state.alarmVolume);
-      gmSet(STORE.chainGoal, state.chainGoal);
-      gmSet(STORE.hitUrl, state.hitUrl);
+      gmSet(STORE.chainGoal, state.chainGoalPref);
+      gmSet(STORE.hitUrl, state.hitUrlPref);
       gmSet(STORE.alarmVoice, state.alarmVoice);
       gmSet(STORE.autoFocus, state.autoFocus);
       gmSet(STORE.celebrate, state.celebrate);
@@ -2509,6 +2555,27 @@
         state.error = "Install Tampermonkey or use Torn PDA — your key and session can't be stored securely otherwise, so they were not saved.";
       }
       close();
+    });
+    document.getElementById("tocw-save-faction-config")?.addEventListener("click", async () => {
+      // Managers push the CURRENT effective values as the faction-wide defaults, so
+      // every member's panel adopts them. Persist personal prefs first so "effective"
+      // reflects exactly what's in the form.
+      applyAlarmSettings();
+      try {
+        const res = await callFunction("chain-watch", {
+          action: "save_config",
+          hit_url: effHitUrl(),
+          drop_thresholds: effThresholds(),
+          chain_goal: effGoal() || null,
+        });
+        state.watch = res;
+        state.factionConfig = res?.watch_config ?? state.factionConfig;
+        state.notice = "Saved as faction defaults — every member's panel will adopt them.";
+        close();
+      } catch (e) {
+        state.error = e.message || "Could not save faction defaults.";
+        render();
+      }
     });
     document.getElementById("tocw-signup-clear")?.addEventListener("click", () => {
       gmSet(STORE.signupToken, "");
