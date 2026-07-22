@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.14.0
+// @version      0.14.1
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.14.0";
+  const VERSION = "0.14.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -207,10 +207,11 @@
     return uniq.length ? uniq : null;
   }
 
-  // Effective values = YOUR preference (if set) ?? the FACTION default ?? the built-in.
-  // "Set" means a non-empty pref for the URL/thresholds, or a positive personal goal.
+  // Thresholds + goal are effective = YOUR preference (if set) ?? the FACTION default ??
+  // the built-in. The HIT target URL is PER-MEMBER only (it depends on your own stats),
+  // so it's just your value ?? the built-in default — never a faction default.
   function effHitUrl() {
-    return validHttpUrl(state.hitUrlPref) || validHttpUrl(state.factionConfig?.hit_url) || DEFAULT_HIT_URL;
+    return validHttpUrl(state.hitUrlPref) || DEFAULT_HIT_URL;
   }
   function effThresholds() {
     return parseThresholds(state.thresholdsPref, null)
@@ -2439,20 +2440,23 @@
         <button id="tocw-alarm-test" class="small" style="margin-top:6px;">Test alarm</button>
       </div>
       <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
-        ${state.factionConfig ? `<div class="tocw-muted" style="margin-bottom:8px;">Your faction has set watcher defaults${settings().sessionToken && state.watch?.viewer?.can_manage ? " — managers can change them below" : ". Leave a field blank to use the faction default."}</div>` : ""}
+        ${state.factionConfig && (state.factionConfig.chain_goal || state.factionConfig.drop_thresholds)
+          ? `<div class="tocw-muted" style="margin-bottom:8px;">Your faction has set watcher defaults (thresholds / goal). Leave a field blank to use them.</div>`
+          : ""}
         <div class="grid">
           <label>Chain goal (hits, 0 = off) <span class="tocw-muted">— blank = faction</span>
             <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoalPref || ""}" placeholder="${Number(state.factionConfig?.chain_goal) > 0 ? Number(state.factionConfig.chain_goal) : "e.g. 5000"}" />
           </label>
-          <label>HIT button target URL <span class="tocw-muted">— blank = faction</span>
-            <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrlPref)}" placeholder="${escapeHtml(validHttpUrl(state.factionConfig?.hit_url) || DEFAULT_HIT_URL)}" />
+          <label>HIT button target URL <span class="tocw-muted">— your own targets</span>
+            <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrlPref)}" placeholder="${escapeHtml(DEFAULT_HIT_URL)}" />
           </label>
         </div>
+        <div class="tocw-muted" style="margin-top:4px;">The HIT target is yours alone — the best target depends on your own stats.</div>
         ${state.watch?.viewer?.can_manage ? `
           <div style="margin-top:8px;border-top:1px solid #2b3d52;padding-top:8px;">
             <div style="font-weight:700;">Faction defaults (managers)</div>
-            <div class="tocw-muted" style="margin:2px 0 6px;">Set these once for the whole faction — every member's panel adopts them (each member can still override above).</div>
-            <button id="tocw-save-faction-config" class="small">Save current values as faction defaults</button>
+            <div class="tocw-muted" style="margin:2px 0 6px;">Push your current thresholds + goal as the faction defaults — every member's panel adopts them (each member can still override). The HIT target stays per-member.</div>
+            <button id="tocw-save-faction-config" class="small">Save thresholds + goal as faction defaults</button>
           </div>` : ""}
       </div>
       <details style="margin-top:10px;">
@@ -2562,15 +2566,15 @@
       // reflects exactly what's in the form.
       applyAlarmSettings();
       try {
+        // The HIT target URL is deliberately NOT pushed — it's per-member.
         const res = await callFunction("chain-watch", {
           action: "save_config",
-          hit_url: effHitUrl(),
           drop_thresholds: effThresholds(),
           chain_goal: effGoal() || null,
         });
         state.watch = res;
         state.factionConfig = res?.watch_config ?? state.factionConfig;
-        state.notice = "Saved as faction defaults — every member's panel will adopt them.";
+        state.notice = "Saved thresholds + goal as faction defaults.";
         close();
       } catch (e) {
         state.error = e.message || "Could not save faction defaults.";
