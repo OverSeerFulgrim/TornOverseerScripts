@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.8.0
+// @version      0.8.1
 // @description  Scheduled chain countdown, chainwatch shift signup, and a zero-lag live chain timer + hit leaderboard pulled straight from Torn with your key (Overseer backend as fallback). Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -25,7 +25,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.8.0";
+  const VERSION = "0.8.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -1110,6 +1110,11 @@
       applyPanelSize(box);
     }
 
+    // Preserve the body's scroll position across the full innerHTML rebuild — otherwise
+    // every poll (and any re-render) snaps the user back to the top mid-read.
+    const prevBody = box.querySelector(".tocw-body");
+    const savedScroll = prevBody ? prevBody.scrollTop : 0;
+
     const cfg = settings();
     const event = state.watch?.event || state.signup?.event || null;
     const mode = panelMode();
@@ -1178,6 +1183,12 @@
       <div id="tocw-resize" title="Drag to resize"></div>
     `;
 
+    // Restore the pre-rebuild scroll position (content height is stable poll-to-poll).
+    if (savedScroll > 0) {
+      const newBody = box.querySelector(".tocw-body");
+      if (newBody) newBody.scrollTop = savedScroll;
+    }
+
     document.getElementById("tocw-collapse")?.addEventListener("click", () => {
       state.collapsed = !state.collapsed;
       gmSet(STORE.collapsed, state.collapsed);
@@ -1211,7 +1222,7 @@
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">${event ? "Next scheduled chain" : "No scheduled chain"}</div>
-        <div class="tocw-big">${event ? `Starts in ${duration(seconds)}` : "--"}</div>
+        <div class="tocw-big" id="tocw-timer">${event ? `Starts in ${duration(seconds)}` : "--"}</div>
         <div class="tocw-muted">${event ? `${escapeHtml(event.title)} - ${tctTime(event.starts_at, true)}` : "Ask a chain-watch manager to schedule one."}</div>
         ${event && event.status === "draft" && canManage
           ? `<div class="tocw-muted" style="margin-top:6px;">Draft — <a href="https://${OVERSEER_HOST}/faction/chains" target="_blank" rel="noreferrer noopener">publish it &amp; mint the signup link on the site ↗</a></div>`
@@ -1230,7 +1241,7 @@
         <div class="tocw-grid">
           <div>
             <div class="tocw-muted">Drop timer</div>
-            <div class="tocw-big">${duration(remaining)}</div>
+            <div class="tocw-big" id="tocw-timer">${duration(remaining)}</div>
           </div>
           <div>
             <div class="tocw-muted">Hits</div>
@@ -1814,15 +1825,27 @@
     // Kick off the live-data loop (refreshAll re-arms itself via scheduleNextRefresh,
     // polling fast while a chain is live and easing off otherwise).
     setTimeout(() => void refreshAll(false), 800);
-    // 1s tick keeps the drop-timer countdown smooth between polls.
-    setInterval(safeRender, 1000);
+    // 1s tick updates ONLY the countdown text in place — no innerHTML rebuild, so it
+    // never resets the user's scroll position or fights their interaction between polls.
+    setInterval(tick, 1000);
   }
 
-  function safeRender() {
+  // Surgical per-second update: refresh the drop-timer / "starts in" text without
+  // re-rendering the panel. Full re-renders happen on data polls (which preserve scroll).
+  function tick() {
     try {
-      render();
+      if (state.hidden || state.collapsed) return;
+      const el = document.getElementById("tocw-timer");
+      if (!el) return;
+      if (state.chain?.active) {
+        el.textContent = duration(chainRemaining());
+      } else {
+        const event = state.watch?.event || state.signup?.event || null;
+        const seconds = event ? countdownTo(event.starts_at) : null;
+        el.textContent = event ? `Starts in ${duration(seconds)}` : "--";
+      }
     } catch (error) {
-      console.error("[Torn Overseer Chain Watch] render failed", error);
+      console.error("[Torn Overseer Chain Watch] tick failed", error);
     }
   }
 
