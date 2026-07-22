@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.18.0
+// @version      0.19.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -894,8 +894,15 @@
             .catch((e) => { scheduleErr = e; if (!state.watch) state.watch = null; }),
         );
       } else if (wantSchedule && mode === "token") {
+        // Verify-to-view: the signup get now needs a session. Use the stored one, minting
+        // it from the Torn key once if needed (then it's cached for later polls). A truly
+        // keyless viewer gets a needs_verification stub and the panel prompts for a key.
+        let st = cfg.sessionToken;
+        if (!st && cfg.tornKey) {
+          try { st = await ensureVerifiedSession(); } catch { st = ""; }
+        }
         tasks.push(
-          callSignup("get")
+          callSignup("get", {}, st || undefined)
             .then((res) => { serverRes = res; state.signup = res; lastScheduleAt = Date.now(); })
             .catch((e) => { scheduleErr = e; if (!state.signup) state.signup = null; }),
         );
@@ -1127,7 +1134,7 @@
   // The viewer's Torn id: from the session (session mode) or the cached signup
   // identity (token mode). Null when we don't know who's watching (nothing personal).
   function viewerId() {
-    const sid = state.watch?.viewer?.player_id;
+    const sid = state.watch?.viewer?.player_id ?? state.signup?.viewer?.player_id;
     if (sid != null) return Number(sid);
     const identity = getSignupIdentity();
     return identity && identity.id != null ? Number(identity.id) : null;
@@ -1863,7 +1870,9 @@
         ${state.settingsOpen ? renderSettingsBody() : state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : `
         ${versionAlert}
         ${mode === "token"
-          ? `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""}. Anyone can view; signing up verifies you with your Torn key.</div>`
+          ? (state.signup?.needs_verification
+              ? `<div class="tocw-alert">This chain sheet is faction-only. Add your Torn API key in Settings to verify and view it.</div>`
+              : `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""} — verified with your key.</div>`)
           : mode === "none"
             ? `<div class="tocw-alert">Add your Torn API key in Settings and connect the site session — or paste a chain-watch signup link there.</div>`
             : !cfg.sessionToken
@@ -1875,6 +1884,7 @@
         ${renderCoverage()}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
+        ${renderAbsence()}
         <div class="tocw-actions">
           <button id="tocw-refresh" class="primary" ${state.loading ? "disabled" : ""}>${state.loading ? "Loading" : "Refresh"}</button>
           <button id="tocw-copy">Copy</button>
@@ -1934,6 +1944,8 @@
       render();
     });
     document.getElementById("tocw-hit-next")?.addEventListener("click", () => hitNextTarget());
+    document.getElementById("tocw-absence-out")?.addEventListener("click", () => void reportOut());
+    document.getElementById("tocw-absence-in")?.addEventListener("click", () => void reportIn());
     for (const btn of box.querySelectorAll("[data-tocw-action]")) {
       btn.addEventListener("click", () => void handleAction(btn));
     }
@@ -1976,6 +1988,84 @@
       </div>`;
     }
     return "";
+  }
+
+  // ---- Whole-chain "I'm out" opt-out (mode-aware) -----------------------------
+  // A verified member can flag they can't make THIS chain, with an optional reason.
+  // Session mode writes chain-watch report_absence; token mode writes the same absence
+  // through the public signup endpoint (session-verified). Leadership sees it WITH the
+  // reason on the Faction -> Chains tab; here we surface only who's out (names).
+  function myAbsenceInfo() {
+    if (panelMode() === "token") {
+      const my = state.signup?.my_absence;
+      return { out: Boolean(my), reason: my?.reason ?? null };
+    }
+    const vid = viewerId();
+    const rows = Array.isArray(state.watch?.absences) ? state.watch.absences : [];
+    const mine = vid != null ? rows.find((a) => Number(a.player_id) === vid && !a.cleared_at) : null;
+    return { out: Boolean(mine), reason: mine?.reason ?? null };
+  }
+
+  function absentNames() {
+    if (panelMode() === "token") return (state.signup?.absent || []).map((a) => a.name);
+    const rows = Array.isArray(state.watch?.absences) ? state.watch.absences : [];
+    return rows.filter((a) => !a.cleared_at).map((a) => a.player_name);
+  }
+
+  function renderAbsence() {
+    const mode = panelMode();
+    if (mode === "none") return "";
+    if (mode === "token" && state.signup?.needs_verification) return "";
+    const event = state.watch?.event || state.signup?.event || null;
+    if (!event) return "";
+    const readOnly = mode === "token" ? Boolean(event.read_only) : watchEventReadOnly(event);
+    if (readOnly) return "";
+    const { out, reason } = myAbsenceInfo();
+    const others = absentNames();
+    const othersLine = others.length
+      ? `<div class="tocw-muted" style="margin-top:6px;">Out this chain (${others.length}): ${escapeHtml(others.join(", "))}</div>`
+      : "";
+    const control = out
+      ? `<div class="tocw-watch-banner soon"><span>🚫 You're out for this chain${reason ? ` — "${escapeHtml(reason)}"` : ""}</span><button class="small" id="tocw-absence-in">I'm back in</button></div>`
+      : `<div style="margin-top:8px;"><button class="small" id="tocw-absence-out">I can't make this chain</button></div>`;
+    return `${control}${othersLine}`;
+  }
+
+  async function reportOut() {
+    const raw = prompt("Can't make this chain? Add a reason for leadership (optional):");
+    if (raw === null) return; // cancelled
+    try {
+      const reason = raw.trim();
+      if (panelMode() === "token") {
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("report_absence", { reason }, session);
+      } else {
+        state.watch = await callFunction("chain-watch", { action: "report_absence", reason });
+      }
+      state.error = null;
+      state.notice = "You're marked out for this chain — leadership can see it.";
+      render();
+    } catch (e) {
+      state.error = e.message || "Couldn't update your status.";
+      render();
+    }
+  }
+
+  async function reportIn() {
+    try {
+      if (panelMode() === "token") {
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("clear_absence", {}, session);
+      } else {
+        state.watch = await callFunction("chain-watch", { action: "clear_absence" });
+      }
+      state.error = null;
+      state.notice = "You're back in for this chain.";
+      render();
+    } catch (e) {
+      state.error = e.message || "Couldn't update your status.";
+      render();
+    }
   }
 
   // Upcoming shifts (current + future) with NO main watcher assigned — the gaps that
