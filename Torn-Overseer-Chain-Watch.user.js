@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.16.0
+// @version      0.17.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.16.0";
+  const VERSION = "0.17.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -83,6 +83,8 @@
     autoFocus: "tocw_auto_focus",
     alarmVoice: "tocw_alarm_voice",
     celebrate: "tocw_celebrate",
+    targetIds: "tocw_target_ids",
+    targetIndex: "tocw_target_index",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -131,6 +133,10 @@
     thresholdsPref: readString(STORE.alarmThresholds, ""),
     chainGoalPref: Math.max(0, Math.round(readNumber(STORE.chainGoal, 0))),
     hitUrlPref: readString(STORE.hitUrl, ""),
+    // Your rotating attack list: player ids the HIT button cycles through (one per
+    // click). targetIndex is where you are in the loop, persisted across page loads.
+    targetIds: parseTargetIds(readString(STORE.targetIds, "")),
+    targetIndex: Math.max(0, Math.round(readNumber(STORE.targetIndex, 0))),
     // Faction-wide watcher defaults from the backend get payload (migration 0098), or
     // null. Leadership sets these once so every member's panel adopts them.
     factionConfig: null,
@@ -155,7 +161,27 @@
     chainSeenTs: new Set(),
     lastBonusPassed: 0,
     chainSummary: null,
+    // Best estimate (unix seconds) of when the chain drops, corrected for Torn's API
+    // staleness by keeping the freshest read; chainDeadlineFor tracks the hit count it
+    // was computed for so a real hit re-anchors it. See updateChainDeadline().
+    chainDeadline: 0,
+    chainDeadlineFor: -1,
   };
+
+  // Parse a free-form list of player ids ("123, 456\n789" / profile links) into a
+  // deduped ordered array of positive ints.
+  function parseTargetIds(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const m of String(raw || "").matchAll(/\d{1,10}/g)) {
+      const n = parseInt(m[0], 10);
+      if (Number.isInteger(n) && n > 0 && !seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
+    return out;
+  }
 
   function readNumber(key, fallback) {
     const n = Number(gmGet(key, fallback));
@@ -936,25 +962,15 @@
       // Resolve the live chain HUD: direct Torn wins; else the backend cache; else keep
       // the last value (never blank a live timer on one failed poll).
       if (tornChain) {
-        // Torn caches /faction/chain for a few seconds, so consecutive polls can return
-        // the SAME timeout. If we re-stamped fetchedAt each time, the countdown would
-        // jump back to the start every poll. So only re-anchor when the data actually
-        // moved (timeout or current changed) — otherwise keep counting from the old anchor.
-        const prev = state.chain;
-        if (
-          prev && prev.active && tornChain.active &&
-          prev.timeout === tornChain.timeout && prev.current === tornChain.current
-        ) {
-          tornChain.fetchedAt = prev.fetchedAt;
-        }
         state.chain = tornChain;
         state.liveSource = "torn";
         state.tornFailCount = 0;
+        updateChainDeadline(tornChain); // staleness-corrected drop deadline
       } else {
         if (hasKey) state.tornFailCount += 1; // ran the direct fetch, got nothing usable
         if (serverRes) {
           const cached = serverLiveChain(serverRes);
-          if (cached) { state.chain = cached; state.liveSource = "cache"; }
+          if (cached) { state.chain = cached; state.liveSource = "cache"; state.chainDeadline = 0; }
         }
       }
 
@@ -1010,8 +1026,30 @@
     }, delay);
   }
 
+  // Torn's /faction/chain `timeout` is stale by however long the API cached the
+  // response, so anchoring naively runs a couple seconds ahead of the in-game sidebar.
+  // The true drop DEADLINE (now + timeout) is a constant we can only over-estimate
+  // (staleness ≥ 0), so we keep the SMALLEST implied deadline seen — the freshest read —
+  // and re-anchor when a hit changes the chain count. This converges to the real time.
+  function updateChainDeadline(chain) {
+    if (!chain?.active) {
+      state.chainDeadline = 0;
+      state.chainDeadlineFor = -1;
+      return;
+    }
+    const implied = Date.now() / 1000 + chain.timeout;
+    const bumped = state.chainDeadline > 0 && implied > state.chainDeadline + 4; // a hit reset the timer up
+    if (!state.chainDeadline || chain.current !== state.chainDeadlineFor || bumped) {
+      state.chainDeadline = implied; // fresh chain / hit / timer jumped up → re-anchor
+    } else {
+      state.chainDeadline = Math.min(state.chainDeadline, implied); // adopt a fresher (smaller) read
+    }
+    state.chainDeadlineFor = chain.current;
+  }
+
   function chainRemaining() {
     if (!state.chain?.active) return 0;
+    if (state.chainDeadline > 0) return Math.max(0, Math.round(state.chainDeadline - Date.now() / 1000));
     return Math.max(0, state.chain.timeout - Math.floor((Date.now() - state.chain.fetchedAt) / 1000));
   }
 
@@ -1574,6 +1612,7 @@
       .tocw-focus-sub { font-size: 15px; margin-top: 4px; }
       .tocw-hit { display: block; width: 100%; text-align: center; text-decoration: none; padding: 12px; border-radius: 9px; font-weight: 900; font-size: 15px; background: #243447; color: #eaf3ff; border: 1px solid #3a5573; }
       .tocw-hit--setup { background: transparent; border-style: dashed; color: #cfe0f7; font-weight: 700; font-size: 13px; cursor: pointer; }
+      .tocw-hit-sub { display: block; font-size: 11px; font-weight: 700; opacity: .85; margin-top: 2px; }
       .tocw-hit.urgent { background: #ff3b45; border-color: #ff6870; color: #fff; animation: tocw-pulse .8s ease-in-out infinite; }
       #tocw-focus.on { background: #234; border-color: #46617f; }
       /* Alarm flash on the whole panel */
@@ -1612,7 +1651,7 @@
       #tocw.collapsed #tocw-resize { display: none; }
       /* In-panel settings view (was a modal — now inherits the panel's z-index + drag) */
       .tocw-settings label { display: grid; gap: 5px; margin-bottom: 10px; color: #cfe0f7; font-size: 12px; font-weight: 700; }
-      .tocw-settings input, .tocw-settings select {
+      .tocw-settings input, .tocw-settings select, .tocw-settings textarea {
         width: 100%;
         padding: 9px 10px;
         border-radius: 7px;
@@ -1620,6 +1659,7 @@
         background: #0b1119;
         color: #f8fbff;
       }
+      .tocw-settings textarea { font-family: inherit; font-size: 13px; resize: vertical; }
       .tocw-settings input[type="range"] { padding: 0; }
       .tocw-settings input[type="checkbox"] { width: auto; }
       .tocw-settings .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -1882,6 +1922,7 @@
       state.settingsOpen = true;
       render();
     });
+    document.getElementById("tocw-hit-next")?.addEventListener("click", () => hitNextTarget());
     for (const btn of box.querySelectorAll("[data-tocw-action]")) {
       btn.addEventListener("click", () => void handleAction(btn));
     }
@@ -1990,17 +2031,35 @@
     return "";
   }
 
-  // A prominent "go hit" button that jumps to YOUR target list (the enemy faction /
-  // shared list you set in Settings) — there's no useful universal target, so when it's
-  // unset the button just prompts you to set one rather than linking somewhere wrong.
-  // Turns big + red when the drop is close.
+  // The HIT button cycles YOUR target list (player ids you set in Settings): each click
+  // opens the next target's attack page and advances the loop. Turns big + red near the
+  // drop. Falls back to a legacy target URL, or a "set your list" prompt when nothing's set.
   function renderHitButton(remaining) {
-    const url = effHitUrl();
-    if (!url) {
-      return `<button id="tocw-hit-setup" type="button" class="tocw-hit tocw-hit--setup">⚙️ Set your target list</button>`;
-    }
     const urgent = Boolean(state.chain?.active) && remaining > 0 && remaining <= 60;
-    return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(url)}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
+    const ids = state.targetIds;
+    if (ids.length > 0) {
+      const idx = state.targetIndex % ids.length;
+      const id = ids[idx];
+      const pos = ids.length > 1 ? ` · ${idx + 1}/${ids.length}` : "";
+      return `<button id="tocw-hit-next" type="button" class="tocw-hit${urgent ? " urgent" : ""}">${urgent ? "⚔️ HIT NOW" : "⚔️ Hit next"}<span class="tocw-hit-sub">→ target ${id}${pos}</span></button>`;
+    }
+    const url = effHitUrl();
+    if (url) {
+      return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(url)}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
+    }
+    return `<button id="tocw-hit-setup" type="button" class="tocw-hit tocw-hit--setup">⚙️ Set your target list</button>`;
+  }
+
+  // Open the current target's attack page and advance the loop (persisted, so the next
+  // click — even after the page reloads on the attack screen — goes to the next one).
+  function hitNextTarget() {
+    const ids = state.targetIds;
+    if (!ids.length) return;
+    const idx = state.targetIndex % ids.length;
+    const id = ids[idx];
+    state.targetIndex = (idx + 1) % ids.length;
+    gmSet(STORE.targetIndex, state.targetIndex);
+    window.location.href = `https://www.torn.com/loader.php?sid=attack&user2ID=${id}`;
   }
 
   // Compact "on watch" view: a giant drop timer, hits, your pace, the HIT button, and
@@ -2452,40 +2511,21 @@
   // full-width panel. Same input ids as before; wireSettings() attaches the handlers.
   function renderSettingsBody() {
     const cfg = settings();
+    const idx = state.targetIds.length ? (state.targetIndex % state.targetIds.length) + 1 : 0;
     return `
       <div class="tocw-settings">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;">
         <div style="font-weight:800;font-size:17px;">Settings</div>
         <button id="tocw-set-back" class="small">← Back</button>
       </div>
-      <p class="tocw-muted" style="margin:0 0 14px;">
-        Data Storage: local script settings plus faction schedule on Torn Overseer.
-        Data Sharing: schedule &amp; signups go to your Overseer backend; the live chain and
-        hit leaderboard are pulled straight from api.torn.com with your key (via the
-        userscript manager / Torn PDA — never exposed to torn.com's page scripts) so the
-        numbers match Torn with no lag.
-        Purpose: scheduled chain countdown, watcher shifts, live chain timer, and read-only chain summaries.
-      </p>
-      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
-        <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
-      </label>
-      <label>Site session token
-        <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
-      </label>
-      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
-        <div style="font-weight:700;">Signup link (token mode)</div>
-        <div class="tocw-muted" style="margin:4px 0 8px;">
-          ${cfg.signupToken
-            ? "Linked to a signup event. Open the link leadership posts to switch events. Viewing is open; signing up uses your Torn key to verify your faction."
-            : "Open a chain-watch signup link (from faction chat) once to bind this panel. Viewing needs no key; signing up verifies you with your key."}
-        </div>
-        <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
-          <label style="margin:0;">Paste a link or token (fallback)
-            <input id="tocw-set-signup" value="" autocomplete="off" placeholder="https://${OVERSEER_HOST}/chain/e/…" />
-          </label>
-          <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
-        </div>
+
+      <div style="padding:10px;border:1px solid #333;border-radius:8px;">
+        <label style="margin-bottom:4px;">Your attack targets <span class="tocw-muted">— player IDs (one per line or comma-separated)</span>
+          <textarea id="tocw-set-target-ids" rows="3" placeholder="123456&#10;789012&#10;…">${escapeHtml(state.targetIds.join("\n"))}</textarea>
+        </label>
+        <div class="tocw-muted">The ⚔️ HIT button opens each one in turn (one per click), so you hit down your list.${state.targetIds.length ? ` ${state.targetIds.length} target${state.targetIds.length === 1 ? "" : "s"} · currently at #${idx}. <button id="tocw-target-reset" class="small" type="button">Restart</button>` : ""}</div>
       </div>
+
       <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
         <label class="tocw-check" style="font-size:14px;">
           <input type="checkbox" id="tocw-set-alarm" ${state.alarm ? "checked" : ""} /> Watcher alarms
@@ -2521,24 +2561,51 @@
         ${state.factionConfig && (state.factionConfig.chain_goal || state.factionConfig.drop_thresholds)
           ? `<div class="tocw-muted" style="margin-bottom:8px;">Your faction has set watcher defaults (thresholds / goal). Leave a field blank to use them.</div>`
           : ""}
-        <div class="grid">
-          <label>Chain goal (hits, 0 = off) <span class="tocw-muted">— blank = faction</span>
-            <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoalPref || ""}" placeholder="${Number(state.factionConfig?.chain_goal) > 0 ? Number(state.factionConfig.chain_goal) : "e.g. 5000"}" />
-          </label>
-          <label>HIT button target URL <span class="tocw-muted">— your own targets</span>
-            <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrlPref)}" placeholder="e.g. the enemy faction's page / your target list" />
-          </label>
-        </div>
-        <div class="tocw-muted" style="margin-top:4px;">Where the HIT button jumps to. Paste the enemy faction page or your own target list — the best target depends on your stats, so there's no shared default.</div>
+        <label>Chain goal (hits, 0 = off) <span class="tocw-muted">— blank = faction</span>
+          <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoalPref || ""}" placeholder="${Number(state.factionConfig?.chain_goal) > 0 ? Number(state.factionConfig.chain_goal) : "e.g. 5000"}" />
+        </label>
         ${state.watch?.viewer?.can_manage ? `
-          <div style="margin-top:8px;border-top:1px solid #2b3d52;padding-top:8px;">
+          <div style="margin-top:4px;border-top:1px solid #2b3d52;padding-top:8px;">
             <div style="font-weight:700;">Faction defaults (managers)</div>
             <div class="tocw-muted" style="margin:2px 0 6px;">Push your current thresholds + goal as the faction defaults — every member's panel adopts them (each member can still override). The HIT target stays per-member.</div>
             <button id="tocw-save-faction-config" class="small">Save thresholds + goal as faction defaults</button>
           </div>` : ""}
       </div>
+
+      <details style="margin-top:10px;">
+        <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Connection &amp; setup</summary>
+        <div style="margin-top:10px;">
+          <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
+            <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
+          </label>
+          <label>Site session token
+            <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
+          </label>
+          <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+            <div style="font-weight:700;">Signup link (token mode)</div>
+            <div class="tocw-muted" style="margin:4px 0 8px;">
+              ${cfg.signupToken
+                ? "Linked to a signup event. Open the link leadership posts to switch events. Viewing is open; signing up uses your Torn key to verify your faction."
+                : "Open a chain-watch signup link (from faction chat) once to bind this panel. Viewing needs no key; signing up verifies you with your key."}
+            </div>
+            <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
+              <label style="margin:0;">Paste a link or token (fallback)
+                <input id="tocw-set-signup" value="" autocomplete="off" placeholder="https://${OVERSEER_HOST}/chain/e/…" />
+              </label>
+              <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
+            </div>
+          </div>
+          <p class="tocw-muted" style="margin:10px 0 0;">
+            Data: your live chain + leaderboard come straight from api.torn.com with your key (via the userscript
+            manager / Torn PDA — never exposed to torn.com's page scripts); schedule &amp; signups go to your Overseer backend.
+          </p>
+          <div style="margin-top:8px;">
+            <button id="tocw-modal-connect">Connect site from Torn key</button>
+          </div>
+        </div>
+      </details>
+
       <div class="tocw-modal-actions">
-        <button id="tocw-modal-connect">Connect site from Torn key</button>
         <button id="tocw-modal-save" class="primary">Save</button>
       </div>
       </div>
@@ -2571,7 +2638,12 @@
       state.alarmTone = ALARM_TONES.includes(tone) ? tone : "beep";
       state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
       state.chainGoalPref = Math.max(0, Math.round(Number(valueOf("tocw-set-goal")) || 0));
-      state.hitUrlPref = validHttpUrl(valueOf("tocw-set-hit-url"));
+      // Your rotating attack list. If it changed, keep the loop position in range.
+      const targetEl = document.getElementById("tocw-set-target-ids");
+      const newTargets = parseTargetIds(targetEl && "value" in targetEl ? String(targetEl.value) : "");
+      const targetsChanged = newTargets.join(",") !== state.targetIds.join(",");
+      state.targetIds = newTargets;
+      if (targetsChanged || state.targetIndex >= newTargets.length) state.targetIndex = 0;
       state.alarmVoice = checked("tocw-set-alarm-voice");
       state.autoFocus = checked("tocw-set-autofocus");
       state.celebrate = checked("tocw-set-celebrate");
@@ -2585,7 +2657,8 @@
       gmSet(STORE.alarmTone, state.alarmTone);
       gmSet(STORE.alarmVolume, state.alarmVolume);
       gmSet(STORE.chainGoal, state.chainGoalPref);
-      gmSet(STORE.hitUrl, state.hitUrlPref);
+      gmSet(STORE.targetIds, state.targetIds.join(","));
+      gmSet(STORE.targetIndex, state.targetIndex);
       gmSet(STORE.alarmVoice, state.alarmVoice);
       gmSet(STORE.autoFocus, state.autoFocus);
       gmSet(STORE.celebrate, state.celebrate);
@@ -2597,6 +2670,12 @@
       render();
     };
     document.getElementById("tocw-set-back")?.addEventListener("click", close);
+    document.getElementById("tocw-target-reset")?.addEventListener("click", () => {
+      state.targetIndex = 0;
+      gmSet(STORE.targetIndex, 0);
+      state.notice = "Target list restarted.";
+      close();
+    });
     document.getElementById("tocw-alarm-test")?.addEventListener("click", () => {
       primeAudio();
       // Preview the CURRENT form's tone/volume without needing to save first.
