@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.6.0
+// @version      0.7.0
 // @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard. No Torn API key needed for data — the Overseer backend serves it.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -24,7 +24,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.6.0";
+  const VERSION = "0.7.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -43,7 +43,10 @@
     claimSecret: "tocw_claim_secret",
     signupIdentity: "tocw_signup_identity",
     collapsed: "tocw_collapsed",
+    hidden: "tocw_hidden",
     position: "tocw_position",
+    size: "tocw_size",
+    launcherPos: "tocw_launcher_pos",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -69,6 +72,9 @@
     settingsOpen: false,
     scriptTooOld: false,
     collapsed: readBool(STORE.collapsed, false),
+    // Fully hidden: only the "TO" launcher shows. Distinct from collapsed (which
+    // keeps a compact header). Needed on mobile PDA where the panel fills the screen.
+    hidden: readBool(STORE.hidden, false),
   };
 
   function gmGet(key, fallback) {
@@ -175,6 +181,74 @@
     const rect = box.getBoundingClientRect();
     const next = clampPosition(rect.left, rect.top, rect.width, rect.height);
     gmSet(STORE.position, next);
+  }
+
+  const MIN_PANEL_W = 240;
+  const MIN_PANEL_H = 150;
+
+  function readSize() {
+    const value = gmGet(STORE.size, null);
+    if (!value || typeof value !== "object") return null;
+    const width = Number(value.width);
+    const height = Number(value.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+    return { width, height };
+  }
+
+  // Keep a user-chosen panel size inside the viewport (and above a usable floor),
+  // so a resize saved on a big screen doesn't overflow a small PDA one on reload.
+  function clampSize(width, height) {
+    const margin = 16;
+    const maxW = Math.max(MIN_PANEL_W, window.innerWidth - margin);
+    const maxH = Math.max(MIN_PANEL_H, window.innerHeight - margin);
+    return {
+      width: Math.min(Math.max(MIN_PANEL_W, Math.round(width)), maxW),
+      height: Math.min(Math.max(MIN_PANEL_H, Math.round(height)), maxH),
+    };
+  }
+
+  function applyPanelSize(box) {
+    const size = readSize();
+    if (!size) return;
+    const next = clampSize(size.width, size.height);
+    box.style.width = `${next.width}px`;
+    box.style.height = `${next.height}px`;
+    // An explicit height replaces the CSS max-height cap; the body scrolls inside.
+    box.style.maxHeight = "none";
+  }
+
+  function savePanelSize(box) {
+    const rect = box.getBoundingClientRect();
+    const next = clampSize(rect.width, rect.height);
+    gmSet(STORE.size, next);
+  }
+
+  const LAUNCHER_W = 46;
+  const LAUNCHER_H = 38;
+
+  function readLauncherPosition() {
+    const value = gmGet(STORE.launcherPos, null);
+    if (!value || typeof value !== "object") return null;
+    const left = Number(value.left);
+    const top = Number(value.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    return { left, top };
+  }
+
+  function applyLauncherPosition(launcher) {
+    const pos = readLauncherPosition();
+    if (!pos) return;
+    const next = clampPosition(pos.left, pos.top, LAUNCHER_W, LAUNCHER_H);
+    launcher.style.left = `${next.left}px`;
+    launcher.style.top = `${next.top}px`;
+    launcher.style.right = "auto";
+    launcher.style.bottom = "auto";
+  }
+
+  function saveLauncherPosition(launcher) {
+    const rect = launcher.getBoundingClientRect();
+    const next = clampPosition(rect.left, rect.top, rect.width || LAUNCHER_W, rect.height || LAUNCHER_H);
+    gmSet(STORE.launcherPos, next);
   }
 
   function pdaApiKey() {
@@ -633,8 +707,11 @@
         left: 82px;
         bottom: 124px;
         width: 390px;
+        min-width: ${MIN_PANEL_W}px;
         max-height: min(680px, calc(100vh - 148px));
-        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
         z-index: 2147483646;
         background: #101923;
         color: #eaf3ff;
@@ -646,6 +723,19 @@
         pointer-events: auto;
       }
       #tocw * { box-sizing: border-box; }
+      #tocw-resize {
+        position: absolute;
+        right: 1px;
+        bottom: 1px;
+        width: 18px;
+        height: 18px;
+        cursor: nwse-resize;
+        touch-action: none;
+        z-index: 3;
+        border-bottom-right-radius: 9px;
+        background: linear-gradient(135deg, transparent 46%, #46596f 46%, #46596f 56%, transparent 56%, transparent 68%, #46596f 68%, #46596f 78%, transparent 78%);
+      }
+      #tocw-resize:hover { background: linear-gradient(135deg, transparent 46%, #6f88a6 46%, #6f88a6 56%, transparent 56%, transparent 68%, #6f88a6 68%, #6f88a6 78%, transparent 78%); }
       #tocw button, #tocw-modal button {
         cursor: pointer;
         border: 1px solid #34465d;
@@ -658,7 +748,7 @@
       #tocw button.primary, #tocw-modal button.primary { background: #ff3b45; border-color: #ff3b45; }
       #tocw button.small { padding: 4px 7px; font-size: 11px; }
       #tocw button:disabled { opacity: .55; cursor: wait; }
-      .tocw-head { padding: 14px 14px 10px; border-bottom: 1px solid #25384d; cursor: move; touch-action: none; user-select: none; }
+      .tocw-head { flex: 0 0 auto; padding: 14px 14px 10px; border-bottom: 1px solid #25384d; cursor: move; touch-action: none; user-select: none; }
       .tocw-head button { cursor: pointer; }
       .tocw-title { font-size: 19px; font-weight: 800; margin: 0 0 5px; }
       .tocw-muted { color: #9eb4ce; font-size: 12px; line-height: 1.35; }
@@ -667,7 +757,7 @@
       .tocw-pill.ok { background: #103d2b; color: #d6ffe8; }
       .tocw-pill.warn { background: #67420c; color: #ffe1a7; }
       .tocw-pill.bad { background: #651922; color: #ffc6cc; }
-      .tocw-body { padding: 12px 14px 14px; display: grid; gap: 10px; }
+      .tocw-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 14px 14px; display: grid; gap: 10px; align-content: start; }
       .tocw-card { background: #0d141d; border: 1px solid #2b3d52; border-radius: 8px; padding: 10px; }
       .tocw-card-title { font-weight: 800; margin-bottom: 6px; }
       .tocw-big { font-size: 32px; font-weight: 900; letter-spacing: 0; line-height: 1; }
@@ -686,14 +776,15 @@
       .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; }
       .tocw-table th, .tocw-table td { text-align: right; padding: 5px 4px; border-top: 1px solid #25384d; }
       .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; }
-      #tocw.collapsed { width: 210px; max-height: none; overflow: visible; }
+      #tocw.collapsed { width: 210px; min-width: 0; height: auto; max-height: none; overflow: visible; }
       #tocw.collapsed .tocw-head { padding: 10px; border-bottom: 0; }
       #tocw.collapsed .tocw-pills { margin-bottom: 6px; }
       #tocw.collapsed .tocw-pills .tocw-pill:nth-child(n+2) { display: none; }
       #tocw.collapsed .tocw-title { font-size: 16px; margin-bottom: 2px; }
       #tocw.collapsed .tocw-muted { max-width: 126px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      #tocw.collapsed #tocw-collapse { padding: 5px 8px; font-size: 12px; }
+      #tocw.collapsed #tocw-collapse, #tocw.collapsed #tocw-hide { padding: 5px 8px; font-size: 12px; }
       #tocw.collapsed .tocw-body { display: none; }
+      #tocw.collapsed #tocw-resize { display: none; }
       #tocw-backdrop {
         position: fixed;
         inset: 0;
@@ -783,11 +874,70 @@
     });
   }
 
+  // Bottom-right grip: drag to resize the panel (touch-friendly for PDA). The
+  // top-left is pinned so it grows toward the corner; the chosen size persists.
+  function bindResize(box) {
+    const grip = document.getElementById("tocw-resize");
+    if (!grip || grip.dataset.bound === "1") return;
+    grip.dataset.bound = "1";
+    grip.addEventListener("pointerdown", (event) => {
+      if (event.button != null && event.button !== 0) return;
+      const rect = box.getBoundingClientRect();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startW = rect.width;
+      const startH = rect.height;
+      // Anchor the top-left corner so only width/height change under the grip.
+      box.style.left = `${rect.left}px`;
+      box.style.top = `${rect.top}px`;
+      box.style.right = "auto";
+      box.style.bottom = "auto";
+      box.style.maxHeight = "none";
+      grip.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+      event.stopPropagation();
+
+      const move = (moveEvent) => {
+        const next = clampSize(startW + (moveEvent.clientX - startX), startH + (moveEvent.clientY - startY));
+        box.style.width = `${next.width}px`;
+        box.style.height = `${next.height}px`;
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        savePanelSize(box);
+        savePanelPosition(box);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointercancel", up, { once: true });
+    });
+  }
+
   function render() {
     createShell();
     const box = document.getElementById("tocw");
     if (!box) return;
+    // Fully hidden: leave only the floating "TO" launcher (tap it to bring the
+    // panel back). Cheap early-out so the 1s render tick does no work while hidden.
+    const launcher = document.getElementById("tocw-launcher");
+    if (state.hidden) {
+      box.style.display = "none";
+      if (launcher) launcher.style.display = "";
+      return;
+    }
+    box.style.display = "";
+    if (launcher) launcher.style.display = "none";
     box.classList.toggle("collapsed", state.collapsed);
+    // Collapsed uses the compact auto size; otherwise honor a saved resize.
+    if (state.collapsed) {
+      box.style.width = "";
+      box.style.height = "";
+      box.style.maxHeight = "";
+    } else {
+      applyPanelSize(box);
+    }
 
     const cfg = settings();
     const event = state.watch?.event || state.signup?.event || null;
@@ -824,7 +974,10 @@
             <div class="tocw-title">Chain Watch</div>
             <div class="tocw-muted">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
           </div>
-          <button id="tocw-collapse">${state.collapsed ? "Open" : "Hide"}</button>
+          <div style="display:flex;gap:6px;align-items:flex-start;flex-shrink:0;">
+            <button id="tocw-collapse" class="small" title="${state.collapsed ? "Expand the panel" : "Minimize to the header"}">${state.collapsed ? "Open" : "Min"}</button>
+            <button id="tocw-hide" class="small" title="Hide — reopen with the TO button" aria-label="Hide panel">✕</button>
+          </div>
         </div>
       </div>
       <div class="tocw-body">
@@ -847,11 +1000,17 @@
         </div>
         <div class="tocw-muted" style="text-align:center;">No auto attacks</div>
       </div>
+      <div id="tocw-resize" title="Drag to resize"></div>
     `;
 
     document.getElementById("tocw-collapse")?.addEventListener("click", () => {
       state.collapsed = !state.collapsed;
       gmSet(STORE.collapsed, state.collapsed);
+      render();
+    });
+    document.getElementById("tocw-hide")?.addEventListener("click", () => {
+      state.hidden = true;
+      gmSet(STORE.hidden, true);
       render();
     });
     document.getElementById("tocw-refresh")?.addEventListener("click", () => void refreshAll(true));
@@ -864,6 +1023,7 @@
       btn.addEventListener("click", () => void handleAction(btn));
     }
     bindDrag(box);
+    bindResize(box);
     if (state.settingsOpen) {
       if (!document.getElementById("tocw-modal")) renderSettings();
     } else {
@@ -1352,14 +1512,14 @@
     launcher.id = "tocw-launcher";
     launcher.type = "button";
     launcher.textContent = "TO";
-    launcher.title = "Open Torn Overseer";
+    launcher.title = "Open Torn Overseer (drag to move)";
     launcher.style.cssText = [
       "position:fixed",
       "left:58px",
       "bottom:76px",
       "z-index:2147483647",
-      "width:46px",
-      "height:38px",
+      `width:${LAUNCHER_W}px`,
+      `height:${LAUNCHER_H}px`,
       "border-radius:9px",
       "border:2px solid #ff6870",
       "background:#ff3b45",
@@ -1367,16 +1527,71 @@
       "font:bold 15px Arial,sans-serif",
       "box-shadow:0 8px 22px rgba(0,0,0,.45)",
       "cursor:pointer",
+      "touch-action:none",
     ].join(";");
+    applyLauncherPosition(launcher);
     launcher.addEventListener("click", () => {
+      // A drag ends in a click too — swallow that one so moving the button
+      // doesn't also open the panel.
+      if (launcher.dataset.dragged === "1") {
+        launcher.dataset.dragged = "";
+        return;
+      }
+      state.hidden = false;
       state.collapsed = false;
+      gmSet(STORE.hidden, false);
       gmSet(STORE.collapsed, false);
       createShell();
       render();
       const box = document.getElementById("tocw");
       if (box) box.scrollIntoView({ block: "nearest", inline: "nearest" });
     });
+    bindLauncherDrag(launcher);
     document.body.appendChild(launcher);
+  }
+
+  // Make the "TO" launcher draggable (persisted), while a plain tap still opens the
+  // panel. A small movement threshold tells a drag from a tap so it never misfires.
+  function bindLauncherDrag(launcher) {
+    launcher.addEventListener("pointerdown", (event) => {
+      if (event.button != null && event.button !== 0) return;
+      const rect = launcher.getBoundingClientRect();
+      const offsetX = event.clientX - rect.left;
+      const offsetY = event.clientY - rect.top;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      let moved = false;
+      launcher.dataset.dragged = "";
+      launcher.setPointerCapture?.(event.pointerId);
+
+      const move = (moveEvent) => {
+        if (!moved && Math.abs(moveEvent.clientX - startX) < 4 && Math.abs(moveEvent.clientY - startY) < 4) return;
+        moved = true;
+        // Switch to top/left anchoring the moment a drag begins.
+        launcher.style.right = "auto";
+        launcher.style.bottom = "auto";
+        const next = clampPosition(
+          moveEvent.clientX - offsetX,
+          moveEvent.clientY - offsetY,
+          launcher.offsetWidth || LAUNCHER_W,
+          launcher.offsetHeight || LAUNCHER_H,
+        );
+        launcher.style.left = `${next.left}px`;
+        launcher.style.top = `${next.top}px`;
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        if (moved) {
+          launcher.dataset.dragged = "1";
+          saveLauncherPosition(launcher);
+        }
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointercancel", up, { once: true });
+    });
   }
 
   // On the Overseer site we ONLY capture the signup token from a /chain/e/:token link
@@ -1421,7 +1636,8 @@
     setTimeout(() => void refreshAll(false), 800);
     setInterval(safeRender, 1000);
     setInterval(() => {
-      if (document.visibilityState === "visible") void refreshAll(false);
+      // Skip polling while fully hidden — no UI to update, and it saves PDA battery/data.
+      if (document.visibilityState === "visible" && !state.hidden) void refreshAll(false);
     }, 30_000);
   }
 
