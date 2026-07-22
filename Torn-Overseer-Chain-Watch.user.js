@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.15.1
+// @version      0.16.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.15.1";
+  const VERSION = "0.16.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -54,7 +54,6 @@
   const SHIFT_WARN_SECS = 300; // 5-minute heads-up before your shift
   const PACE_MIN_WINDOW_SEC = 10; // don't compute a hit/min pace off too short a sample
   const HANDOFF_WARN_SECS = 600; // start nagging about the next watcher 10m before your shift ends
-  const DEFAULT_HIT_URL = "https://www.torn.com/war.php"; // ranked-war target list (configurable)
 
   const STORE = {
     tornKey: "tocw_torn_key",
@@ -168,10 +167,9 @@
     return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0.3;
   }
 
-  // The HIT button href is user-set — only allow http(s) so it can't become a
-  // javascript:/data: link; anything else falls back to the default target list.
-  // An http(s) URL or "" (used by the effective-value merge, which must be able to tell
-  // "nothing set" from a valid URL); the settings save uses sanitizeHitUrl below.
+  // The HIT button href is user-set — only allow http(s) (never javascript:/data:).
+  // Returns the normalized URL, or "" when nothing usable is set (the caller uses the
+  // empty string to mean "no target configured" rather than sending you somewhere random).
   function validHttpUrl(raw) {
     const s = String(raw || "").trim();
     if (!s) return "";
@@ -182,10 +180,6 @@
       /* not a URL */
     }
     return "";
-  }
-
-  function sanitizeHitUrl(raw) {
-    return validHttpUrl(raw) || DEFAULT_HIT_URL;
   }
 
   // Parse a "60,30,10" thresholds string into a sorted-desc list of positive ints.
@@ -209,9 +203,10 @@
 
   // Thresholds + goal are effective = YOUR preference (if set) ?? the FACTION default ??
   // the built-in. The HIT target URL is PER-MEMBER only (it depends on your own stats),
-  // so it's just your value ?? the built-in default — never a faction default.
+  // and there's NO sensible universal default — so it's just your value, or "" (unset),
+  // in which case the button prompts you to set one instead of linking somewhere wrong.
   function effHitUrl() {
-    return validHttpUrl(state.hitUrlPref) || DEFAULT_HIT_URL;
+    return validHttpUrl(state.hitUrlPref);
   }
   function effThresholds() {
     return parseThresholds(state.thresholdsPref, null)
@@ -781,6 +776,7 @@
       timeout,
       modifier: num(c.modifier) ?? 0,
       cooldown: num(c.cooldown) ?? 0,
+      start: num(c.start) ?? 0, // unix seconds the chain began — windows the leaderboard
       fetchedAt: Date.now(),
     };
   }
@@ -788,9 +784,11 @@
   // Torn /faction?selections=attacks -> the same aggregated leaderboard shape the
   // backend serves, built client-side from the last ~100 attacks (needs faction API
   // access; a 403/access error surfaces as an error and we fall back to the backend).
-  // Also computes a recent hit PACE (per-minute) over the sampled window: your own,
-  // the whole faction, and the per-hitter average — `viewerId` singles out your rows.
-  function parseAttacks(raw, viewerId) {
+  // Windowed to THIS chain (windowStartSec) and filtered to faction members (rosterIds)
+  // so it matches the live chain — not last-100-attacks that include the previous chain
+  // and incoming enemy hits. Also computes a recent hit PACE (per-minute) over the
+  // sampled window: your own, the whole faction, and the per-hitter average.
+  function parseAttacks(raw, viewerId, windowStartSec, rosterIds) {
     const rows = asRows(raw?.attacks ?? raw);
     const byId = new Map();
     let last = null;
@@ -801,15 +799,21 @@
     const yourTs = [];
     const yourResp = [];
     const vid = viewerId != null ? Number(viewerId) : null;
+    const winStart = Number.isFinite(windowStartSec) && windowStartSec > 0 ? windowStartSec : 0;
+    const hasRoster = rosterIds instanceof Set && rosterIds.size > 0;
     for (const row of rows) {
       const attacker = row?.attacker && typeof row.attacker === "object" ? row.attacker : {};
       const defender = row?.defender && typeof row.defender === "object" ? row.defender : {};
       const attackerId = num(row?.attacker_id ?? row?.attackerID ?? attacker.id);
       if (!attackerId || attackerId <= 0) continue; // stealthed / unknown attacker
-      const attackerName = row?.attacker_name || attacker.name || `ID ${attackerId}`;
-      const defenderName = row?.defender_name || defender.name || row?.target_name || "target";
+      // Only faction members' hits (drops incoming enemy attacks); and only within the
+      // current chain's window (drops the previous chain / between-chain randoms).
+      if (hasRoster && !rosterIds.has(attackerId)) continue;
       const timestamp =
         num(row?.timestamp_ended ?? row?.ended ?? row?.timestamp_started ?? row?.started ?? row?.timestamp) ?? 0;
+      if (winStart && timestamp > 0 && timestamp < winStart) continue;
+      const attackerName = row?.attacker_name || attacker.name || `ID ${attackerId}`;
+      const defenderName = row?.defender_name || defender.name || row?.target_name || "target";
       const respect = num(row?.respect_gain ?? row?.respect ?? row?.respectGain ?? row?.respect_total) ?? 0;
       const prior = byId.get(attackerId) || { playerId: attackerId, name: attackerName, hits: 0, respect: 0 };
       prior.hits += 1;
@@ -903,6 +907,16 @@
       // 2) Zero-lag live data STRAIGHT from Torn (member key). This is the primary
       //    source whenever a key is present; the backend block is only a fallback.
       if (hasKey) {
+        // Window the leaderboard to the running chain (its start), else a rolling 4h;
+        // filter to faction members so incoming enemy hits don't pollute it.
+        const chainStart = state.chain?.active && state.chain.start > 0
+          ? state.chain.start
+          : Math.floor(Date.now() / 1000) - 4 * 3600;
+        const rosterIds = new Set(
+          (state.signup?.roster || state.watch?.roster || [])
+            .map((m) => Number(m.id))
+            .filter((n) => Number.isFinite(n) && n > 0),
+        );
         tasks.push(
           tornFetch("/faction/chain")
             .then((raw) => { tornChain = parseChain(raw); })
@@ -911,7 +925,7 @@
         if (wantAttacks) {
           tasks.push(
             tornLegacyFaction("attacks")
-              .then((raw) => { tornAttacks = parseAttacks(raw, viewerId()); lastAttacksAt = Date.now(); })
+              .then((raw) => { tornAttacks = parseAttacks(raw, viewerId(), chainStart, rosterIds); lastAttacksAt = Date.now(); })
               .catch(() => { /* no faction API access etc. — fall back to the backend block */ }),
           );
         }
@@ -922,6 +936,17 @@
       // Resolve the live chain HUD: direct Torn wins; else the backend cache; else keep
       // the last value (never blank a live timer on one failed poll).
       if (tornChain) {
+        // Torn caches /faction/chain for a few seconds, so consecutive polls can return
+        // the SAME timeout. If we re-stamped fetchedAt each time, the countdown would
+        // jump back to the start every poll. So only re-anchor when the data actually
+        // moved (timeout or current changed) — otherwise keep counting from the old anchor.
+        const prev = state.chain;
+        if (
+          prev && prev.active && tornChain.active &&
+          prev.timeout === tornChain.timeout && prev.current === tornChain.current
+        ) {
+          tornChain.fetchedAt = prev.fetchedAt;
+        }
         state.chain = tornChain;
         state.liveSource = "torn";
         state.tornFailCount = 0;
@@ -1547,7 +1572,8 @@
       .tocw-focus { text-align: center; padding: 6px 0 2px; }
       .tocw-focus-timer { font-size: 58px; font-weight: 900; line-height: 1; letter-spacing: -1px; }
       .tocw-focus-sub { font-size: 15px; margin-top: 4px; }
-      .tocw-hit { display: block; text-align: center; text-decoration: none; padding: 12px; border-radius: 9px; font-weight: 900; font-size: 15px; background: #243447; color: #eaf3ff; border: 1px solid #3a5573; }
+      .tocw-hit { display: block; width: 100%; text-align: center; text-decoration: none; padding: 12px; border-radius: 9px; font-weight: 900; font-size: 15px; background: #243447; color: #eaf3ff; border: 1px solid #3a5573; }
+      .tocw-hit--setup { background: transparent; border-style: dashed; color: #cfe0f7; font-weight: 700; font-size: 13px; cursor: pointer; }
       .tocw-hit.urgent { background: #ff3b45; border-color: #ff6870; color: #fff; animation: tocw-pulse .8s ease-in-out infinite; }
       #tocw-focus.on { background: #234; border-color: #46617f; }
       /* Alarm flash on the whole panel */
@@ -1570,8 +1596,10 @@
       #tocw-alarm.on { background: #ff3b45; border-color: #ff6870; color: #fff; }
       /* Wide content (the leaderboard table) scrolls inside its own box, never the panel */
       .tocw-scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-      .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-      .tocw-table th, .tocw-table td { text-align: right; padding: 5px 6px; border-top: 1px solid #25384d; white-space: nowrap; }
+      /* Explicit colors so torn.com's own table styles can't bleed in (was black text) */
+      .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; color: #eaf3ff; background: transparent; }
+      .tocw-table th, .tocw-table td { text-align: right; padding: 5px 6px; border-top: 1px solid #25384d; white-space: nowrap; color: #eaf3ff; background: transparent; }
+      .tocw-table th { color: #9eb4ce; font-weight: 700; }
       .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; position: sticky; left: 0; background: #0d141d; }
       #tocw.collapsed { width: 210px; min-width: 0; height: auto; max-height: none; overflow: visible; }
       #tocw.collapsed .tocw-head { padding: 10px; border-bottom: 0; }
@@ -1850,6 +1878,10 @@
       state.settingsOpen = true;
       render();
     });
+    document.getElementById("tocw-hit-setup")?.addEventListener("click", () => {
+      state.settingsOpen = true;
+      render();
+    });
     for (const btn of box.querySelectorAll("[data-tocw-action]")) {
       btn.addEventListener("click", () => void handleAction(btn));
     }
@@ -1958,11 +1990,17 @@
     return "";
   }
 
-  // A prominent "go hit" button. Turns big + red when the drop is close. Links to the
-  // configured target list (a ranked-war page or shared list) in the same tab.
+  // A prominent "go hit" button that jumps to YOUR target list (the enemy faction /
+  // shared list you set in Settings) — there's no useful universal target, so when it's
+  // unset the button just prompts you to set one rather than linking somewhere wrong.
+  // Turns big + red when the drop is close.
   function renderHitButton(remaining) {
+    const url = effHitUrl();
+    if (!url) {
+      return `<button id="tocw-hit-setup" type="button" class="tocw-hit tocw-hit--setup">⚙️ Set your target list</button>`;
+    }
     const urgent = Boolean(state.chain?.active) && remaining > 0 && remaining <= 60;
-    return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(effHitUrl())}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
+    return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(url)}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
   }
 
   // Compact "on watch" view: a giant drop timer, hits, your pace, the HIT button, and
@@ -2488,10 +2526,10 @@
             <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoalPref || ""}" placeholder="${Number(state.factionConfig?.chain_goal) > 0 ? Number(state.factionConfig.chain_goal) : "e.g. 5000"}" />
           </label>
           <label>HIT button target URL <span class="tocw-muted">— your own targets</span>
-            <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrlPref)}" placeholder="${escapeHtml(DEFAULT_HIT_URL)}" />
+            <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrlPref)}" placeholder="e.g. the enemy faction's page / your target list" />
           </label>
         </div>
-        <div class="tocw-muted" style="margin-top:4px;">The HIT target is yours alone — the best target depends on your own stats.</div>
+        <div class="tocw-muted" style="margin-top:4px;">Where the HIT button jumps to. Paste the enemy faction page or your own target list — the best target depends on your stats, so there's no shared default.</div>
         ${state.watch?.viewer?.can_manage ? `
           <div style="margin-top:8px;border-top:1px solid #2b3d52;padding-top:8px;">
             <div style="font-weight:700;">Faction defaults (managers)</div>
