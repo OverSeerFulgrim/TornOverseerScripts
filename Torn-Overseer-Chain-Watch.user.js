@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.17.0
+// @version      0.17.1
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.17.0";
+  const VERSION = "0.17.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -161,11 +161,6 @@
     chainSeenTs: new Set(),
     lastBonusPassed: 0,
     chainSummary: null,
-    // Best estimate (unix seconds) of when the chain drops, corrected for Torn's API
-    // staleness by keeping the freshest read; chainDeadlineFor tracks the hit count it
-    // was computed for so a real hit re-anchors it. See updateChainDeadline().
-    chainDeadline: 0,
-    chainDeadlineFor: -1,
   };
 
   // Parse a free-form list of player ids ("123, 456\n789" / profile links) into a
@@ -962,15 +957,24 @@
       // Resolve the live chain HUD: direct Torn wins; else the backend cache; else keep
       // the last value (never blank a live timer on one failed poll).
       if (tornChain) {
+        // Torn caches /faction/chain, so consecutive polls can return the SAME timeout.
+        // Keep the previous anchor when the data hasn't moved, or the countdown jumps back
+        // to the start each poll; re-anchor only when timeout/current actually changed.
+        const prev = state.chain;
+        if (
+          prev && prev.active && tornChain.active &&
+          prev.timeout === tornChain.timeout && prev.current === tornChain.current
+        ) {
+          tornChain.fetchedAt = prev.fetchedAt;
+        }
         state.chain = tornChain;
         state.liveSource = "torn";
         state.tornFailCount = 0;
-        updateChainDeadline(tornChain); // staleness-corrected drop deadline
       } else {
         if (hasKey) state.tornFailCount += 1; // ran the direct fetch, got nothing usable
         if (serverRes) {
           const cached = serverLiveChain(serverRes);
-          if (cached) { state.chain = cached; state.liveSource = "cache"; state.chainDeadline = 0; }
+          if (cached) { state.chain = cached; state.liveSource = "cache"; }
         }
       }
 
@@ -1026,31 +1030,41 @@
     }, delay);
   }
 
-  // Torn's /faction/chain `timeout` is stale by however long the API cached the
-  // response, so anchoring naively runs a couple seconds ahead of the in-game sidebar.
-  // The true drop DEADLINE (now + timeout) is a constant we can only over-estimate
-  // (staleness ≥ 0), so we keep the SMALLEST implied deadline seen — the freshest read —
-  // and re-anchor when a hit changes the chain count. This converges to the real time.
-  function updateChainDeadline(chain) {
-    if (!chain?.active) {
-      state.chainDeadline = 0;
-      state.chainDeadlineFor = -1;
-      return;
+  // torn.com's own sidebar shows the chain countdown, updated live by the site — the
+  // exact value the player sees, with zero API-cache lag. Read it (defensively) so our
+  // drop timer matches. Returns seconds, or null when the sidebar/chain bar isn't there.
+  let sidebarChainNode = null;
+  function readSidebarChainSeconds() {
+    try {
+      // Re-use a previously found node if it's still attached, else re-scan.
+      if (!sidebarChainNode || !sidebarChainNode.isConnected) {
+        sidebarChainNode = null;
+        const root = document.getElementById("sidebarroot") || document.getElementById("sidebar") || document.body;
+        for (const node of root.querySelectorAll('[class*="chain" i], [class*="bar"]')) {
+          const text = node.textContent || "";
+          if (/chain/i.test(text) && /\b\d{1,2}:\d{2}\b/.test(text) && text.length < 40) {
+            sidebarChainNode = node;
+            break;
+          }
+        }
+      }
+      const text = sidebarChainNode?.textContent || "";
+      const m = text.match(/\b(\d{1,2}):(\d{2})\b/);
+      if (m) return Number(m[1]) * 60 + Number(m[2]);
+    } catch {
+      sidebarChainNode = null;
     }
-    const implied = Date.now() / 1000 + chain.timeout;
-    const bumped = state.chainDeadline > 0 && implied > state.chainDeadline + 4; // a hit reset the timer up
-    if (!state.chainDeadline || chain.current !== state.chainDeadlineFor || bumped) {
-      state.chainDeadline = implied; // fresh chain / hit / timer jumped up → re-anchor
-    } else {
-      state.chainDeadline = Math.min(state.chainDeadline, implied); // adopt a fresher (smaller) read
-    }
-    state.chainDeadlineFor = chain.current;
+    return null;
   }
 
   function chainRemaining() {
     if (!state.chain?.active) return 0;
-    if (state.chainDeadline > 0) return Math.max(0, Math.round(state.chainDeadline - Date.now() / 1000));
-    return Math.max(0, state.chain.timeout - Math.floor((Date.now() - state.chain.fetchedAt) / 1000));
+    const byTimeout = Math.max(0, state.chain.timeout - Math.floor((Date.now() - state.chain.fetchedAt) / 1000));
+    // Prefer the sidebar's live value when it's plausibly the chain timer (within ~90s of
+    // our API value) — a mis-parsed element can't hijack the countdown that way.
+    const dom = readSidebarChainSeconds();
+    if (dom != null && Math.abs(dom - byTimeout) <= 90) return dom;
+    return byTimeout;
   }
 
   function duration(seconds) {
@@ -1579,12 +1593,12 @@
       .tocw-card-title { font-weight: 800; margin-bottom: 6px; }
       .tocw-big { font-size: 32px; font-weight: 900; letter-spacing: 0; line-height: 1; }
       .tocw-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      .tocw-row { display: grid; grid-template-columns: 104px 1fr; gap: 10px; align-items: start; padding: 9px 0; border-top: 1px solid #25384d; }
+      .tocw-row { display: grid; grid-template-columns: 108px 1fr; gap: 12px; align-items: start; padding: 10px 4px 10px 10px; border-top: 1px solid #25384d; border-radius: 6px; }
       .tocw-row:first-child { border-top: 0; }
       /* Shift time: two non-breaking lines (TCT window, then local), tiny zone tags */
-      .tocw-when-tct { display: block; white-space: nowrap; font-weight: 700; color: #d7e4f5; font-size: 12px; }
-      .tocw-when-local { display: block; white-space: nowrap; font-size: 11px; color: #7f93ad; margin-top: 1px; }
-      .tocw-when-zone { font-weight: 400; font-size: 10px; color: #6f8098; }
+      .tocw-when-tct { display: block; white-space: nowrap; font-weight: 700; color: #eaf3ff; font-size: 12.5px; }
+      .tocw-when-local { display: block; white-space: nowrap; font-size: 11px; color: #93a8c2; margin-top: 2px; }
+      .tocw-when-zone { font-weight: 400; font-size: 10px; color: #7385a0; }
       /* Main + backup stack vertically, each its own clear line (role · who · action) */
       .tocw-slots { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
       .tocw-slot { display: flex; align-items: center; gap: 8px; }
@@ -1623,7 +1637,7 @@
       #tocw.tocw-flash-warn { animation: tocw-flashwarn 1.4s ease-out; }
       #tocw.tocw-flash-good { animation: tocw-flashgood 1.4s ease-out; }
       /* Active / your shift row highlight */
-      .tocw-row.active { background: #12233a; border-radius: 6px; box-shadow: inset 3px 0 0 #35b76f; padding-left: 6px; }
+      .tocw-row.active { background: #12233a; box-shadow: inset 3px 0 0 #35b76f; }
       .tocw-row.mine { box-shadow: inset 3px 0 0 #ff9f43; }
       .tocw-row.active.mine { background: #1a2740; box-shadow: inset 3px 0 0 #ffce54; }
       .tocw-you { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 10px; font-weight: 800; background: #ff9f43; color: #201200; vertical-align: middle; }
