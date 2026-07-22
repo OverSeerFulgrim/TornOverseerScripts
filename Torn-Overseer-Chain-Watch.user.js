@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.14.1
+// @version      0.14.2
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
-// @author       OverSeerFulgrim
+// @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
 // @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.14.1";
+  const VERSION = "0.14.2";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -2459,17 +2459,6 @@
             <button id="tocw-save-faction-config" class="small">Save thresholds + goal as faction defaults</button>
           </div>` : ""}
       </div>
-      <details style="margin-top:10px;">
-        <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Advanced backend settings</summary>
-        <div class="grid" style="margin-top:10px;">
-          <label>Functions URL
-            <input id="tocw-set-functions" value="${escapeHtml(cfg.functionsUrl)}" />
-          </label>
-          <label>Supabase publishable key
-            <input id="tocw-set-anon" type="password" value="${escapeHtml(cfg.anonKey)}" autocomplete="off" />
-          </label>
-        </div>
-      </details>
       <div class="tocw-modal-actions">
         <button id="tocw-modal-connect">Connect site from Torn key</button>
         <button id="tocw-modal-save" class="primary">Save</button>
@@ -2481,10 +2470,10 @@
   // Attach the settings handlers after the settings body is in the DOM (called from
   // render() when state.settingsOpen). Same logic as the old modal, minus the overlay.
   function wireSettings() {
+    // The backend URL + publishable key are fixed (the DEFAULT_* constants); there's no
+    // UI to override them, so settings()/saveSettings just use the defaults.
     const collect = () => ({
       tornKey: valueOf("tocw-set-torn-key"),
-      functionsUrl: valueOf("tocw-set-functions"),
-      anonKey: valueOf("tocw-set-anon"),
       sessionToken: valueOf("tocw-set-session"),
     });
     const checked = (id) => Boolean(document.getElementById(id)?.checked);
