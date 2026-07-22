@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.15.0
+// @version      0.15.1
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.15.0";
+  const VERSION = "0.15.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -1026,10 +1026,21 @@
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
   }
 
+  // Bare "HH:MM" in TCT (UTC), no zone suffix — for building compact time ranges.
+  function hhmmTct(iso) {
+    if (!iso) return "--";
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return "--";
+    return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
+  }
+
+  // Two clean, non-breaking lines: the TCT window and the viewer-local window, each
+  // with a small zone tag — so nothing wraps mid-value in the narrow time column.
   function shiftLabel(shift) {
-    const tct = `${tctTime(shift.shift_start)}-${tctTime(shift.shift_end).replace(" TCT", "")}`;
-    const local = `${localTime(shift.shift_start)}-${localTime(shift.shift_end)}`;
-    return `${tct} <span class="tocw-muted">· ${local} your time</span>`;
+    const tct = `${hhmmTct(shift.shift_start)}–${hhmmTct(shift.shift_end)}`;
+    const local = `${localTime(shift.shift_start)}–${localTime(shift.shift_end)}`;
+    return `<span class="tocw-when-tct">${tct}<span class="tocw-when-zone"> TCT</span></span>` +
+      `<span class="tocw-when-local">${local}<span class="tocw-when-zone"> local</span></span>`;
   }
 
   function statusClass(status) {
@@ -1505,8 +1516,12 @@
       .tocw-card-title { font-weight: 800; margin-bottom: 6px; }
       .tocw-big { font-size: 32px; font-weight: 900; letter-spacing: 0; line-height: 1; }
       .tocw-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      .tocw-row { display: grid; grid-template-columns: 84px 1fr; gap: 10px; align-items: start; padding: 9px 0; border-top: 1px solid #25384d; }
+      .tocw-row { display: grid; grid-template-columns: 104px 1fr; gap: 10px; align-items: start; padding: 9px 0; border-top: 1px solid #25384d; }
       .tocw-row:first-child { border-top: 0; }
+      /* Shift time: two non-breaking lines (TCT window, then local), tiny zone tags */
+      .tocw-when-tct { display: block; white-space: nowrap; font-weight: 700; color: #d7e4f5; font-size: 12px; }
+      .tocw-when-local { display: block; white-space: nowrap; font-size: 11px; color: #7f93ad; margin-top: 1px; }
+      .tocw-when-zone { font-weight: 400; font-size: 10px; color: #6f8098; }
       /* Main + backup stack vertically, each its own clear line (role · who · action) */
       .tocw-slots { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
       .tocw-slot { display: flex; align-items: center; gap: 8px; }
