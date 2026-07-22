@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.17.2
+// @version      0.17.3
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.17.2";
+  const VERSION = "0.17.3";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -1616,9 +1616,9 @@
       .tocw-progress { height: 8px; background: #0a1018; border-radius: 999px; overflow: hidden; border: 1px solid #28394d; margin-top: 6px; }
       .tocw-progress span { display: block; height: 100%; background: #35b76f; }
       /* Drop-timer urgency */
-      .tocw-big.u-ok, .tocw-focus-timer.u-ok { color: #6ff0a8; }
-      .tocw-big.u-warn, .tocw-focus-timer.u-warn { color: #ffcf6b; }
-      .tocw-big.u-bad, .tocw-focus-timer.u-bad { color: #ff6d76; animation: tocw-pulse .9s ease-in-out infinite; }
+      .tocw-big.u-ok, .tocw-focus-timer.u-ok, .tocw-cstatus-timer.u-ok { color: #6ff0a8; }
+      .tocw-big.u-warn, .tocw-focus-timer.u-warn, .tocw-cstatus-timer.u-warn { color: #ffcf6b; }
+      .tocw-big.u-bad, .tocw-focus-timer.u-bad, .tocw-cstatus-timer.u-bad { color: #ff6d76; animation: tocw-pulse .9s ease-in-out infinite; }
       @keyframes tocw-pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
       /* Focus (on-watch) mode + HIT button */
       .tocw-focus { text-align: center; padding: 6px 0 2px; }
@@ -1654,13 +1654,17 @@
       .tocw-table th, .tocw-table td { text-align: right; padding: 5px 6px; border-top: 1px solid #25384d; white-space: nowrap; color: #eaf3ff; background: transparent; }
       .tocw-table th { color: #9eb4ce; font-weight: 700; }
       .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; position: sticky; left: 0; background: #0d141d; }
-      #tocw.collapsed { width: 210px; min-width: 0; height: auto; max-height: none; overflow: visible; }
+      /* Compact drop-timer status shown only when minimized (hidden when expanded) */
+      .tocw-cstatus { display: none; margin-top: 1px; white-space: nowrap; }
+      .tocw-cstatus-timer { font-weight: 900; font-size: 21px; line-height: 1; }
+      #tocw.collapsed { width: 240px; min-width: 0; height: auto; max-height: none; overflow: visible; }
       #tocw.collapsed .tocw-head { padding: 10px; border-bottom: 0; }
       #tocw.collapsed .tocw-pills { margin-bottom: 6px; }
       #tocw.collapsed .tocw-pills .tocw-pill:nth-child(n+2) { display: none; }
-      #tocw.collapsed .tocw-title { font-size: 16px; margin-bottom: 2px; }
-      #tocw.collapsed .tocw-muted { max-width: 126px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      #tocw.collapsed #tocw-collapse, #tocw.collapsed #tocw-hide { padding: 5px 8px; font-size: 12px; }
+      #tocw.collapsed .tocw-title, #tocw.collapsed .tocw-subtitle { display: none; }
+      #tocw.collapsed .tocw-cstatus { display: block; }
+      #tocw.collapsed #tocw-focus { display: none; }
+      #tocw.collapsed #tocw-collapse, #tocw.collapsed #tocw-hide, #tocw.collapsed #tocw-alarm { padding: 5px 8px; font-size: 12px; }
       #tocw.collapsed .tocw-body { display: none; }
       #tocw.collapsed #tocw-resize { display: none; }
       /* In-panel settings view (was a modal — now inherits the panel's z-index + drag) */
@@ -1848,9 +1852,14 @@
           <span class="tocw-pill">READ-ONLY</span>
         </div>
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
-          <div>
+          <div style="min-width:0;">
             <div class="tocw-title">Chain Watch</div>
-            <div class="tocw-muted">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
+            <div class="tocw-muted tocw-subtitle">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
+            <div class="tocw-cstatus">${live
+              ? `<span class="tocw-cstatus-timer ${timerUrgencyClass(remaining)}" id="tocw-ctimer">${duration(remaining)}</span> <span class="tocw-muted">· ${chain.current} hit${chain.current === 1 ? "" : "s"}</span>`
+              : event
+                ? `<span class="tocw-muted">Starts in ${duration(scheduledSeconds)}</span>`
+                : `<span class="tocw-muted">No chain scheduled</span>`}</div>
           </div>
           <div style="display:flex;gap:6px;align-items:flex-start;flex-shrink:0;">
             <button id="tocw-focus" class="small ${state.focus ? "on" : ""}" title="${state.focus ? "Exit focus (full panel)" : "Focus mode — giant timer only"}" aria-label="Toggle focus mode">⛶</button>
@@ -2917,7 +2926,17 @@
       // is collapsed or hidden and you're not watching it.
       evaluateAlarms();
       updateWakeLock();
-      if (state.hidden || state.collapsed) return;
+      if (state.hidden) return;
+      if (state.collapsed) {
+        // Minimized: only the compact status drop-timer is visible — keep it ticking.
+        const cel = document.getElementById("tocw-ctimer");
+        if (cel && state.chain?.active) {
+          const remaining = chainRemaining();
+          cel.textContent = duration(remaining);
+          cel.className = `tocw-cstatus-timer ${timerUrgencyClass(remaining)}`;
+        }
+        return;
+      }
 
       const el = document.getElementById("tocw-timer");
       if (el) {
