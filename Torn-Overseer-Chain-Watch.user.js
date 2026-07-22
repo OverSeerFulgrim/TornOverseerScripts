@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.10.0
+// @version      0.11.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.10.0";
+  const VERSION = "0.11.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -53,6 +53,8 @@
   const DEFAULT_DROP_THRESHOLDS = [60, 30, 10];
   const SHIFT_WARN_SECS = 300; // 5-minute heads-up before your shift
   const PACE_MIN_WINDOW_SEC = 10; // don't compute a hit/min pace off too short a sample
+  const HANDOFF_WARN_SECS = 600; // start nagging about the next watcher 10m before your shift ends
+  const DEFAULT_HIT_URL = "https://www.torn.com/war.php"; // ranked-war target list (configurable)
 
   const STORE = {
     tornKey: "tocw_torn_key",
@@ -74,6 +76,11 @@
     alarmNotify: "tocw_alarm_notify",
     alarmThresholds: "tocw_alarm_thresholds",
     wakeLock: "tocw_wakelock",
+    focus: "tocw_focus",
+    alarmVolume: "tocw_alarm_volume",
+    alarmTone: "tocw_alarm_tone",
+    chainGoal: "tocw_chain_goal",
+    hitUrl: "tocw_hit_url",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -112,8 +119,16 @@
     alarmFlash: readBool(STORE.alarmFlash, true),
     alarmNotify: readBool(STORE.alarmNotify, false),
     dropThresholds: parseThresholds(readString(STORE.alarmThresholds, ""), DEFAULT_DROP_THRESHOLDS),
+    alarmVolume: clampVolume(readNumber(STORE.alarmVolume, 0.3)),
+    alarmTone: readString(STORE.alarmTone, "beep") || "beep",
     // Keep the screen awake while on watch (mobile/PDA) so the drop alarm can fire.
     wakeLockEnabled: readBool(STORE.wakeLock, true),
+    // Compact "on watch" view: giant drop timer + hits + HIT button, nothing else.
+    focus: readBool(STORE.focus, false),
+    // Optional personal target hit-count for the chain (0 = off); drives a goal + ETA line.
+    chainGoal: Math.max(0, Math.round(readNumber(STORE.chainGoal, 0))),
+    // Where the HIT button sends you (a shared target list / enemy faction page).
+    hitUrl: readString(STORE.hitUrl, "") || DEFAULT_HIT_URL,
     // Fire-once bookkeeping so an alarm sounds at each threshold only once per chain
     // run / shift (cleared when the drop timer resets on a fresh hit, or the chain ends).
     firedDrop: new Set(),
@@ -122,6 +137,30 @@
     // Consecutive direct-Torn chain failures — used to hint at missing faction API access.
     tornFailCount: 0,
   };
+
+  function readNumber(key, fallback) {
+    const n = Number(gmGet(key, fallback));
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function clampVolume(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0.3;
+  }
+
+  // The HIT button href is user-set — only allow http(s) so it can't become a
+  // javascript:/data: link; anything else falls back to the default target list.
+  function sanitizeHitUrl(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return DEFAULT_HIT_URL;
+    try {
+      const u = new URL(s);
+      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    } catch {
+      /* not a URL */
+    }
+    return DEFAULT_HIT_URL;
+  }
 
   // Parse a "60,30,10" thresholds string into a sorted-desc list of positive ints,
   // falling back to the default when nothing valid is given.
@@ -988,6 +1027,54 @@
     return { active, next };
   }
 
+  // MAIN-slot coverage across both payload shapes: {start, end, id, name, online}.
+  function normalizedShifts() {
+    if (Array.isArray(state.watch?.shifts)) {
+      return state.watch.shifts.map((s) => ({
+        start: s.shift_start, end: s.shift_end,
+        id: s.watcher_id, name: s.watcher_name, online: s.watcher_online_status,
+      }));
+    }
+    if (Array.isArray(state.signup?.shifts)) {
+      return state.signup.shifts.map((s) => ({
+        start: s.shift_start, end: s.shift_end,
+        id: s.main?.watcher_id, name: s.main?.watcher_name, online: s.main?.online_status,
+      }));
+    }
+    return [];
+  }
+
+  // Handoff readiness for the shift that's ending: is the NEXT slot covered by someone
+  // online? Returns null until the current shift is within HANDOFF_WARN of ending.
+  //  - "gap":   no next watcher assigned at all
+  //  - "risk":  next watcher assigned but not Online (idle/offline)
+  //  - "ready": next watcher assigned and Online
+  function handoffStatus() {
+    const rows = normalizedShifts();
+    const now = Date.now();
+    const current = rows.find((s) => new Date(s.start).getTime() <= now && new Date(s.end).getTime() > now) || null;
+    if (!current) return null;
+    const handoffAt = new Date(current.end).getTime();
+    const endsIn = Math.floor((handoffAt - now) / 1000);
+    if (endsIn > HANDOFF_WARN_SECS) return null;
+    // The shift that covers the instant this one ends (the contiguous next slot). If
+    // nothing covers it, there's an immediate unmanned gap right after the handoff.
+    const cover = rows.find((s) => new Date(s.start).getTime() <= handoffAt && new Date(s.end).getTime() > handoffAt) || null;
+    if (!cover || cover.id == null) return { state: "gap", endsIn, name: null, online: null };
+    const online = cover.online === "Online";
+    return { state: online ? "ready" : "risk", endsIn, name: cover.name, online: cover.online };
+  }
+
+  // "~Xm" ETA to close a gap of `toGo` hits at `pacePerMin`. Empty when unknown.
+  function etaText(toGo, pacePerMin) {
+    if (!pacePerMin || pacePerMin <= 0 || toGo <= 0) return "";
+    const mins = toGo / pacePerMin;
+    if (!Number.isFinite(mins)) return "";
+    if (mins < 1) return "~<1m";
+    if (mins < 60) return `~${Math.round(mins)}m`;
+    return `~${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m`;
+  }
+
   // --- Alarms (opt-in): sound (WebAudio), vibration, and a panel flash ---------
 
   let audioCtx = null;
@@ -1006,19 +1093,20 @@
     }
   }
 
-  function beep(count = 1, freq = 880) {
+  function beep(count = 1, freq = 880, type = "square") {
     if (!audioCtx) primeAudio();
     if (!audioCtx) return;
+    const peak = Math.max(0.0002, state.alarmVolume); // exponential ramps can't hit 0
     try {
       const t0 = audioCtx.currentTime;
       for (let i = 0; i < count; i += 1) {
         const at = t0 + i * 0.18;
         const osc = audioCtx.createOscillator();
         const gain = audioCtx.createGain();
-        osc.type = "square";
+        osc.type = type;
         osc.frequency.value = freq;
         gain.gain.setValueAtTime(0.0001, at);
-        gain.gain.exponentialRampToValueAtTime(0.28, at + 0.02);
+        gain.gain.exponentialRampToValueAtTime(peak, at + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.15);
         osc.connect(gain);
         gain.connect(audioCtx.destination);
@@ -1028,6 +1116,15 @@
     } catch {
       /* audio can fail on some webviews — never let it break the tick */
     }
+  }
+
+  // Named tone presets so watchers can pick a sound they'll actually notice.
+  const ALARM_TONES = ["beep", "chime", "siren"];
+  function playAlarmSound(kind) {
+    const drop = kind === "drop";
+    if (state.alarmTone === "chime") return beep(drop ? 3 : 2, drop ? 1320 : 988, "sine");
+    if (state.alarmTone === "siren") return beep(drop ? 4 : 2, drop ? 860 : 640, "sawtooth");
+    return beep(drop ? 3 : 2, drop ? 990 : 740, "square"); // beep (default)
   }
 
   function flashPanel(kind) {
@@ -1051,7 +1148,7 @@
   }
 
   function fireAlarm(kind, message) {
-    if (state.alarmSound) beep(kind === "drop" ? 3 : 2, kind === "drop" ? 990 : 740);
+    if (state.alarmSound) playAlarmSound(kind);
     if (state.alarmVibrate) {
       try {
         navigator.vibrate?.(kind === "drop" ? [130, 60, 130, 60, 220] : [200, 100, 200]);
@@ -1138,6 +1235,17 @@
       if (!state.firedShift.has(liveKey)) {
         state.firedShift.add(liveKey);
         fireAlarm("shift", "You're on watch now — keep the chain alive.");
+      }
+      // Handoff: your shift is ending and the next slot isn't covered by someone online.
+      const handoff = handoffStatus();
+      if (handoff && (handoff.state === "gap" || handoff.state === "risk")) {
+        const handoffKey = `${active.start}:handoff`;
+        if (!state.firedShift.has(handoffKey)) {
+          state.firedShift.add(handoffKey);
+          fireAlarm("shift", handoff.state === "gap"
+            ? "No watcher scheduled after you — get the next slot covered!"
+            : `Next watcher (${handoff.name}) isn't online — ping them before you hand off.`);
+        }
       }
     }
   }
@@ -1227,10 +1335,17 @@
       .tocw-progress { height: 8px; background: #0a1018; border-radius: 999px; overflow: hidden; border: 1px solid #28394d; margin-top: 6px; }
       .tocw-progress span { display: block; height: 100%; background: #35b76f; }
       /* Drop-timer urgency */
-      .tocw-big.u-ok { color: #6ff0a8; }
-      .tocw-big.u-warn { color: #ffcf6b; }
-      .tocw-big.u-bad { color: #ff6d76; animation: tocw-pulse .9s ease-in-out infinite; }
+      .tocw-big.u-ok, .tocw-focus-timer.u-ok { color: #6ff0a8; }
+      .tocw-big.u-warn, .tocw-focus-timer.u-warn { color: #ffcf6b; }
+      .tocw-big.u-bad, .tocw-focus-timer.u-bad { color: #ff6d76; animation: tocw-pulse .9s ease-in-out infinite; }
       @keyframes tocw-pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+      /* Focus (on-watch) mode + HIT button */
+      .tocw-focus { text-align: center; padding: 6px 0 2px; }
+      .tocw-focus-timer { font-size: 58px; font-weight: 900; line-height: 1; letter-spacing: -1px; }
+      .tocw-focus-sub { font-size: 15px; margin-top: 4px; }
+      .tocw-hit { display: block; text-align: center; text-decoration: none; padding: 12px; border-radius: 9px; font-weight: 900; font-size: 15px; background: #243447; color: #eaf3ff; border: 1px solid #3a5573; }
+      .tocw-hit.urgent { background: #ff3b45; border-color: #ff6870; color: #fff; animation: tocw-pulse .8s ease-in-out infinite; }
+      #tocw-focus.on { background: #234; border-color: #46617f; }
       /* Alarm flash on the whole panel */
       @keyframes tocw-flashbad { 30% { box-shadow: 0 0 0 4px rgba(255,60,72,.9), 0 0 34px rgba(255,60,72,.75); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
       @keyframes tocw-flashwarn { 30% { box-shadow: 0 0 0 4px rgba(255,190,80,.85), 0 0 30px rgba(255,190,80,.6); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
@@ -1285,7 +1400,7 @@
         padding: 16px;
       }
       #tocw-modal label { display: grid; gap: 5px; margin-bottom: 10px; color: #cfe0f7; font-size: 12px; font-weight: 700; }
-      #tocw-modal input {
+      #tocw-modal input, #tocw-modal select {
         width: 100%;
         padding: 9px 10px;
         border-radius: 7px;
@@ -1293,6 +1408,7 @@
         background: #0b1119;
         color: #f8fbff;
       }
+      #tocw-modal input[type="range"] { padding: 0; }
       #tocw-modal .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
       #tocw-modal .tocw-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 14px; }
       @media (max-width: 760px) {
@@ -1460,6 +1576,7 @@
             <div class="tocw-muted">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
           </div>
           <div style="display:flex;gap:6px;align-items:flex-start;flex-shrink:0;">
+            <button id="tocw-focus" class="small ${state.focus ? "on" : ""}" title="${state.focus ? "Exit focus (full panel)" : "Focus mode — giant timer only"}" aria-label="Toggle focus mode">⛶</button>
             <button id="tocw-alarm" class="small ${state.alarm ? "on" : ""}" title="${state.alarm ? "Watcher alarms ON — click to mute" : "Turn on watcher alarms (drop timer + your shift)"}" aria-label="Toggle alarms">${state.alarm ? "🔔" : "🔕"}</button>
             <button id="tocw-collapse" class="small" title="${state.collapsed ? "Expand the panel" : "Minimize to the header"}">${state.collapsed ? "Open" : "Min"}</button>
             <button id="tocw-hide" class="small" title="Hide — reopen with the TO button" aria-label="Hide panel">✕</button>
@@ -1469,6 +1586,7 @@
       <div class="tocw-body">
         ${state.error ? `<div class="tocw-alert bad">${escapeHtml(state.error)}</div>` : ""}
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
+        ${state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : `
         ${versionAlert}
         ${mode === "token"
           ? `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""}. Anyone can view; signing up verifies you with your Torn key.</div>`
@@ -1488,6 +1606,7 @@
           <button id="tocw-settings">Settings</button>
         </div>
         <div class="tocw-muted" style="text-align:center;">No auto attacks</div>
+        `}
       </div>
       <div id="tocw-resize" title="Drag to resize"></div>
     `;
@@ -1498,6 +1617,11 @@
       if (newBody) newBody.scrollTop = savedScroll;
     }
 
+    document.getElementById("tocw-focus")?.addEventListener("click", () => {
+      state.focus = !state.focus;
+      gmSet(STORE.focus, state.focus);
+      render();
+    });
     document.getElementById("tocw-alarm")?.addEventListener("click", () => {
       state.alarm = !state.alarm;
       gmSet(STORE.alarm, state.alarm);
@@ -1625,10 +1749,73 @@
     return "";
   }
 
+  // A prominent "go hit" button. Turns big + red when the drop is close. Links to the
+  // configured target list (a ranked-war page or shared list) in the same tab.
+  function renderHitButton(remaining) {
+    const urgent = Boolean(state.chain?.active) && remaining > 0 && remaining <= 60;
+    const url = state.hitUrl || DEFAULT_HIT_URL;
+    return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(url)}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
+  }
+
+  // Compact "on watch" view: a giant drop timer, hits, your pace, the HIT button, and
+  // the handoff/your-shift banners — nothing else. For glance-and-hit during a shift.
+  function renderFocus(chain, remaining, live, event, scheduledSeconds) {
+    const cur = chain?.current || 0;
+    const you = state.attacks?.pace?.you;
+    const timerText = live ? duration(remaining) : (event ? `Starts in ${duration(scheduledSeconds)}` : "--");
+    const label = live ? "Drop timer" : (event ? "Next chain" : "No chain scheduled");
+    return `
+      ${renderWatchBanner()}
+      ${renderHandoff()}
+      <div class="tocw-focus">
+        <div class="tocw-muted">${label}</div>
+        <div class="tocw-focus-timer ${live ? timerUrgencyClass(remaining) : ""}" id="tocw-timer">${timerText}</div>
+        ${live ? `<div class="tocw-focus-sub">Hits <strong>${cur}</strong>${you != null ? ` · You <strong>${you.toFixed(1)}</strong>/min` : ""}</div>` : ""}
+      </div>
+      ${renderHitButton(remaining)}
+      <div class="tocw-actions" style="grid-template-columns:1fr 1fr;">
+        <button id="tocw-refresh" class="primary" ${state.loading ? "disabled" : ""}>${state.loading ? "…" : "Refresh"}</button>
+        <button id="tocw-settings">Settings</button>
+      </div>
+    `;
+  }
+
+  // Optional personal chain goal: progress + an ETA off the faction's recent pace. This
+  // is a FACTION-total ETA (the whole chain reaching N), never a personal-bonus claim.
+  function renderGoal(chain, attacks) {
+    const goal = state.chainGoal;
+    if (!goal || !chain?.active) return "";
+    const cur = chain.current || 0;
+    const toGo = goal - cur;
+    const eta = etaText(toGo, attacks?.pace?.faction);
+    const pct = Math.max(0, Math.min(100, Math.round((cur / goal) * 100)));
+    return `
+      <div class="tocw-card">
+        <div class="tocw-card-title">Goal ${goal.toLocaleString()}</div>
+        <div>${cur.toLocaleString()} / ${goal.toLocaleString()}${toGo > 0 ? ` · ${toGo.toLocaleString()} to go${eta ? ` (${eta})` : ""}` : " ✅ reached"}</div>
+        <div class="tocw-progress"><span style="width:${pct}%"></span></div>
+      </div>
+    `;
+  }
+
+  // Handoff readiness alert for the shift that's ending soon (see handoffStatus).
+  function renderHandoff() {
+    const h = handoffStatus();
+    if (!h) return "";
+    if (h.state === "gap") {
+      return `<div class="tocw-alert bad">🚨 Handoff gap — no watcher after this shift (ends in ${duration(h.endsIn)}). Get it covered.</div>`;
+    }
+    if (h.state === "risk") {
+      return `<div class="tocw-alert bad">🚨 Next watcher ${escapeHtml(h.name || "")} is ${escapeHtml(h.online || "not online")} — ping them (handoff in ${duration(h.endsIn)}).</div>`;
+    }
+    return `<div class="tocw-watch-banner on">✅ Handoff ready — ${escapeHtml(h.name || "")} is online (in ${duration(h.endsIn)})</div>`;
+  }
+
   function renderLive(chain, remaining, bonus, bonusPct, current, next) {
     const attacks = state.attacks || { leaderboard: [], last: null, error: null };
     const currentOffline = current?.watcher_id && current.watcher_online_status !== "Online";
-    const nextIdle = next?.watcher_id && next.watcher_online_status !== "Online";
+    const facPace = attacks?.pace?.faction;
+    const bonusEta = bonus ? etaText(bonus.toGo, facPace) : "";
     return `
       <div class="tocw-card">
         <div class="tocw-grid">
@@ -1641,9 +1828,12 @@
             <div class="tocw-big">${chain.current}</div>
           </div>
         </div>
-        ${bonus ? `<div class="tocw-muted" style="margin-top:8px;">Next bonus: ${bonus.toGo} to ${bonus.target}</div><div class="tocw-progress"><span style="width:${bonusPct}%"></span></div>` : ""}
+        ${bonus ? `<div class="tocw-muted" style="margin-top:8px;">Next bonus: ${bonus.toGo} to ${bonus.target}${bonusEta ? ` (${bonusEta})` : ""}</div><div class="tocw-progress"><span style="width:${bonusPct}%"></span></div>` : ""}
       </div>
+      ${renderHitButton(remaining)}
+      ${renderGoal(chain, attacks)}
       ${renderHitPace(attacks)}
+      ${renderHandoff()}
       <div class="tocw-card">
         <div class="tocw-card-title">Current watcher</div>
         ${renderWatcherLine(current, "No watcher assigned")}
@@ -1655,7 +1845,6 @@
         <div class="tocw-muted">${next ? `Starts ${tctTime(next.shift_start)}` : ""}</div>
       </div>
       ${currentOffline ? `<div class="tocw-alert bad">Current watcher is not online.</div>` : ""}
-      ${nextIdle ? `<div class="tocw-alert">Next watcher is ${escapeHtml(next.watcher_online_status || "not online")}.</div>` : ""}
       <div class="tocw-card">
         <div class="tocw-card-title">Last attack</div>
         ${attacks.last ? `<div>${escapeHtml(attacks.last.attackerName)} vs ${escapeHtml(attacks.last.defenderName)} - ${duration(Math.floor(Date.now() / 1000 - attacks.last.timestamp))} ago</div>` : `<div class="tocw-muted">${escapeHtml(attacks.error || "Attack log unavailable.")}</div>`}
@@ -2040,11 +2229,29 @@
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-vibrate" ${state.alarmVibrate ? "checked" : ""} /> Vibrate (mobile / PDA)</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-flash" ${state.alarmFlash ? "checked" : ""} /> Visual flash</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-notify" ${state.alarmNotify ? "checked" : ""} /> Desktop notification</label>
+        <div class="grid" style="margin-top:8px;">
+          <label>Sound
+            <select id="tocw-set-alarm-tone">
+              ${ALARM_TONES.map((t) => `<option value="${t}" ${state.alarmTone === t ? "selected" : ""}>${t[0].toUpperCase()}${t.slice(1)}</option>`).join("")}
+            </select>
+          </label>
+          <label>Volume
+            <input id="tocw-set-alarm-volume" type="range" min="0" max="100" value="${Math.round(state.alarmVolume * 100)}" />
+          </label>
+        </div>
         <label style="margin-top:8px;">Drop alerts at (seconds to drop)
           <input id="tocw-set-alarm-thresholds" value="${escapeHtml(state.dropThresholds.join(", "))}" placeholder="60, 30, 10" />
         </label>
         <label class="tocw-check" style="margin-top:8px;"><input type="checkbox" id="tocw-set-wakelock" ${state.wakeLockEnabled ? "checked" : ""} /> Keep screen awake while on watch</label>
         <button id="tocw-alarm-test" class="small" style="margin-top:6px;">Test alarm</button>
+      </div>
+      <div class="grid" style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+        <label>Chain goal (hits, 0 = off)
+          <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoal || ""}" placeholder="e.g. 5000" />
+        </label>
+        <label>HIT button target URL
+          <input id="tocw-set-hit-url" value="${escapeHtml(state.hitUrl)}" placeholder="${DEFAULT_HIT_URL}" />
+        </label>
       </div>
       <details style="margin-top:10px;">
         <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Advanced backend settings</summary>
@@ -2082,6 +2289,11 @@
       state.alarmNotify = checked("tocw-set-alarm-notify");
       state.wakeLockEnabled = checked("tocw-set-wakelock");
       state.dropThresholds = parseThresholds(valueOf("tocw-set-alarm-thresholds"), DEFAULT_DROP_THRESHOLDS);
+      const tone = valueOf("tocw-set-alarm-tone");
+      state.alarmTone = ALARM_TONES.includes(tone) ? tone : "beep";
+      state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
+      state.chainGoal = Math.max(0, Math.round(Number(valueOf("tocw-set-goal")) || 0));
+      state.hitUrl = sanitizeHitUrl(valueOf("tocw-set-hit-url"));
       gmSet(STORE.alarm, state.alarm);
       gmSet(STORE.alarmSound, state.alarmSound);
       gmSet(STORE.alarmVibrate, state.alarmVibrate);
@@ -2089,6 +2301,10 @@
       gmSet(STORE.alarmNotify, state.alarmNotify);
       gmSet(STORE.wakeLock, state.wakeLockEnabled);
       gmSet(STORE.alarmThresholds, state.dropThresholds.join(","));
+      gmSet(STORE.alarmTone, state.alarmTone);
+      gmSet(STORE.alarmVolume, state.alarmVolume);
+      gmSet(STORE.chainGoal, state.chainGoal);
+      gmSet(STORE.hitUrl, state.hitUrl);
       if (state.alarm && wasOff) primeAudio(); // Save click is a user gesture → unlock audio
       updateWakeLock();
     };
@@ -2100,11 +2316,19 @@
     document.getElementById("tocw-modal-close")?.addEventListener("click", close);
     document.getElementById("tocw-alarm-test")?.addEventListener("click", () => {
       primeAudio();
-      if (checked("tocw-set-alarm-sound")) beep(3, 990);
+      // Preview the CURRENT form's tone/volume without needing to save first.
+      const prevTone = state.alarmTone;
+      const prevVol = state.alarmVolume;
+      const tone = valueOf("tocw-set-alarm-tone");
+      state.alarmTone = ALARM_TONES.includes(tone) ? tone : "beep";
+      state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
+      if (checked("tocw-set-alarm-sound")) playAlarmSound("drop");
       if (checked("tocw-set-alarm-vibrate")) {
         try { navigator.vibrate?.([130, 60, 130, 60, 220]); } catch { /* unsupported */ }
       }
       if (checked("tocw-set-alarm-flash")) flashPanel("drop");
+      state.alarmTone = prevTone;
+      state.alarmVolume = prevVol;
     });
     document.getElementById("tocw-modal-save")?.addEventListener("click", () => {
       const ok = saveSettings(collect());
@@ -2302,15 +2526,18 @@
 
       const el = document.getElementById("tocw-timer");
       if (el) {
+        // Preserve the base class (full-panel .tocw-big vs focus-mode .tocw-focus-timer),
+        // only swapping the urgency modifier.
+        const base = el.classList.contains("tocw-focus-timer") ? "tocw-focus-timer" : "tocw-big";
         if (state.chain?.active) {
           const remaining = chainRemaining();
           el.textContent = duration(remaining);
-          el.className = `tocw-big ${timerUrgencyClass(remaining)}`;
+          el.className = `${base} ${timerUrgencyClass(remaining)}`;
         } else {
           const event = state.watch?.event || state.signup?.event || null;
           const seconds = event ? countdownTo(event.starts_at) : null;
           el.textContent = event ? `Starts in ${duration(seconds)}` : "--";
-          el.className = "tocw-big";
+          el.className = base;
         }
       }
 
