@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.9.0
+// @version      0.10.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -14,6 +14,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_notification
 // @connect      ijolgywtybadfuvyopeg.supabase.co
 // @connect      api.torn.com
 // @run-at       document-end
@@ -25,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.9.0";
+  const VERSION = "0.10.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -47,10 +48,11 @@
   const ATTACKS_MIN_INTERVAL = 6000;
   const SCHEDULE_MIN_INTERVAL = 25000;
 
-  // Watcher alarms: seconds-to-drop at which to sound off (once each, per chain run),
-  // and how early to warn before your own shift starts.
-  const DROP_THRESHOLDS = [60, 30, 10];
+  // Watcher alarms: default seconds-to-drop at which to sound off (once each, per chain
+  // run); user-overridable in Settings. Plus how early to warn before your own shift.
+  const DEFAULT_DROP_THRESHOLDS = [60, 30, 10];
   const SHIFT_WARN_SECS = 300; // 5-minute heads-up before your shift
+  const PACE_MIN_WINDOW_SEC = 10; // don't compute a hit/min pace off too short a sample
 
   const STORE = {
     tornKey: "tocw_torn_key",
@@ -69,6 +71,9 @@
     alarmSound: "tocw_alarm_sound",
     alarmVibrate: "tocw_alarm_vibrate",
     alarmFlash: "tocw_alarm_flash",
+    alarmNotify: "tocw_alarm_notify",
+    alarmThresholds: "tocw_alarm_thresholds",
+    wakeLock: "tocw_wakelock",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -105,12 +110,29 @@
     alarmSound: readBool(STORE.alarmSound, true),
     alarmVibrate: readBool(STORE.alarmVibrate, true),
     alarmFlash: readBool(STORE.alarmFlash, true),
+    alarmNotify: readBool(STORE.alarmNotify, false),
+    dropThresholds: parseThresholds(readString(STORE.alarmThresholds, ""), DEFAULT_DROP_THRESHOLDS),
+    // Keep the screen awake while on watch (mobile/PDA) so the drop alarm can fire.
+    wakeLockEnabled: readBool(STORE.wakeLock, true),
     // Fire-once bookkeeping so an alarm sounds at each threshold only once per chain
     // run / shift (cleared when the drop timer resets on a fresh hit, or the chain ends).
     firedDrop: new Set(),
     firedShift: new Set(),
     lastRemaining: null,
+    // Consecutive direct-Torn chain failures — used to hint at missing faction API access.
+    tornFailCount: 0,
   };
+
+  // Parse a "60,30,10" thresholds string into a sorted-desc list of positive ints,
+  // falling back to the default when nothing valid is given.
+  function parseThresholds(raw, fallback) {
+    const parts = String(raw || "")
+      .split(/[\s,]+/)
+      .map((s) => parseInt(s, 10))
+      .filter((n) => Number.isInteger(n) && n > 0 && n <= 3600);
+    const uniq = [...new Set(parts)].sort((a, b) => b - a);
+    return uniq.length ? uniq : fallback.slice();
+  }
 
   function gmGet(key, fallback) {
     try {
@@ -676,10 +698,17 @@
   // Torn /faction?selections=attacks -> the same aggregated leaderboard shape the
   // backend serves, built client-side from the last ~100 attacks (needs faction API
   // access; a 403/access error surfaces as an error and we fall back to the backend).
-  function parseAttacks(raw) {
+  // Also computes a recent hit PACE (per-minute) over the sampled window: your own,
+  // the whole faction, and the per-hitter average — `viewerId` singles out your rows.
+  function parseAttacks(raw, viewerId) {
     const rows = asRows(raw?.attacks ?? raw);
     const byId = new Map();
     let last = null;
+    let total = 0;
+    let yourHits = 0;
+    let minTs = Infinity;
+    let maxTs = 0;
+    const vid = viewerId != null ? Number(viewerId) : null;
     for (const row of rows) {
       const attacker = row?.attacker && typeof row.attacker === "object" ? row.attacker : {};
       const defender = row?.defender && typeof row.defender === "object" ? row.defender : {};
@@ -690,10 +719,16 @@
       const timestamp =
         num(row?.timestamp_ended ?? row?.ended ?? row?.timestamp_started ?? row?.started ?? row?.timestamp) ?? 0;
       const respect = num(row?.respect_gain ?? row?.respect ?? row?.respectGain ?? row?.respect_total) ?? 0;
-      const prior = byId.get(attackerId) || { name: attackerName, hits: 0, respect: 0 };
+      const prior = byId.get(attackerId) || { playerId: attackerId, name: attackerName, hits: 0, respect: 0 };
       prior.hits += 1;
       prior.respect += respect;
       byId.set(attackerId, prior);
+      total += 1;
+      if (vid != null && attackerId === vid) yourHits += 1;
+      if (timestamp > 0) {
+        if (timestamp < minTs) minTs = timestamp;
+        if (timestamp > maxTs) maxTs = timestamp;
+      }
       if (timestamp > 0 && (!last || timestamp > last.timestamp)) {
         last = { attackerName, defenderName, timestamp };
       }
@@ -702,7 +737,23 @@
       .map((row) => ({ ...row, avg: row.hits > 0 ? row.respect / row.hits : 0 }))
       .sort((a, b) => b.hits - a.hits || b.respect - a.respect)
       .slice(0, 8);
-    return { leaderboard, last, error: null };
+
+    // Recent per-minute pace over the sampled window. All three figures share ONE
+    // window so they're consistent: the faction rate, YOUR rate, and the rate an
+    // average active hitter is managing (faction ÷ number of people who hit).
+    const windowSec = maxTs > 0 && minTs < Infinity ? maxTs - minTs : 0;
+    const hitters = byId.size;
+    let pace = null;
+    if (windowSec >= PACE_MIN_WINDOW_SEC && total >= 3) {
+      const perMin = (n) => (n / windowSec) * 60;
+      pace = {
+        faction: perMin(total),
+        you: vid != null ? perMin(yourHits) : null,
+        avg: hitters > 0 ? perMin(total) / hitters : 0,
+        hitters,
+      };
+    }
+    return { leaderboard, last, error: null, mine: { hits: yourHits }, pace };
   }
 
   // Freshness bookkeeping so the two heavier reads (attacks, backend schedule) run on
@@ -765,7 +816,7 @@
         if (wantAttacks) {
           tasks.push(
             tornLegacyFaction("attacks")
-              .then((raw) => { tornAttacks = parseAttacks(raw); lastAttacksAt = Date.now(); })
+              .then((raw) => { tornAttacks = parseAttacks(raw, viewerId()); lastAttacksAt = Date.now(); })
               .catch(() => { /* no faction API access etc. — fall back to the backend block */ }),
           );
         }
@@ -778,9 +829,13 @@
       if (tornChain) {
         state.chain = tornChain;
         state.liveSource = "torn";
-      } else if (serverRes) {
-        const cached = serverLiveChain(serverRes);
-        if (cached) { state.chain = cached; state.liveSource = "cache"; }
+        state.tornFailCount = 0;
+      } else {
+        if (hasKey) state.tornFailCount += 1; // ran the direct fetch, got nothing usable
+        if (serverRes) {
+          const cached = serverLiveChain(serverRes);
+          if (cached) { state.chain = cached; state.liveSource = "cache"; }
+        }
       }
 
       // Resolve the leaderboard the same way (direct Torn -> backend -> keep last).
@@ -985,6 +1040,16 @@
     setTimeout(() => box.classList.remove(cls), 1500);
   }
 
+  function notify(message) {
+    try {
+      if (typeof GM_notification === "function") {
+        GM_notification({ title: "Chain Watch", text: message, timeout: 8000, silent: !state.alarmSound });
+      }
+    } catch {
+      /* notifications unavailable */
+    }
+  }
+
   function fireAlarm(kind, message) {
     if (state.alarmSound) beep(kind === "drop" ? 3 : 2, kind === "drop" ? 990 : 740);
     if (state.alarmVibrate) {
@@ -995,7 +1060,38 @@
       }
     }
     if (state.alarmFlash) flashPanel(kind);
+    if (state.alarmNotify) notify(message);
     state.notice = message;
+  }
+
+  // --- Screen wake lock: keep a phone/PDA awake while on watch so the alarm fires ---
+  let wakeLock = null;
+  async function acquireWakeLock() {
+    try {
+      if (wakeLock || !("wakeLock" in navigator)) return;
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener?.("release", () => { wakeLock = null; });
+    } catch {
+      wakeLock = null; // denied / unsupported — silently do without
+    }
+  }
+  function releaseWakeLock() {
+    try {
+      wakeLock?.release?.();
+    } catch {
+      /* ignore */
+    }
+    wakeLock = null;
+  }
+  // Hold the lock while you're the active watcher, or a chain is live and alarms are
+  // armed (you're actively hitting). The OS drops the lock when the tab hides, so this
+  // (called each tick + on visibility change) re-acquires it when you come back.
+  function updateWakeLock() {
+    const want = state.wakeLockEnabled
+      && document.visibilityState === "visible"
+      && (Boolean(viewerShiftStatus().active) || (Boolean(state.chain?.active) && state.alarm));
+    if (want && !wakeLock) void acquireWakeLock();
+    else if (!want && wakeLock) releaseWakeLock();
   }
 
   // Runs every second (even while collapsed/hidden — the whole point is to alert you
@@ -1009,7 +1105,7 @@
       // A fresh hit reset the timer upward → re-arm the thresholds for this run.
       if (state.lastRemaining != null && remaining > state.lastRemaining + 3) state.firedDrop.clear();
       state.lastRemaining = remaining;
-      for (const t of DROP_THRESHOLDS) {
+      for (const t of state.dropThresholds) {
         if (remaining > 0 && remaining <= t && !state.firedDrop.has(t)) {
           state.firedDrop.add(t);
           fireAlarm("drop", `Chain drops in ${remaining}s — HIT NOW!`);
@@ -1381,7 +1477,9 @@
             : !cfg.sessionToken
               ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
               : ""}
+        ${renderAccessHint()}
         ${renderWatchBanner()}
+        ${renderCoverage()}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
         <div class="tocw-actions">
@@ -1476,6 +1574,57 @@
     return "";
   }
 
+  // Upcoming shifts (current + future) with NO main watcher assigned — the gaps that
+  // silently drop a chain. Works across the session and token payload shapes.
+  function coverageGaps() {
+    const now = Date.now();
+    const out = [];
+    if (Array.isArray(state.watch?.shifts)) {
+      for (const s of state.watch.shifts) {
+        if (new Date(s.shift_end).getTime() > now && s.watcher_id == null) out.push(s.shift_start);
+      }
+    } else if (Array.isArray(state.signup?.shifts)) {
+      for (const s of state.signup.shifts) {
+        if (new Date(s.shift_end).getTime() > now && !s.main?.filled) out.push(s.shift_start);
+      }
+    }
+    return out;
+  }
+
+  function renderCoverage() {
+    const gaps = coverageGaps();
+    if (!gaps.length) return "";
+    const shown = gaps.slice(0, 4).map((iso) => tctTime(iso).replace(" TCT", "")).join(", ");
+    const more = gaps.length > 4 ? ` +${gaps.length - 4}` : "";
+    return `<div class="tocw-alert bad">⚠️ ${gaps.length} unmanned shift${gaps.length > 1 ? "s" : ""} ahead — ${shown}${more} TCT. Fill the gaps or the chain can drop.</div>`;
+  }
+
+  // Recent hit pace (your rate, the faction's total rate, and the per-hitter average),
+  // computed from the direct-Torn attack sample. Reworded per feedback: it never implies
+  // an individual "bonus ETA" — the bonus is a faction milestone, shown separately.
+  function renderHitPace(attacks) {
+    const p = attacks?.pace;
+    if (!p) return "";
+    const fmt = (n) => (n == null ? "—" : n.toFixed(1));
+    const you = p.you != null ? `You <strong>${fmt(p.you)}</strong>/min` : "";
+    return `
+      <div class="tocw-card">
+        <div class="tocw-card-title">Hit pace <span class="tocw-muted">(recent)</span></div>
+        ${you ? `<div style="font-size:15px;">${you}</div>` : ""}
+        <div class="tocw-muted">Faction ${fmt(p.faction)}/min total · avg ${fmt(p.avg)}/min across ${p.hitters} hitter${p.hitters === 1 ? "" : "s"}</div>
+      </div>
+    `;
+  }
+
+  // When we hold a key but the direct chain read keeps failing (stuck on CACHED), the
+  // most likely cause is the key lacking faction API access — say so, don't stay silent.
+  function renderAccessHint() {
+    if (settings().tornKey && state.tornFailCount >= 3 && state.liveSource !== "torn") {
+      return `<div class="tocw-alert">Your Torn key isn't returning live chain data — it likely needs <strong>faction API access</strong>. Ask leadership to enable it for you to get zero-lag hits.</div>`;
+    }
+    return "";
+  }
+
   function renderLive(chain, remaining, bonus, bonusPct, current, next) {
     const attacks = state.attacks || { leaderboard: [], last: null, error: null };
     const currentOffline = current?.watcher_id && current.watcher_online_status !== "Online";
@@ -1494,6 +1643,7 @@
         </div>
         ${bonus ? `<div class="tocw-muted" style="margin-top:8px;">Next bonus: ${bonus.toGo} to ${bonus.target}</div><div class="tocw-progress"><span style="width:${bonusPct}%"></span></div>` : ""}
       </div>
+      ${renderHitPace(attacks)}
       <div class="tocw-card">
         <div class="tocw-card-title">Current watcher</div>
         ${renderWatcherLine(current, "No watcher assigned")}
@@ -1883,12 +2033,17 @@
           <input type="checkbox" id="tocw-set-alarm" ${state.alarm ? "checked" : ""} /> Watcher alarms
         </label>
         <div class="tocw-muted" style="margin:2px 0 8px;">
-          Alerts near the chain drop (${DROP_THRESHOLDS.join(" / ")}s) and before + at your own shift.
-          Also toggle with the 🔔 button in the header. Enable it with a click so audio can play.
+          Alerts near the chain drop and before + at your own shift. Also toggle with the
+          🔔 button in the header. Enable it with a click so audio can play.
         </div>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-sound" ${state.alarmSound ? "checked" : ""} /> Sound (beep)</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-vibrate" ${state.alarmVibrate ? "checked" : ""} /> Vibrate (mobile / PDA)</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-flash" ${state.alarmFlash ? "checked" : ""} /> Visual flash</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-notify" ${state.alarmNotify ? "checked" : ""} /> Desktop notification</label>
+        <label style="margin-top:8px;">Drop alerts at (seconds to drop)
+          <input id="tocw-set-alarm-thresholds" value="${escapeHtml(state.dropThresholds.join(", "))}" placeholder="60, 30, 10" />
+        </label>
+        <label class="tocw-check" style="margin-top:8px;"><input type="checkbox" id="tocw-set-wakelock" ${state.wakeLockEnabled ? "checked" : ""} /> Keep screen awake while on watch</label>
         <button id="tocw-alarm-test" class="small" style="margin-top:6px;">Test alarm</button>
       </div>
       <details style="margin-top:10px;">
@@ -1924,11 +2079,18 @@
       state.alarmSound = checked("tocw-set-alarm-sound");
       state.alarmVibrate = checked("tocw-set-alarm-vibrate");
       state.alarmFlash = checked("tocw-set-alarm-flash");
+      state.alarmNotify = checked("tocw-set-alarm-notify");
+      state.wakeLockEnabled = checked("tocw-set-wakelock");
+      state.dropThresholds = parseThresholds(valueOf("tocw-set-alarm-thresholds"), DEFAULT_DROP_THRESHOLDS);
       gmSet(STORE.alarm, state.alarm);
       gmSet(STORE.alarmSound, state.alarmSound);
       gmSet(STORE.alarmVibrate, state.alarmVibrate);
       gmSet(STORE.alarmFlash, state.alarmFlash);
+      gmSet(STORE.alarmNotify, state.alarmNotify);
+      gmSet(STORE.wakeLock, state.wakeLockEnabled);
+      gmSet(STORE.alarmThresholds, state.dropThresholds.join(","));
       if (state.alarm && wasOff) primeAudio(); // Save click is a user gesture → unlock audio
+      updateWakeLock();
     };
     const close = () => {
       state.settingsOpen = false;
@@ -2114,6 +2276,12 @@
     } catch (error) {
       console.error("[Torn Overseer Chain Watch] render failed", error);
     }
+    // A screen wake lock is dropped whenever the tab hides; re-evaluate (re-acquire or
+    // release) each time visibility changes, and resume the poll loop on return.
+    document.addEventListener("visibilitychange", () => {
+      updateWakeLock();
+      if (document.visibilityState === "visible") scheduleNextRefresh();
+    });
     // Kick off the live-data loop (refreshAll re-arms itself via scheduleNextRefresh,
     // polling fast while a chain is live and easing off otherwise).
     setTimeout(() => void refreshAll(false), 800);
@@ -2129,6 +2297,7 @@
       // Alarms run regardless of visibility — they exist to alert you when the panel
       // is collapsed or hidden and you're not watching it.
       evaluateAlarms();
+      updateWakeLock();
       if (state.hidden || state.collapsed) return;
 
       const el = document.getElementById("tocw-timer");
