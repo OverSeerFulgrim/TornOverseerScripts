@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.17.1
+// @version      0.17.2
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.17.1";
+  const VERSION = "0.17.2";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -2541,12 +2541,10 @@
       </div>
 
       <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
-        <label class="tocw-check" style="font-size:14px;">
-          <input type="checkbox" id="tocw-set-alarm" ${state.alarm ? "checked" : ""} /> Watcher alarms
-        </label>
+        <div style="font-weight:700;font-size:14px;">Watcher alarms <span class="tocw-muted" style="font-weight:400;">— ${state.alarm ? "ON" : "OFF"}</span></div>
         <div class="tocw-muted" style="margin:2px 0 8px;">
-          Alerts near the chain drop and before + at your own shift. Also toggle with the
-          🔔 button in the header. Enable it with a click so audio can play.
+          Turn alarms on/off with the ${state.alarm ? "🔔" : "🔕"} button in the header (that's the master switch).
+          These control what fires when they're on — alerts near the chain drop and before + at your own shift.
         </div>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-sound" ${state.alarmSound ? "checked" : ""} /> Sound (beep)</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-vibrate" ${state.alarmVibrate ? "checked" : ""} /> Vibrate (mobile / PDA)</label>
@@ -2637,8 +2635,8 @@
     });
     const checked = (id) => Boolean(document.getElementById(id)?.checked);
     const applyAlarmSettings = () => {
-      const wasOff = !state.alarm;
-      state.alarm = checked("tocw-set-alarm");
+      // NB: state.alarm (the master on/off) is owned by the header 🔔 toggle, NOT this
+      // form — so saving settings never flips it, and the two can't disagree.
       state.alarmSound = checked("tocw-set-alarm-sound");
       state.alarmVibrate = checked("tocw-set-alarm-vibrate");
       state.alarmFlash = checked("tocw-set-alarm-flash");
@@ -2661,7 +2659,6 @@
       state.alarmVoice = checked("tocw-set-alarm-voice");
       state.autoFocus = checked("tocw-set-autofocus");
       state.celebrate = checked("tocw-set-celebrate");
-      gmSet(STORE.alarm, state.alarm);
       gmSet(STORE.alarmSound, state.alarmSound);
       gmSet(STORE.alarmVibrate, state.alarmVibrate);
       gmSet(STORE.alarmFlash, state.alarmFlash);
@@ -2676,7 +2673,7 @@
       gmSet(STORE.alarmVoice, state.alarmVoice);
       gmSet(STORE.autoFocus, state.autoFocus);
       gmSet(STORE.celebrate, state.celebrate);
-      if (state.alarm && wasOff) primeAudio(); // Save click is a user gesture → unlock audio
+      if (state.alarm) primeAudio(); // Save is a user gesture → (re)unlock audio while armed
       updateWakeLock();
     };
     const close = () => {
