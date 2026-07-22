@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.17.3
+// @version      0.17.4
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.17.3";
+  const VERSION = "0.17.4";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -1031,30 +1031,36 @@
   }
 
   // torn.com's own sidebar shows the chain countdown, updated live by the site — the
-  // exact value the player sees, with zero API-cache lag. Read it (defensively) so our
-  // drop timer matches. Returns seconds, or null when the sidebar/chain bar isn't there.
+  // exact value the player sees, with zero API-cache lag. Find + read it so our drop
+  // timer matches. The chain bar is the ONE small element whose text has the word
+  // "Chain", an "N/M" count, AND an MM:SS timer (Energy/Nerve also have N/M + MM:SS but
+  // no "Chain"; the sidebar root has "Chain" but is far too long). Returns seconds, or
+  // null when there's no such element (wrong page / PDA) → the API value is used instead.
   let sidebarChainNode = null;
+  function chainBarSeconds(text) {
+    const t = (text || "").replace(/\s+/g, " ").trim();
+    if (t.length > 60 || !/chain/i.test(t)) return null;
+    if (!/\b\d{1,3}\s*\/\s*\d{1,3}\b/.test(t)) return null; // the N/M count
+    const m = t.match(/\b(\d{1,2}):(\d{2})\b/);
+    return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+  }
   function readSidebarChainSeconds() {
     try {
-      // Re-use a previously found node if it's still attached, else re-scan.
       if (!sidebarChainNode || !sidebarChainNode.isConnected) {
         sidebarChainNode = null;
         const root = document.getElementById("sidebarroot") || document.getElementById("sidebar") || document.body;
-        for (const node of root.querySelectorAll('[class*="chain" i], [class*="bar"]')) {
-          const text = node.textContent || "";
-          if (/chain/i.test(text) && /\b\d{1,2}:\d{2}\b/.test(text) && text.length < 40) {
-            sidebarChainNode = node;
+        for (const el of root.querySelectorAll("li, p, div, span, a")) {
+          if (chainBarSeconds(el.textContent) != null) {
+            sidebarChainNode = el;
             break;
           }
         }
       }
-      const text = sidebarChainNode?.textContent || "";
-      const m = text.match(/\b(\d{1,2}):(\d{2})\b/);
-      if (m) return Number(m[1]) * 60 + Number(m[2]);
+      return chainBarSeconds(sidebarChainNode?.textContent);
     } catch {
       sidebarChainNode = null;
+      return null;
     }
-    return null;
   }
 
   function chainRemaining() {
