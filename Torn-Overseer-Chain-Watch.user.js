@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.7.0
-// @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard. No Torn API key needed for data — the Overseer backend serves it.
+// @version      0.8.0
+// @description  Scheduled chain countdown, chainwatch shift signup, and a zero-lag live chain timer + hit leaderboard pulled straight from Torn with your key (Overseer backend as fallback). Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
@@ -15,6 +15,7 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @connect      ijolgywtybadfuvyopeg.supabase.co
+// @connect      api.torn.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -24,7 +25,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.7.0";
+  const VERSION = "0.8.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -32,7 +33,19 @@
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
+  const COMMENT = "TornOverseerChainWatch";
   const BONUS_MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000];
+
+  // Live-data polling cadence. While a chain is live the HUD is fetched STRAIGHT from
+  // Torn (member key) so the hit count + drop timer match torn.com with no backend lag;
+  // between chains it eases off, and while hidden it barely ticks.
+  const LIVE_POLL_MS = 3000;
+  const IDLE_POLL_MS = 20000;
+  const HIDDEN_POLL_MS = 60000;
+  // Torn's own rate limit is 100 req/min/key — throttle the heavier reads so the fast
+  // chain poll leaves plenty of headroom (chain ~20/min, attacks ~10/min, schedule ~2/min).
+  const ATTACKS_MIN_INTERVAL = 6000;
+  const SCHEDULE_MIN_INTERVAL = 25000;
 
   const STORE = {
     tornKey: "tocw_torn_key",
@@ -69,6 +82,9 @@
     chain: null,
     attacks: null,
     fetchedAt: null,
+    // Where the live chain HUD/leaderboard currently come from: "torn" (zero-lag,
+    // direct from the member key), "cache" (Overseer fallback), or null (nothing yet).
+    liveSource: null,
     settingsOpen: false,
     scriptTooOld: false,
     collapsed: readBool(STORE.collapsed, false),
@@ -581,59 +597,214 @@
     return { leaderboard, last, error: null };
   }
 
+  // --- Direct-from-Torn live data (member key, zero-lag) -----------------------
+  // These go STRAIGHT to Torn via the userscript manager / PDA (never a page fetch),
+  // so the key stays private but the chain HUD + leaderboard match torn.com with no
+  // backend cache lag. The Overseer backend remains the fallback (see refreshAll).
+
+  async function tornFetch(path) {
+    const cfg = settings();
+    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
+    const url = new URL(`https://api.torn.com/v2${path.startsWith("/") ? path : `/${path}`}`);
+    url.searchParams.set("key", cfg.tornKey);
+    url.searchParams.set("comment", COMMENT);
+    const data = await requestJson(url.toString());
+    if (data && typeof data === "object" && data.error) {
+      const err = data.error;
+      throw new Error(err.error || `Torn API error ${err.code ?? ""}`.trim());
+    }
+    return data;
+  }
+
+  async function tornLegacyFaction(selections) {
+    const cfg = settings();
+    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
+    const url = new URL("https://api.torn.com/faction/");
+    url.searchParams.set("selections", selections);
+    url.searchParams.set("key", cfg.tornKey);
+    url.searchParams.set("comment", COMMENT);
+    const data = await requestJson(url.toString());
+    if (data && typeof data === "object" && data.error) {
+      const err = data.error;
+      throw new Error(err.error || `Torn API error ${err.code ?? ""}`.trim());
+    }
+    return data;
+  }
+
+  function asRows(value) {
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === "object") return Object.values(value);
+    return [];
+  }
+
+  // Torn /v2/faction/chain -> the panel's chain shape, stamped with the moment WE got
+  // the response so the local drop-timer countdown stays honest between polls.
+  function parseChain(raw) {
+    const c = raw?.chain || raw || {};
+    const current = num(c.current) ?? 0;
+    const timeout = num(c.timeout) ?? 0;
+    return {
+      active: current > 0 && timeout > 0,
+      current,
+      max: num(c.maximum ?? c.max) ?? 0,
+      timeout,
+      modifier: num(c.modifier) ?? 0,
+      cooldown: num(c.cooldown) ?? 0,
+      fetchedAt: Date.now(),
+    };
+  }
+
+  // Torn /faction?selections=attacks -> the same aggregated leaderboard shape the
+  // backend serves, built client-side from the last ~100 attacks (needs faction API
+  // access; a 403/access error surfaces as an error and we fall back to the backend).
+  function parseAttacks(raw) {
+    const rows = asRows(raw?.attacks ?? raw);
+    const byId = new Map();
+    let last = null;
+    for (const row of rows) {
+      const attacker = row?.attacker && typeof row.attacker === "object" ? row.attacker : {};
+      const defender = row?.defender && typeof row.defender === "object" ? row.defender : {};
+      const attackerId = num(row?.attacker_id ?? row?.attackerID ?? attacker.id);
+      if (!attackerId || attackerId <= 0) continue; // stealthed / unknown attacker
+      const attackerName = row?.attacker_name || attacker.name || `ID ${attackerId}`;
+      const defenderName = row?.defender_name || defender.name || row?.target_name || "target";
+      const timestamp =
+        num(row?.timestamp_ended ?? row?.ended ?? row?.timestamp_started ?? row?.started ?? row?.timestamp) ?? 0;
+      const respect = num(row?.respect_gain ?? row?.respect ?? row?.respectGain ?? row?.respect_total) ?? 0;
+      const prior = byId.get(attackerId) || { name: attackerName, hits: 0, respect: 0 };
+      prior.hits += 1;
+      prior.respect += respect;
+      byId.set(attackerId, prior);
+      if (timestamp > 0 && (!last || timestamp > last.timestamp)) {
+        last = { attackerName, defenderName, timestamp };
+      }
+    }
+    const leaderboard = [...byId.values()]
+      .map((row) => ({ ...row, avg: row.hits > 0 ? row.respect / row.hits : 0 }))
+      .sort((a, b) => b.hits - a.hits || b.respect - a.respect)
+      .slice(0, 8);
+    return { leaderboard, last, error: null };
+  }
+
+  // Freshness bookkeeping so the two heavier reads (attacks, backend schedule) run on
+  // their own slower cadence than the fast chain poll.
+  let lastAttacksAt = 0;
+  let lastScheduleAt = 0;
+
   async function refreshAll(manual = false) {
-    state.loading = true;
+    // Only the manual button shows a spinner — a background poll every few seconds
+    // must not flicker the UI or blank a value mid-chain.
+    if (manual) {
+      state.loading = true;
+      state.notice = null;
+      render();
+    }
     state.error = null;
-    if (manual) state.notice = null;
-    render();
     try {
+      const cfg = settings();
       const mode = panelMode();
+      const now = Date.now();
       // Clear the inactive surface so a mode switch never renders stale data.
       if (mode === "token") state.watch = null;
       else state.signup = null;
+
+      const hasKey = Boolean(cfg.tornKey);
+      const wantSchedule = manual || now - lastScheduleAt >= SCHEDULE_MIN_INTERVAL;
+      const wantAttacks = hasKey && (manual || now - lastAttacksAt >= ATTACKS_MIN_INTERVAL);
+
       const tasks = [];
-      // Both modes are fully keyless for data: the chain HUD and the hit leaderboard
-      // come from the Overseer backend (live_chain + leaderboard blocks). A Torn key,
-      // if present, is used ONLY to mint/renew the site session — never to fetch data.
-      if (mode === "session") {
+      let serverRes = null;
+      let scheduleErr = null;
+      let tornChain = null;
+      let tornAttacks = null;
+      let tornChainErr = null;
+
+      // 1) Backend schedule (event / shifts / roster) + a FALLBACK live block. Throttled
+      //    so a fast live poll doesn't hammer Supabase — the schedule changes slowly.
+      if (wantSchedule && mode === "session") {
         tasks.push(
           callFunction("chain-watch", { action: "get" })
-            .then((res) => {
-              state.watch = res;
-              state.chain = serverLiveChain(res);
-              state.attacks = serverLeaderboard(res);
-              state.fetchedAt = Date.now();
-            })
-            .catch((e) => {
-              state.watch = null;
-              state.error = e.message || "Could not load Chain Watch schedule.";
-            }),
+            .then((res) => { serverRes = res; state.watch = res; lastScheduleAt = Date.now(); })
+            .catch((e) => { scheduleErr = e; if (!state.watch) state.watch = null; }),
         );
-      }
-      if (mode === "token") {
+      } else if (wantSchedule && mode === "token") {
         tasks.push(
           callSignup("get")
-            .then((res) => {
-              state.signup = res;
-              state.chain = serverLiveChain(res);
-              state.attacks = serverLeaderboard(res);
-              state.fetchedAt = Date.now();
-            })
-            .catch((e) => {
-              state.signup = null;
-              state.error = e.message || "Could not load the signup sheet.";
-            }),
+            .then((res) => { serverRes = res; state.signup = res; lastScheduleAt = Date.now(); })
+            .catch((e) => { scheduleErr = e; if (!state.signup) state.signup = null; }),
         );
       }
-      if (tasks.length === 0) {
-        state.notice = null;
-      } else {
-        await Promise.all(tasks);
+
+      // 2) Zero-lag live data STRAIGHT from Torn (member key). This is the primary
+      //    source whenever a key is present; the backend block is only a fallback.
+      if (hasKey) {
+        tasks.push(
+          tornFetch("/faction/chain")
+            .then((raw) => { tornChain = parseChain(raw); })
+            .catch((e) => { tornChainErr = e; }),
+        );
+        if (wantAttacks) {
+          tasks.push(
+            tornLegacyFaction("attacks")
+              .then((raw) => { tornAttacks = parseAttacks(raw); lastAttacksAt = Date.now(); })
+              .catch(() => { /* no faction API access etc. — fall back to the backend block */ }),
+          );
+        }
+      }
+
+      await Promise.all(tasks);
+
+      // Resolve the live chain HUD: direct Torn wins; else the backend cache; else keep
+      // the last value (never blank a live timer on one failed poll).
+      if (tornChain) {
+        state.chain = tornChain;
+        state.liveSource = "torn";
+      } else if (serverRes) {
+        const cached = serverLiveChain(serverRes);
+        if (cached) { state.chain = cached; state.liveSource = "cache"; }
+      }
+
+      // Resolve the leaderboard the same way (direct Torn -> backend -> keep last).
+      if (tornAttacks) {
+        state.attacks = tornAttacks;
+      } else if (serverRes) {
+        state.attacks = serverLeaderboard(serverRes);
+      }
+
+      state.fetchedAt = Date.now();
+
+      // Only surface an error when we're left with nothing to show. A failed direct
+      // chain poll that still has a backend fallback (or a last value) stays quiet.
+      if (mode === "none") {
+        state.error = null;
+      } else if (scheduleErr && !state.watch && !state.signup) {
+        state.error = scheduleErr.message || "Could not load Chain Watch.";
+      } else if (tornChainErr && !state.chain) {
+        state.error = tornChainErr.message || "Could not load the live chain from Torn.";
       }
     } finally {
       state.loading = false;
       render();
+      scheduleNextRefresh();
     }
+  }
+
+  // Self-adjusting poll loop: fast while a chain is live (zero-lag), easy between
+  // chains, barely ticking while hidden. refreshAll re-arms this in its finally.
+  let refreshTimer = null;
+  function scheduleNextRefresh() {
+    clearTimeout(refreshTimer);
+    // The fast poll only pays off when we can read Torn directly (a key) during a live
+    // chain; keyless viewers can't beat the backend cache, so they stay on the easy pace.
+    const canLive = Boolean(settings().tornKey) && Boolean(state.chain?.active);
+    const delay = state.hidden ? HIDDEN_POLL_MS : canLive ? LIVE_POLL_MS : IDLE_POLL_MS;
+    refreshTimer = setTimeout(() => {
+      if (document.visibilityState === "visible" && !state.hidden) {
+        void refreshAll(false); // re-arms the loop in its finally
+      } else {
+        scheduleNextRefresh(); // paused (hidden / backgrounded) — keep the loop alive
+      }
+    }, delay);
   }
 
   function chainRemaining() {
@@ -966,7 +1137,11 @@
       <div class="tocw-head" id="tocw-drag-handle" title="Drag to move Chain Watch">
         <div class="tocw-pills">
           <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE" : "SCHEDULED"}</span>
-          <span class="tocw-pill">SITE SYNC</span>
+          ${state.liveSource === "torn"
+            ? `<span class="tocw-pill ok" title="Chain data is pulled straight from Torn — no backend lag">TORN LIVE</span>`
+            : state.liveSource === "cache"
+              ? `<span class="tocw-pill warn" title="Falling back to the Overseer cache (add a Torn API key with faction access for zero-lag data)">CACHED</span>`
+              : `<span class="tocw-pill">SITE SYNC</span>`}
           <span class="tocw-pill">READ-ONLY</span>
         </div>
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
@@ -1412,10 +1587,13 @@
       <h2 style="margin:0 0 6px;font-size:20px;">Chain Watch Settings</h2>
       <p class="tocw-muted" style="margin:0 0 14px;">
         Data Storage: local script settings plus faction schedule on Torn Overseer.
-        Data Sharing: every request goes to your configured Overseer backend only — never to api.torn.com.
+        Data Sharing: schedule &amp; signups go to your Overseer backend; the live chain and
+        hit leaderboard are pulled straight from api.torn.com with your key (via the
+        userscript manager / Torn PDA — never exposed to torn.com's page scripts) so the
+        numbers match Torn with no lag.
         Purpose: scheduled chain countdown, watcher shifts, live chain timer, and read-only chain summaries.
       </p>
-      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— only to connect a site session; never used to fetch data</span>
+      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
         <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
       </label>
       <label>Site session token
@@ -1633,12 +1811,11 @@
     } catch (error) {
       console.error("[Torn Overseer Chain Watch] render failed", error);
     }
+    // Kick off the live-data loop (refreshAll re-arms itself via scheduleNextRefresh,
+    // polling fast while a chain is live and easing off otherwise).
     setTimeout(() => void refreshAll(false), 800);
+    // 1s tick keeps the drop-timer countdown smooth between polls.
     setInterval(safeRender, 1000);
-    setInterval(() => {
-      // Skip polling while fully hidden — no UI to update, and it saves PDA battery/data.
-      if (document.visibilityState === "visible" && !state.hidden) void refreshAll(false);
-    }, 30_000);
   }
 
   function safeRender() {
