@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.14.2
+// @version      0.15.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.14.2";
+  const VERSION = "0.15.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -1505,8 +1505,15 @@
       .tocw-card-title { font-weight: 800; margin-bottom: 6px; }
       .tocw-big { font-size: 32px; font-weight: 900; letter-spacing: 0; line-height: 1; }
       .tocw-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      .tocw-row { display: grid; grid-template-columns: 92px 1fr auto; gap: 8px; align-items: center; padding: 7px 0; border-top: 1px solid #25384d; }
+      .tocw-row { display: grid; grid-template-columns: 84px 1fr; gap: 10px; align-items: start; padding: 9px 0; border-top: 1px solid #25384d; }
       .tocw-row:first-child { border-top: 0; }
+      /* Main + backup stack vertically, each its own clear line (role · who · action) */
+      .tocw-slots { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+      .tocw-slot { display: flex; align-items: center; gap: 8px; }
+      .tocw-slot__role { min-width: 52px; font-weight: 700; color: #9eb4ce; }
+      .tocw-slot--backup .tocw-slot__role { color: #7f93ad; }
+      .tocw-slot__who { flex: 1; min-width: 0; }
+      .tocw-slot__actions { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; flex-shrink: 0; }
       .tocw-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 5px; background: #789; }
       .tocw-dot.ok { background: #32d47b; }
       .tocw-dot.warn { background: #f2b13c; }
@@ -2039,10 +2046,24 @@
     `;
   }
 
+  // Resolve a player id to a real name using the roster the payload already sends
+  // (signup.roster in token mode; watch.roster for managers). This upgrades a slot
+  // stored as a bare "ID <n>" client-side, so names read right even before the backend
+  // re-resolution deploys. Falls back to the stored name / id when the roster can't help.
+  function rosterName(id, fallback) {
+    const nid = Number(id);
+    if (!Number.isFinite(nid) || nid <= 0) return fallback;
+    const roster = state.signup?.roster || state.watch?.roster || [];
+    const member = roster.find((r) => Number(r.id) === nid);
+    const name = member && typeof member.name === "string" ? member.name.trim() : "";
+    return name && !/^ID \d+$/.test(name) ? name : fallback;
+  }
+
   function renderWatcherLine(shift, fallback) {
     if (!shift?.watcher_id) return `<div class="tocw-muted">${escapeHtml(fallback)}</div>`;
     const tone = statusClass(shift.watcher_online_status);
-    return `<div><span class="tocw-dot ${tone}"></span><strong>${escapeHtml(shift.watcher_name || `ID ${shift.watcher_id}`)}</strong> <span class="tocw-muted">${escapeHtml(shift.watcher_online_status || "Unknown")}</span></div>`;
+    const name = rosterName(shift.watcher_id, shift.watcher_name || `ID ${shift.watcher_id}`);
+    return `<div><span class="tocw-dot ${tone}"></span><strong>${escapeHtml(name)}</strong> <span class="tocw-muted">${escapeHtml(shift.watcher_online_status || "Unknown")}</span></div>`;
   }
 
   function renderLeaderboard(attacks) {
@@ -2097,8 +2118,10 @@
     return `
       <div class="tocw-row${active ? " active" : ""}${mine ? " mine" : ""}">
         <div class="tocw-muted">${shiftLabel(shift)}${mine ? `<span class="tocw-you">YOU</span>` : ""}</div>
-        ${renderSlot(shift, "main", viewer, readOnly)}
-        ${renderSlot(shift, "backup", viewer, readOnly)}
+        <div class="tocw-slots">
+          ${renderSlot(shift, "main", viewer, readOnly)}
+          ${renderSlot(shift, "backup", viewer, readOnly)}
+        </div>
       </div>
     `;
   }
@@ -2136,16 +2159,16 @@
     }
 
     const who = assigned
-      ? `<span class="tocw-dot ${statusClass(onlineStatus)}"></span>${escapeHtml(watcherName || `ID ${watcherId}`)} <span class="tocw-muted">${escapeHtml(onlineStatus || "")}</span>`
+      ? `<span class="tocw-dot ${statusClass(onlineStatus)}"></span>${escapeHtml(rosterName(watcherId, watcherName || `ID ${watcherId}`))} <span class="tocw-muted">${escapeHtml(onlineStatus || "")}</span>`
       : locked
         ? `<span class="tocw-muted">Locked</span>`
         : `<span class="tocw-muted">Open</span>`;
 
     return `
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
-        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
-        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
-        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
+      <div class="tocw-slot tocw-slot--${role}">
+        <span class="tocw-slot__role">${roleLabel}</span>
+        <span class="tocw-slot__who">${locked ? "🔒 " : ""}${who}</span>
+        <span class="tocw-slot__actions">${actions.join("")}</span>
       </div>
     `;
   }
@@ -2172,8 +2195,8 @@
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">Chainwatch shifts</div>
-        ${identity && identity.name
-          ? `<div class="tocw-muted">Signed in as ${escapeHtml(identity.name)} ✓</div>`
+        ${identity && identity.id != null
+          ? `<div class="tocw-muted">Signed in as ${escapeHtml(rosterName(identity.id, identity.name || `ID ${identity.id}`))} ✓</div>`
           : canClaim
             ? `<div class="tocw-muted">Signing up verifies you with your Torn key${settings().tornKey || settings().sessionToken ? "" : " — add it in Settings"}.</div>`
             : ""}
@@ -2185,8 +2208,10 @@
           return `
           <div class="tocw-row${active ? " active" : ""}${mine ? " mine" : ""}">
             <div class="tocw-muted">${shiftLabel(shift)}${mine ? `<span class="tocw-you">YOU</span>` : ""}</div>
-            ${renderSignupSlot(shift, "main", canClaim, identity)}
-            ${renderSignupSlot(shift, "backup", canClaim, identity)}
+            <div class="tocw-slots">
+              ${renderSignupSlot(shift, "main", canClaim, identity)}
+              ${renderSignupSlot(shift, "backup", canClaim, identity)}
+            </div>
           </div>
         `;
         }).join("")}
@@ -2210,16 +2235,16 @@
     }
 
     const who = filled
-      ? `<span class="tocw-dot ${statusClass(slot.online_status)}"></span>${escapeHtml(slot.watcher_name || `ID ${slot.watcher_id}`)}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
+      ? `<span class="tocw-dot ${statusClass(slot.online_status)}"></span>${escapeHtml(rosterName(slot.watcher_id, slot.watcher_name || `ID ${slot.watcher_id}`))}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
       : locked
         ? `<span class="tocw-muted">Locked</span>`
         : `<span class="tocw-muted">Open</span>`;
 
     return `
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
-        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
-        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
-        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
+      <div class="tocw-slot tocw-slot--${role}">
+        <span class="tocw-slot__role">${roleLabel}</span>
+        <span class="tocw-slot__who">${locked ? "🔒 " : ""}${who}</span>
+        <span class="tocw-slot__actions">${actions.join("")}</span>
       </div>
     `;
   }
