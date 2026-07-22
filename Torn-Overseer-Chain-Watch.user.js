@@ -1,20 +1,21 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.6.0
-// @description  Read-only scheduled chain countdown, chainwatch shift signup, live chain timer, and best-effort hit leaderboard. No Torn API key needed for data — the Overseer backend serves it.
-// @author       OverSeerFulgrim
+// @version      0.19.0
+// @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
+// @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
 // @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @match        https://www.torn.com/*
-// @match        https://torn-overseer-v2.pages.dev/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_notification
 // @connect      ijolgywtybadfuvyopeg.supabase.co
+// @connect      api.torn.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -24,15 +25,35 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.6.0";
+  const VERSION = "0.18.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
-  // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
-  // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
+  // The Overseer web app host — used for the "open the site to publish" deep-link and the
+  // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
+  // signup links are bound by pasting them in Settings, not auto-captured.)
   const OVERSEER_HOST = "torn-overseer-v2.pages.dev";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
   const PDA_API_KEY = "###PDA-APIKEY###";
+  const COMMENT = "TornOverseerChainWatch";
   const BONUS_MILESTONES = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000];
+
+  // Live-data polling cadence. While a chain is live the HUD is fetched STRAIGHT from
+  // Torn (member key) so the hit count + drop timer match torn.com with no backend lag;
+  // between chains it eases off, and while hidden it barely ticks.
+  const LIVE_POLL_MS = 3000;
+  const IDLE_POLL_MS = 20000;
+  const HIDDEN_POLL_MS = 60000;
+  // Torn's own rate limit is 100 req/min/key — throttle the heavier reads so the fast
+  // chain poll leaves plenty of headroom (chain ~20/min, attacks ~10/min, schedule ~2/min).
+  const ATTACKS_MIN_INTERVAL = 6000;
+  const SCHEDULE_MIN_INTERVAL = 25000;
+
+  // Watcher alarms: default seconds-to-drop at which to sound off (once each, per chain
+  // run); user-overridable in Settings. Plus how early to warn before your own shift.
+  const DEFAULT_DROP_THRESHOLDS = [60, 30, 10];
+  const SHIFT_WARN_SECS = 300; // 5-minute heads-up before your shift
+  const PACE_MIN_WINDOW_SEC = 10; // don't compute a hit/min pace off too short a sample
+  const HANDOFF_WARN_SECS = 600; // start nagging about the next watcher 10m before your shift ends
 
   const STORE = {
     tornKey: "tocw_torn_key",
@@ -43,7 +64,27 @@
     claimSecret: "tocw_claim_secret",
     signupIdentity: "tocw_signup_identity",
     collapsed: "tocw_collapsed",
+    hidden: "tocw_hidden",
     position: "tocw_position",
+    size: "tocw_size",
+    launcherPos: "tocw_launcher_pos",
+    alarm: "tocw_alarm",
+    alarmSound: "tocw_alarm_sound",
+    alarmVibrate: "tocw_alarm_vibrate",
+    alarmFlash: "tocw_alarm_flash",
+    alarmNotify: "tocw_alarm_notify",
+    alarmThresholds: "tocw_alarm_thresholds",
+    wakeLock: "tocw_wakelock",
+    focus: "tocw_focus",
+    alarmVolume: "tocw_alarm_volume",
+    alarmTone: "tocw_alarm_tone",
+    chainGoal: "tocw_chain_goal",
+    hitUrl: "tocw_hit_url",
+    autoFocus: "tocw_auto_focus",
+    alarmVoice: "tocw_alarm_voice",
+    celebrate: "tocw_celebrate",
+    targetIds: "tocw_target_ids",
+    targetIndex: "tocw_target_index",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -66,10 +107,138 @@
     chain: null,
     attacks: null,
     fetchedAt: null,
+    // Where the live chain HUD/leaderboard currently come from: "torn" (zero-lag,
+    // direct from the member key), "cache" (Overseer fallback), or null (nothing yet).
+    liveSource: null,
     settingsOpen: false,
     scriptTooOld: false,
     collapsed: readBool(STORE.collapsed, false),
+    // Fully hidden: only the "TO" launcher shows. Distinct from collapsed (which
+    // keeps a compact header). Needed on mobile PDA where the panel fills the screen.
+    hidden: readBool(STORE.hidden, false),
+    // Watcher alarms (opt-in). Each output channel is independently toggleable.
+    alarm: readBool(STORE.alarm, false),
+    alarmSound: readBool(STORE.alarmSound, true),
+    alarmVibrate: readBool(STORE.alarmVibrate, true),
+    alarmFlash: readBool(STORE.alarmFlash, true),
+    alarmNotify: readBool(STORE.alarmNotify, false),
+    alarmVolume: clampVolume(readNumber(STORE.alarmVolume, 0.3)),
+    alarmTone: readString(STORE.alarmTone, "beep") || "beep",
+    // Keep the screen awake while on watch (mobile/PDA) so the drop alarm can fire.
+    wakeLockEnabled: readBool(STORE.wakeLock, true),
+    // Compact "on watch" view: giant drop timer + hits + HIT button, nothing else.
+    focus: readBool(STORE.focus, false),
+    // Personal PREFERENCES (raw; "" / 0 = "inherit the faction default"). The effective
+    // value used everywhere is eff*() = your value ?? the faction's ?? the built-in.
+    thresholdsPref: readString(STORE.alarmThresholds, ""),
+    chainGoalPref: Math.max(0, Math.round(readNumber(STORE.chainGoal, 0))),
+    hitUrlPref: readString(STORE.hitUrl, ""),
+    // Your rotating attack list: player ids the HIT button cycles through (one per
+    // click). targetIndex is where you are in the loop, persisted across page loads.
+    targetIds: parseTargetIds(readString(STORE.targetIds, "")),
+    targetIndex: Math.max(0, Math.round(readNumber(STORE.targetIndex, 0))),
+    // Faction-wide watcher defaults from the backend get payload (migration 0098), or
+    // null. Leadership sets these once so every member's panel adopts them.
+    factionConfig: null,
+    // Auto-enter focus mode while you're the active watcher; speak drop alerts (TTS);
+    // flash + chime when a chain-bonus milestone lands.
+    autoFocus: readBool(STORE.autoFocus, true),
+    alarmVoice: readBool(STORE.alarmVoice, false),
+    celebrate: readBool(STORE.celebrate, true),
+    // Fire-once bookkeeping so an alarm sounds at each threshold only once per chain
+    // run / shift (cleared when the drop timer resets on a fresh hit, or the chain ends).
+    firedDrop: new Set(),
+    firedShift: new Set(),
+    lastRemaining: null,
+    // Consecutive direct-Torn chain failures — used to hint at missing faction API access.
+    tornFailCount: 0,
+    // Per-chain lifecycle bookkeeping (post-chain summary, bonus celebration, auto-focus).
+    wasChainActive: false,
+    wasOnWatch: false,
+    chainPeak: 0,
+    chainYourHits: 0,
+    chainYourRespect: 0,
+    chainSeenTs: new Set(),
+    lastBonusPassed: 0,
+    chainSummary: null,
   };
+
+  // Parse a free-form list of player ids ("123, 456\n789" / profile links) into a
+  // deduped ordered array of positive ints.
+  function parseTargetIds(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const m of String(raw || "").matchAll(/\d{1,10}/g)) {
+      const n = parseInt(m[0], 10);
+      if (Number.isInteger(n) && n > 0 && !seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
+    return out;
+  }
+
+  function readNumber(key, fallback) {
+    const n = Number(gmGet(key, fallback));
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function clampVolume(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0.3;
+  }
+
+  // The HIT button href is user-set — only allow http(s) (never javascript:/data:).
+  // Returns the normalized URL, or "" when nothing usable is set (the caller uses the
+  // empty string to mean "no target configured" rather than sending you somewhere random).
+  function validHttpUrl(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return "";
+    try {
+      const u = new URL(s);
+      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    } catch {
+      /* not a URL */
+    }
+    return "";
+  }
+
+  // Parse a "60,30,10" thresholds string into a sorted-desc list of positive ints.
+  // Returns the fallback when nothing valid is given (fallback may be null → null).
+  function parseThresholds(raw, fallback) {
+    const parts = String(raw || "")
+      .split(/[\s,]+/)
+      .map((s) => parseInt(s, 10))
+      .filter((n) => Number.isInteger(n) && n > 0 && n <= 3600);
+    const uniq = [...new Set(parts)].sort((a, b) => b - a);
+    return uniq.length ? uniq : (fallback ? fallback.slice() : null);
+  }
+
+  // Clean a faction-supplied threshold array (from watch_config) the same way.
+  function cleanThresholdArray(arr) {
+    if (!Array.isArray(arr)) return null;
+    const nums = arr.map((n) => Math.trunc(Number(n))).filter((n) => Number.isFinite(n) && n > 0 && n <= 3600);
+    const uniq = [...new Set(nums)].sort((a, b) => b - a);
+    return uniq.length ? uniq : null;
+  }
+
+  // Thresholds + goal are effective = YOUR preference (if set) ?? the FACTION default ??
+  // the built-in. The HIT target URL is PER-MEMBER only (it depends on your own stats),
+  // and there's NO sensible universal default — so it's just your value, or "" (unset),
+  // in which case the button prompts you to set one instead of linking somewhere wrong.
+  function effHitUrl() {
+    return validHttpUrl(state.hitUrlPref);
+  }
+  function effThresholds() {
+    return parseThresholds(state.thresholdsPref, null)
+      || cleanThresholdArray(state.factionConfig?.drop_thresholds)
+      || DEFAULT_DROP_THRESHOLDS.slice();
+  }
+  function effGoal() {
+    if (state.chainGoalPref > 0) return state.chainGoalPref;
+    const fac = Math.trunc(Number(state.factionConfig?.chain_goal)) || 0;
+    return fac > 0 ? fac : 0;
+  }
 
   function gmGet(key, fallback) {
     try {
@@ -177,6 +346,74 @@
     gmSet(STORE.position, next);
   }
 
+  const MIN_PANEL_W = 240;
+  const MIN_PANEL_H = 150;
+
+  function readSize() {
+    const value = gmGet(STORE.size, null);
+    if (!value || typeof value !== "object") return null;
+    const width = Number(value.width);
+    const height = Number(value.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+    return { width, height };
+  }
+
+  // Keep a user-chosen panel size inside the viewport (and above a usable floor),
+  // so a resize saved on a big screen doesn't overflow a small PDA one on reload.
+  function clampSize(width, height) {
+    const margin = 16;
+    const maxW = Math.max(MIN_PANEL_W, window.innerWidth - margin);
+    const maxH = Math.max(MIN_PANEL_H, window.innerHeight - margin);
+    return {
+      width: Math.min(Math.max(MIN_PANEL_W, Math.round(width)), maxW),
+      height: Math.min(Math.max(MIN_PANEL_H, Math.round(height)), maxH),
+    };
+  }
+
+  function applyPanelSize(box) {
+    const size = readSize();
+    if (!size) return;
+    const next = clampSize(size.width, size.height);
+    box.style.width = `${next.width}px`;
+    box.style.height = `${next.height}px`;
+    // An explicit height replaces the CSS max-height cap; the body scrolls inside.
+    box.style.maxHeight = "none";
+  }
+
+  function savePanelSize(box) {
+    const rect = box.getBoundingClientRect();
+    const next = clampSize(rect.width, rect.height);
+    gmSet(STORE.size, next);
+  }
+
+  const LAUNCHER_W = 46;
+  const LAUNCHER_H = 38;
+
+  function readLauncherPosition() {
+    const value = gmGet(STORE.launcherPos, null);
+    if (!value || typeof value !== "object") return null;
+    const left = Number(value.left);
+    const top = Number(value.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    return { left, top };
+  }
+
+  function applyLauncherPosition(launcher) {
+    const pos = readLauncherPosition();
+    if (!pos) return;
+    const next = clampPosition(pos.left, pos.top, LAUNCHER_W, LAUNCHER_H);
+    launcher.style.left = `${next.left}px`;
+    launcher.style.top = `${next.top}px`;
+    launcher.style.right = "auto";
+    launcher.style.bottom = "auto";
+  }
+
+  function saveLauncherPosition(launcher) {
+    const rect = launcher.getBoundingClientRect();
+    const next = clampPosition(rect.left, rect.top, rect.width || LAUNCHER_W, rect.height || LAUNCHER_H);
+    gmSet(STORE.launcherPos, next);
+  }
+
   function pdaApiKey() {
     return PDA_API_KEY && !PDA_API_KEY.includes("###") ? PDA_API_KEY.trim() : "";
   }
@@ -193,31 +430,7 @@
     };
   }
 
-  function isOverseerSite() {
-    return location.host === OVERSEER_HOST;
-  }
-
-  // Grab the capability token from a /chain/e/:token link the user opened on the
-  // Overseer site and stash it in (shared) GM storage so the torn.com panel picks it
-  // up. Token entry is never manual — this is the one-click bind.
-  function captureSignupToken() {
-    const m = location.pathname.match(/\/chain\/e\/([^/?#]+)/);
-    if (!m) return null;
-    let token = m[1];
-    try {
-      token = decodeURIComponent(m[1]);
-    } catch {
-      /* keep raw */
-    }
-    token = String(token).trim();
-    if (token && token.length <= 128) {
-      gmSet(STORE.signupToken, token);
-      return token;
-    }
-    return null;
-  }
-
-  // Pull a token out of a pasted signup LINK or a raw token (last-resort manual entry).
+  // Pull a token out of a pasted signup LINK or a raw token (Settings → paste a link).
   function extractSignupToken(input) {
     const s = String(input || "").trim();
     if (!s) return "";
@@ -507,64 +720,346 @@
     return { leaderboard, last, error: null };
   }
 
+  // --- Direct-from-Torn live data (member key, zero-lag) -----------------------
+  // These go STRAIGHT to Torn via the userscript manager / PDA (never a page fetch),
+  // so the key stays private but the chain HUD + leaderboard match torn.com with no
+  // backend cache lag. The Overseer backend remains the fallback (see refreshAll).
+
+  async function tornFetch(path) {
+    const cfg = settings();
+    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
+    const url = new URL(`https://api.torn.com/v2${path.startsWith("/") ? path : `/${path}`}`);
+    url.searchParams.set("key", cfg.tornKey);
+    url.searchParams.set("comment", COMMENT);
+    const data = await requestJson(url.toString());
+    if (data && typeof data === "object" && data.error) {
+      const err = data.error;
+      throw new Error(err.error || `Torn API error ${err.code ?? ""}`.trim());
+    }
+    return data;
+  }
+
+  async function tornLegacyFaction(selections) {
+    const cfg = settings();
+    if (!cfg.tornKey) throw new Error("Add a Torn API key in Settings.");
+    const url = new URL("https://api.torn.com/faction/");
+    url.searchParams.set("selections", selections);
+    url.searchParams.set("key", cfg.tornKey);
+    url.searchParams.set("comment", COMMENT);
+    const data = await requestJson(url.toString());
+    if (data && typeof data === "object" && data.error) {
+      const err = data.error;
+      throw new Error(err.error || `Torn API error ${err.code ?? ""}`.trim());
+    }
+    return data;
+  }
+
+  function asRows(value) {
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === "object") return Object.values(value);
+    return [];
+  }
+
+  // Torn /v2/faction/chain -> the panel's chain shape, stamped with the moment WE got
+  // the response so the local drop-timer countdown stays honest between polls.
+  function parseChain(raw) {
+    const c = raw?.chain || raw || {};
+    const current = num(c.current) ?? 0;
+    const timeout = num(c.timeout) ?? 0;
+    return {
+      active: current > 0 && timeout > 0,
+      current,
+      max: num(c.maximum ?? c.max) ?? 0,
+      timeout,
+      modifier: num(c.modifier) ?? 0,
+      cooldown: num(c.cooldown) ?? 0,
+      start: num(c.start) ?? 0, // unix seconds the chain began — windows the leaderboard
+      fetchedAt: Date.now(),
+    };
+  }
+
+  // Torn /faction?selections=attacks -> the same aggregated leaderboard shape the
+  // backend serves, built client-side from the last ~100 attacks (needs faction API
+  // access; a 403/access error surfaces as an error and we fall back to the backend).
+  // Windowed to THIS chain (windowStartSec) and filtered to faction members (rosterIds)
+  // so it matches the live chain — not last-100-attacks that include the previous chain
+  // and incoming enemy hits. Also computes a recent hit PACE (per-minute) over the
+  // sampled window: your own, the whole faction, and the per-hitter average.
+  function parseAttacks(raw, viewerId, windowStartSec, rosterIds) {
+    const rows = asRows(raw?.attacks ?? raw);
+    const byId = new Map();
+    let last = null;
+    let total = 0;
+    let yourHits = 0;
+    let minTs = Infinity;
+    let maxTs = 0;
+    const yourTs = [];
+    const yourResp = [];
+    const vid = viewerId != null ? Number(viewerId) : null;
+    const winStart = Number.isFinite(windowStartSec) && windowStartSec > 0 ? windowStartSec : 0;
+    const hasRoster = rosterIds instanceof Set && rosterIds.size > 0;
+    for (const row of rows) {
+      const attacker = row?.attacker && typeof row.attacker === "object" ? row.attacker : {};
+      const defender = row?.defender && typeof row.defender === "object" ? row.defender : {};
+      const attackerId = num(row?.attacker_id ?? row?.attackerID ?? attacker.id);
+      if (!attackerId || attackerId <= 0) continue; // stealthed / unknown attacker
+      // Only faction members' hits (drops incoming enemy attacks); and only within the
+      // current chain's window (drops the previous chain / between-chain randoms).
+      if (hasRoster && !rosterIds.has(attackerId)) continue;
+      const timestamp =
+        num(row?.timestamp_ended ?? row?.ended ?? row?.timestamp_started ?? row?.started ?? row?.timestamp) ?? 0;
+      if (winStart && timestamp > 0 && timestamp < winStart) continue;
+      const attackerName = row?.attacker_name || attacker.name || `ID ${attackerId}`;
+      const defenderName = row?.defender_name || defender.name || row?.target_name || "target";
+      const respect = num(row?.respect_gain ?? row?.respect ?? row?.respectGain ?? row?.respect_total) ?? 0;
+      const prior = byId.get(attackerId) || { playerId: attackerId, name: attackerName, hits: 0, respect: 0 };
+      prior.hits += 1;
+      prior.respect += respect;
+      byId.set(attackerId, prior);
+      total += 1;
+      if (vid != null && attackerId === vid) {
+        yourHits += 1;
+        if (timestamp > 0) { yourTs.push(timestamp); yourResp.push(respect); }
+      }
+      if (timestamp > 0) {
+        if (timestamp < minTs) minTs = timestamp;
+        if (timestamp > maxTs) maxTs = timestamp;
+      }
+      if (timestamp > 0 && (!last || timestamp > last.timestamp)) {
+        last = { attackerName, defenderName, timestamp };
+      }
+    }
+    const leaderboard = [...byId.values()]
+      .map((row) => ({ ...row, avg: row.hits > 0 ? row.respect / row.hits : 0 }))
+      .sort((a, b) => b.hits - a.hits || b.respect - a.respect)
+      .slice(0, 8);
+
+    // Recent per-minute pace over the sampled window. All three figures share ONE
+    // window so they're consistent: the faction rate, YOUR rate, and the rate an
+    // average active hitter is managing (faction ÷ number of people who hit).
+    const windowSec = maxTs > 0 && minTs < Infinity ? maxTs - minTs : 0;
+    const hitters = byId.size;
+    let pace = null;
+    if (windowSec >= PACE_MIN_WINDOW_SEC && total >= 3) {
+      const perMin = (n) => (n / windowSec) * 60;
+      pace = {
+        faction: perMin(total),
+        you: vid != null ? perMin(yourHits) : null,
+        avg: hitters > 0 ? perMin(total) / hitters : 0,
+        hitters,
+      };
+    }
+    return { leaderboard, last, error: null, mine: { hits: yourHits, ts: yourTs, respect: yourResp }, pace };
+  }
+
+  // Freshness bookkeeping so the two heavier reads (attacks, backend schedule) run on
+  // their own slower cadence than the fast chain poll.
+  let lastAttacksAt = 0;
+  let lastScheduleAt = 0;
+
   async function refreshAll(manual = false) {
-    state.loading = true;
+    // Only the manual button shows a spinner — a background poll every few seconds
+    // must not flicker the UI or blank a value mid-chain.
+    if (manual) {
+      state.loading = true;
+      state.notice = null;
+      render();
+    }
     state.error = null;
-    if (manual) state.notice = null;
-    render();
     try {
+      const cfg = settings();
       const mode = panelMode();
+      const now = Date.now();
       // Clear the inactive surface so a mode switch never renders stale data.
       if (mode === "token") state.watch = null;
       else state.signup = null;
+
+      const hasKey = Boolean(cfg.tornKey);
+      const wantSchedule = manual || now - lastScheduleAt >= SCHEDULE_MIN_INTERVAL;
+      const wantAttacks = hasKey && (manual || now - lastAttacksAt >= ATTACKS_MIN_INTERVAL);
+
       const tasks = [];
-      // Both modes are fully keyless for data: the chain HUD and the hit leaderboard
-      // come from the Overseer backend (live_chain + leaderboard blocks). A Torn key,
-      // if present, is used ONLY to mint/renew the site session — never to fetch data.
-      if (mode === "session") {
+      let serverRes = null;
+      let scheduleErr = null;
+      let tornChain = null;
+      let tornAttacks = null;
+      let tornChainErr = null;
+
+      // 1) Backend schedule (event / shifts / roster) + a FALLBACK live block. Throttled
+      //    so a fast live poll doesn't hammer Supabase — the schedule changes slowly.
+      if (wantSchedule && mode === "session") {
         tasks.push(
           callFunction("chain-watch", { action: "get" })
-            .then((res) => {
-              state.watch = res;
-              state.chain = serverLiveChain(res);
-              state.attacks = serverLeaderboard(res);
-              state.fetchedAt = Date.now();
-            })
-            .catch((e) => {
-              state.watch = null;
-              state.error = e.message || "Could not load Chain Watch schedule.";
-            }),
+            .then((res) => { serverRes = res; state.watch = res; lastScheduleAt = Date.now(); })
+            .catch((e) => { scheduleErr = e; if (!state.watch) state.watch = null; }),
         );
-      }
-      if (mode === "token") {
+      } else if (wantSchedule && mode === "token") {
+        // Verify-to-view: the signup get now needs a session. Use the stored one, minting
+        // it from the Torn key once if needed (then it's cached for later polls). A truly
+        // keyless viewer gets a needs_verification stub and the panel prompts for a key.
+        let st = cfg.sessionToken;
+        if (!st && cfg.tornKey) {
+          try { st = await ensureVerifiedSession(); } catch { st = ""; }
+        }
         tasks.push(
-          callSignup("get")
-            .then((res) => {
-              state.signup = res;
-              state.chain = serverLiveChain(res);
-              state.attacks = serverLeaderboard(res);
-              state.fetchedAt = Date.now();
-            })
-            .catch((e) => {
-              state.signup = null;
-              state.error = e.message || "Could not load the signup sheet.";
-            }),
+          callSignup("get", {}, st || undefined)
+            .then((res) => { serverRes = res; state.signup = res; lastScheduleAt = Date.now(); })
+            .catch((e) => { scheduleErr = e; if (!state.signup) state.signup = null; }),
         );
       }
-      if (tasks.length === 0) {
-        state.notice = null;
+
+      // 2) Zero-lag live data STRAIGHT from Torn (member key). This is the primary
+      //    source whenever a key is present; the backend block is only a fallback.
+      if (hasKey) {
+        // Window the leaderboard to the running chain (its start), else a rolling 4h;
+        // filter to faction members so incoming enemy hits don't pollute it.
+        const chainStart = state.chain?.active && state.chain.start > 0
+          ? state.chain.start
+          : Math.floor(Date.now() / 1000) - 4 * 3600;
+        const rosterIds = new Set(
+          (state.signup?.roster || state.watch?.roster || [])
+            .map((m) => Number(m.id))
+            .filter((n) => Number.isFinite(n) && n > 0),
+        );
+        tasks.push(
+          tornFetch("/faction/chain")
+            .then((raw) => { tornChain = parseChain(raw); })
+            .catch((e) => { tornChainErr = e; }),
+        );
+        if (wantAttacks) {
+          tasks.push(
+            tornLegacyFaction("attacks")
+              .then((raw) => { tornAttacks = parseAttacks(raw, viewerId(), chainStart, rosterIds); lastAttacksAt = Date.now(); })
+              .catch(() => { /* no faction API access etc. — fall back to the backend block */ }),
+          );
+        }
+      }
+
+      await Promise.all(tasks);
+
+      // Resolve the live chain HUD: direct Torn wins; else the backend cache; else keep
+      // the last value (never blank a live timer on one failed poll).
+      if (tornChain) {
+        // Torn caches /faction/chain, so consecutive polls can return the SAME timeout.
+        // Keep the previous anchor when the data hasn't moved, or the countdown jumps back
+        // to the start each poll; re-anchor only when timeout/current actually changed.
+        const prev = state.chain;
+        if (
+          prev && prev.active && tornChain.active &&
+          prev.timeout === tornChain.timeout && prev.current === tornChain.current
+        ) {
+          tornChain.fetchedAt = prev.fetchedAt;
+        }
+        state.chain = tornChain;
+        state.liveSource = "torn";
+        state.tornFailCount = 0;
       } else {
-        await Promise.all(tasks);
+        if (hasKey) state.tornFailCount += 1; // ran the direct fetch, got nothing usable
+        if (serverRes) {
+          const cached = serverLiveChain(serverRes);
+          if (cached) { state.chain = cached; state.liveSource = "cache"; }
+        }
+      }
+
+      // Resolve the leaderboard the same way (direct Torn -> backend -> keep last).
+      if (tornAttacks) {
+        state.attacks = tornAttacks;
+      } else if (serverRes) {
+        state.attacks = serverLeaderboard(serverRes);
+      }
+
+      // Adopt the faction's watcher defaults (0098) from whichever payload we have.
+      state.factionConfig = state.watch?.watch_config ?? state.signup?.watch_config ?? null;
+      updateChainLifecycle();
+      state.fetchedAt = Date.now();
+
+      // Only surface an error when we're left with nothing to show. A failed direct
+      // chain poll that still has a backend fallback (or a last value) stays quiet.
+      if (mode === "none") {
+        state.error = null;
+      } else if (scheduleErr && !state.watch && !state.signup) {
+        state.error = scheduleErr.message || "Could not load Chain Watch.";
+      } else if (tornChainErr && !state.chain) {
+        state.error = tornChainErr.message || "Could not load the live chain from Torn.";
       }
     } finally {
       state.loading = false;
       render();
+      scheduleNextRefresh();
     }
+  }
+
+  // Self-adjusting poll loop: fast while a chain is live (zero-lag), easy between
+  // chains, barely ticking while hidden. refreshAll re-arms this in its finally.
+  let refreshTimer = null;
+  function scheduleNextRefresh() {
+    clearTimeout(refreshTimer);
+    // The fast poll only pays off when we can read Torn directly (a key) during a live
+    // chain; keyless viewers can't beat the backend cache, so they stay on the easy pace.
+    const canLive = Boolean(settings().tornKey) && Boolean(state.chain?.active);
+    // Keep polling fast even while hidden IF alarms are armed on a live chain — an alarm
+    // is only as accurate as the last chain fetch, so it must not go stale in a pocket.
+    const delay = canLive && (!state.hidden || state.alarm)
+      ? LIVE_POLL_MS
+      : state.hidden ? HIDDEN_POLL_MS : IDLE_POLL_MS;
+    refreshTimer = setTimeout(() => {
+      // Poll whenever the TAB is foreground (panel hidden is fine — alarms/data still
+      // need refreshing); a backgrounded tab pauses (browsers throttle it anyway).
+      if (document.visibilityState === "visible") {
+        void refreshAll(false); // re-arms the loop in its finally
+      } else {
+        scheduleNextRefresh(); // paused (tab backgrounded) — keep the loop alive
+      }
+    }, delay);
+  }
+
+  // torn.com's own sidebar shows the chain countdown, updated live by the site — the
+  // exact value the player sees, with zero API-cache lag. Read it so our drop timer
+  // matches. Torn renders each bar's countdown in a `bar-timeleft___<hash>` element,
+  // and ALL bars (Energy/Nerve/Happy/Chain) share it — so pick the timer whose bar (an
+  // ancestor within a few levels, kept small) says "Chain". Returns seconds, or null
+  // when there's no such element (wrong page / PDA) → the API value is used instead.
+  let sidebarChainNode = null;
+  function chainTimerSeconds(timer) {
+    if (!timer) return null;
+    const m = (timer.textContent || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    let node = timer.parentElement;
+    for (let i = 0; i < 5 && node; i += 1, node = node.parentElement) {
+      const t = (node.textContent || "").replace(/\s+/g, " ").trim();
+      if (t.length > 80) break; // walked past this single bar into its neighbours
+      if (/chain/i.test(t)) return Number(m[1]) * 60 + Number(m[2]);
+    }
+    return null;
+  }
+  function readSidebarChainSeconds() {
+    try {
+      if (sidebarChainNode && sidebarChainNode.isConnected) {
+        const secs = chainTimerSeconds(sidebarChainNode);
+        if (secs != null) return secs;
+        sidebarChainNode = null;
+      }
+      for (const timer of document.querySelectorAll('[class*="timeleft"]')) {
+        const secs = chainTimerSeconds(timer);
+        if (secs != null) {
+          sidebarChainNode = timer;
+          return secs;
+        }
+      }
+    } catch {
+      sidebarChainNode = null;
+    }
+    return null;
   }
 
   function chainRemaining() {
     if (!state.chain?.active) return 0;
-    return Math.max(0, state.chain.timeout - Math.floor((Date.now() - state.chain.fetchedAt) / 1000));
+    const byTimeout = Math.max(0, state.chain.timeout - Math.floor((Date.now() - state.chain.fetchedAt) / 1000));
+    // Prefer the sidebar's live value when it's plausibly the chain timer (within ~90s of
+    // our API value) — a mis-parsed element can't hijack the countdown that way.
+    const dom = readSidebarChainSeconds();
+    if (dom != null && Math.abs(dom - byTimeout) <= 90) return dom;
+    return byTimeout;
   }
 
   function duration(seconds) {
@@ -603,10 +1098,21 @@
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
   }
 
+  // Bare "HH:MM" in TCT (UTC), no zone suffix — for building compact time ranges.
+  function hhmmTct(iso) {
+    if (!iso) return "--";
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return "--";
+    return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
+  }
+
+  // Two clean, non-breaking lines: the TCT window and the viewer-local window, each
+  // with a small zone tag — so nothing wraps mid-value in the narrow time column.
   function shiftLabel(shift) {
-    const tct = `${tctTime(shift.shift_start)}-${tctTime(shift.shift_end).replace(" TCT", "")}`;
-    const local = `${localTime(shift.shift_start)}-${localTime(shift.shift_end)}`;
-    return `${tct} <span class="tocw-muted">· ${local} your time</span>`;
+    const tct = `${hhmmTct(shift.shift_start)}–${hhmmTct(shift.shift_end)}`;
+    const local = `${localTime(shift.shift_start)}–${localTime(shift.shift_end)}`;
+    return `<span class="tocw-when-tct">${tct}<span class="tocw-when-zone"> TCT</span></span>` +
+      `<span class="tocw-when-local">${local}<span class="tocw-when-zone"> local</span></span>`;
   }
 
   function statusClass(status) {
@@ -623,6 +1129,400 @@
     return { current, next };
   }
 
+  // --- Who "you" are, and which of the shifts are yours ------------------------
+
+  // The viewer's Torn id: from the session (session mode) or the cached signup
+  // identity (token mode). Null when we don't know who's watching (nothing personal).
+  function viewerId() {
+    const sid = state.watch?.viewer?.player_id ?? state.signup?.viewer?.player_id;
+    if (sid != null) return Number(sid);
+    const identity = getSignupIdentity();
+    return identity && identity.id != null ? Number(identity.id) : null;
+  }
+
+  // Every shift the viewer holds (main or backup), across both payload shapes,
+  // sorted by start. Empty when the viewer holds none / is unknown.
+  function viewerShifts() {
+    const vid = viewerId();
+    if (vid == null) return [];
+    const out = [];
+    if (Array.isArray(state.watch?.shifts)) {
+      for (const s of state.watch.shifts) {
+        if (Number(s.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "main" });
+        if (Number(s.backup_watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "backup" });
+      }
+    } else if (Array.isArray(state.signup?.shifts)) {
+      for (const s of state.signup.shifts) {
+        if (s.main && Number(s.main.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "main" });
+        if (s.backup && Number(s.backup.watcher_id) === vid) out.push({ start: s.shift_start, end: s.shift_end, role: "backup" });
+      }
+    }
+    return out.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+  }
+
+  // The viewer's currently-active shift (if on watch now) and their next upcoming one.
+  function viewerShiftStatus() {
+    const now = Date.now();
+    const mine = viewerShifts();
+    const active = mine.find((s) => new Date(s.start).getTime() <= now && new Date(s.end).getTime() > now) || null;
+    const next = mine.find((s) => new Date(s.start).getTime() > now) || null;
+    return { active, next };
+  }
+
+  // MAIN-slot coverage across both payload shapes: {start, end, id, name, online}.
+  function normalizedShifts() {
+    if (Array.isArray(state.watch?.shifts)) {
+      return state.watch.shifts.map((s) => ({
+        start: s.shift_start, end: s.shift_end,
+        id: s.watcher_id, name: s.watcher_name, online: s.watcher_online_status,
+      }));
+    }
+    if (Array.isArray(state.signup?.shifts)) {
+      return state.signup.shifts.map((s) => ({
+        start: s.shift_start, end: s.shift_end,
+        id: s.main?.watcher_id, name: s.main?.watcher_name, online: s.main?.online_status,
+      }));
+    }
+    return [];
+  }
+
+  // Handoff readiness for the shift that's ending: is the NEXT slot covered by someone
+  // online? Returns null until the current shift is within HANDOFF_WARN of ending.
+  //  - "gap":   no next watcher assigned at all
+  //  - "risk":  next watcher assigned but not Online (idle/offline)
+  //  - "ready": next watcher assigned and Online
+  function handoffStatus() {
+    const rows = normalizedShifts();
+    const now = Date.now();
+    const current = rows.find((s) => new Date(s.start).getTime() <= now && new Date(s.end).getTime() > now) || null;
+    if (!current) return null;
+    const handoffAt = new Date(current.end).getTime();
+    const endsIn = Math.floor((handoffAt - now) / 1000);
+    if (endsIn > HANDOFF_WARN_SECS) return null;
+    // The shift that covers the instant this one ends (the contiguous next slot). If
+    // nothing covers it, there's an immediate unmanned gap right after the handoff.
+    const cover = rows.find((s) => new Date(s.start).getTime() <= handoffAt && new Date(s.end).getTime() > handoffAt) || null;
+    if (!cover || cover.id == null) return { state: "gap", endsIn, name: null, online: null };
+    const online = cover.online === "Online";
+    return { state: online ? "ready" : "risk", endsIn, name: cover.name, online: cover.online };
+  }
+
+  // "~Xm" ETA to close a gap of `toGo` hits at `pacePerMin`. Empty when unknown.
+  function etaText(toGo, pacePerMin) {
+    if (!pacePerMin || pacePerMin <= 0 || toGo <= 0) return "";
+    const mins = toGo / pacePerMin;
+    if (!Number.isFinite(mins)) return "";
+    if (mins < 1) return "~<1m";
+    if (mins < 60) return `~${Math.round(mins)}m`;
+    return `~${Math.floor(mins / 60)}h ${Math.round(mins % 60)}m`;
+  }
+
+  // --- Alarms (opt-in): sound (WebAudio), vibration, and a panel flash ---------
+
+  let audioCtx = null;
+  // Must be primed by a user gesture (the alarm toggle) or the browser/PDA blocks
+  // audio; resuming a suspended context here is what makes later beeps actually play.
+  function primeAudio() {
+    try {
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        audioCtx = new Ctx();
+      }
+      if (audioCtx.state === "suspended") void audioCtx.resume();
+    } catch {
+      audioCtx = null;
+    }
+  }
+
+  function beep(count = 1, freq = 880, type = "square") {
+    if (!audioCtx) primeAudio();
+    if (!audioCtx) return;
+    const peak = Math.max(0.0002, state.alarmVolume); // exponential ramps can't hit 0
+    try {
+      const t0 = audioCtx.currentTime;
+      for (let i = 0; i < count; i += 1) {
+        const at = t0 + i * 0.18;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(peak, at + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.15);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(at);
+        osc.stop(at + 0.17);
+      }
+    } catch {
+      /* audio can fail on some webviews — never let it break the tick */
+    }
+  }
+
+  // Named tone presets so watchers can pick a sound they'll actually notice.
+  const ALARM_TONES = ["beep", "chime", "siren"];
+  function playAlarmSound(kind) {
+    const drop = kind === "drop";
+    if (state.alarmTone === "chime") return beep(drop ? 3 : 2, drop ? 1320 : 988, "sine");
+    if (state.alarmTone === "siren") return beep(drop ? 4 : 2, drop ? 860 : 640, "sawtooth");
+    return beep(drop ? 3 : 2, drop ? 990 : 740, "square"); // beep (default)
+  }
+
+  function flashPanel(kind) {
+    const box = document.getElementById("tocw");
+    if (!box) return;
+    const cls = kind === "drop" ? "tocw-flash-bad" : "tocw-flash-warn";
+    box.classList.remove(cls);
+    void box.offsetWidth; // restart the animation
+    box.classList.add(cls);
+    setTimeout(() => box.classList.remove(cls), 1500);
+  }
+
+  function notify(message) {
+    try {
+      if (typeof GM_notification === "function") {
+        GM_notification({ title: "Chain Watch", text: message, timeout: 8000, silent: !state.alarmSound });
+      }
+    } catch {
+      /* notifications unavailable */
+    }
+  }
+
+  // Speak an alert aloud (voice countdown). cancel() first so alerts don't queue up
+  // into a backlog when several fire close together near the drop.
+  function speak(message) {
+    try {
+      const synth = window.speechSynthesis;
+      if (!synth || typeof SpeechSynthesisUtterance !== "function") return;
+      const u = new SpeechSynthesisUtterance(String(message));
+      u.rate = 1.1;
+      u.volume = Math.max(0.15, state.alarmVolume);
+      synth.cancel();
+      synth.speak(u);
+    } catch {
+      /* TTS unavailable on this webview */
+    }
+  }
+
+  // A short rising chime (distinct from the alarm) for bonus celebrations.
+  function chime(freqs) {
+    if (!audioCtx) primeAudio();
+    if (!audioCtx) return;
+    const peak = Math.max(0.0002, state.alarmVolume);
+    try {
+      const t0 = audioCtx.currentTime;
+      (freqs || [660, 880, 1174]).forEach((f, i) => {
+        const at = t0 + i * 0.13;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = f;
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(peak, at + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.22);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(at);
+        osc.stop(at + 0.24);
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Bonus milestone landed: a green flash + rising chime + a celebratory notice.
+  function celebrate(milestone) {
+    const box = document.getElementById("tocw");
+    if (box) {
+      box.classList.remove("tocw-flash-good");
+      void box.offsetWidth;
+      box.classList.add("tocw-flash-good");
+      setTimeout(() => box.classList.remove("tocw-flash-good"), 1500);
+    }
+    chime();
+    state.notice = `🎉 ${Number(milestone).toLocaleString()} chain bonus!`;
+  }
+
+  function fireAlarm(kind, message) {
+    if (state.alarmSound) playAlarmSound(kind);
+    if (state.alarmVibrate) {
+      try {
+        navigator.vibrate?.(kind === "drop" ? [130, 60, 130, 60, 220] : [200, 100, 200]);
+      } catch {
+        /* not supported */
+      }
+    }
+    if (state.alarmFlash) flashPanel(kind);
+    if (state.alarmNotify) notify(message);
+    if (state.alarmVoice) speak(message);
+    state.notice = message;
+  }
+
+  // --- Screen wake lock: keep a phone/PDA awake while on watch so the alarm fires ---
+  let wakeLock = null;
+  async function acquireWakeLock() {
+    try {
+      if (wakeLock || !("wakeLock" in navigator)) return;
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener?.("release", () => { wakeLock = null; });
+    } catch {
+      wakeLock = null; // denied / unsupported — silently do without
+    }
+  }
+  function releaseWakeLock() {
+    try {
+      wakeLock?.release?.();
+    } catch {
+      /* ignore */
+    }
+    wakeLock = null;
+  }
+  // Hold the lock while you're the active watcher, or a chain is live and alarms are
+  // armed (you're actively hitting). The OS drops the lock when the tab hides, so this
+  // (called each tick + on visibility change) re-acquires it when you come back.
+  function updateWakeLock() {
+    const want = state.wakeLockEnabled
+      && document.visibilityState === "visible"
+      && (Boolean(viewerShiftStatus().active) || (Boolean(state.chain?.active) && state.alarm));
+    if (want && !wakeLock) void acquireWakeLock();
+    else if (!want && wakeLock) releaseWakeLock();
+  }
+
+  // Per-poll chain lifecycle: accumulate YOUR hits across the chain (dedup by
+  // timestamp), celebrate bonus milestones, snapshot a post-chain summary when it
+  // ends, and auto-enter/exit focus mode on your shift. Runs after each data poll.
+  function updateChainLifecycle() {
+    const active = Boolean(state.chain?.active);
+    const cur = state.chain?.current || 0;
+
+    if (active && !state.wasChainActive) {
+      // A fresh chain started — reset the per-chain accumulators.
+      state.chainYourHits = 0;
+      state.chainYourRespect = 0;
+      state.chainSeenTs = new Set();
+      state.chainPeak = 0;
+      state.lastBonusPassed = BONUS_MILESTONES.filter((n) => n <= cur).pop() || 0;
+      state.chainSummary = null;
+    }
+
+    if (active) {
+      state.chainPeak = Math.max(state.chainPeak, cur);
+      // Accumulate your hits over the whole chain from the direct attack feed (deduped
+      // by timestamp so overlapping poll windows don't double-count).
+      const mine = state.attacks?.mine;
+      if (Array.isArray(mine?.ts)) {
+        for (let i = 0; i < mine.ts.length; i += 1) {
+          const t = mine.ts[i];
+          if (!state.chainSeenTs.has(t)) {
+            state.chainSeenTs.add(t);
+            state.chainYourHits += 1;
+            state.chainYourRespect += mine.respect?.[i] || 0;
+          }
+        }
+      }
+      // Bonus celebration when a milestone is crossed.
+      if (state.celebrate) {
+        const passed = BONUS_MILESTONES.filter((n) => n <= cur).pop() || 0;
+        if (passed > state.lastBonusPassed) {
+          state.lastBonusPassed = passed;
+          celebrate(passed);
+        }
+      }
+    }
+
+    if (!active && state.wasChainActive && state.chainPeak > 0) {
+      // Chain just ended — snapshot the recap.
+      state.chainSummary = {
+        totalHits: state.chainPeak,
+        yourHits: state.chainYourHits,
+        yourRespect: state.chainYourRespect,
+      };
+    }
+
+    if (state.autoFocus && !state.settingsOpen) {
+      // React only to on-watch TRANSITIONS so a manual focus toggle mid-shift sticks.
+      const onWatch = Boolean(viewerShiftStatus().active);
+      if (onWatch && !state.wasOnWatch && !state.focus) {
+        state.focus = true;
+        gmSet(STORE.focus, true);
+      } else if (!onWatch && state.wasOnWatch && state.focus) {
+        state.focus = false;
+        gmSet(STORE.focus, false);
+      }
+      state.wasOnWatch = onWatch;
+    }
+
+    state.wasChainActive = active;
+  }
+
+  // Runs every second (even while collapsed/hidden — the whole point is to alert you
+  // when you're NOT looking). Fires each drop threshold once per chain run, re-arming
+  // when a fresh hit pushes the timer back up; warns before + at your shift start.
+  function evaluateAlarms() {
+    if (!state.alarm) return;
+
+    if (state.chain?.active) {
+      const remaining = chainRemaining();
+      // A fresh hit reset the timer upward → re-arm the thresholds for this run.
+      if (state.lastRemaining != null && remaining > state.lastRemaining + 3) state.firedDrop.clear();
+      state.lastRemaining = remaining;
+      for (const t of effThresholds()) {
+        if (remaining > 0 && remaining <= t && !state.firedDrop.has(t)) {
+          state.firedDrop.add(t);
+          fireAlarm("drop", `Chain drops in ${remaining}s — HIT NOW!`);
+          break; // one alert per tick
+        }
+      }
+    } else {
+      state.firedDrop.clear();
+      state.lastRemaining = null;
+    }
+
+    const { active, next } = viewerShiftStatus();
+    if (next) {
+      const secs = countdownTo(next.start);
+      if (secs != null) {
+        const warnKey = `${next.start}:warn`;
+        const nowKey = `${next.start}:now`;
+        if (secs <= SHIFT_WARN_SECS && secs > 30 && !state.firedShift.has(warnKey)) {
+          state.firedShift.add(warnKey);
+          fireAlarm("shift", `Your ${next.role} shift starts in ${Math.max(1, Math.round(secs / 60))}m — get ready.`);
+        }
+        if (secs <= 5 && !state.firedShift.has(nowKey)) {
+          state.firedShift.add(nowKey);
+          fireAlarm("shift", "Your shift is starting now.");
+        }
+      }
+    }
+    if (active) {
+      const liveKey = `${active.start}:live`;
+      if (!state.firedShift.has(liveKey)) {
+        state.firedShift.add(liveKey);
+        fireAlarm("shift", "You're on watch now — keep the chain alive.");
+      }
+      // Handoff: your shift is ending and the next slot isn't covered by someone online.
+      const handoff = handoffStatus();
+      if (handoff && (handoff.state === "gap" || handoff.state === "risk")) {
+        const handoffKey = `${active.start}:handoff`;
+        if (!state.firedShift.has(handoffKey)) {
+          state.firedShift.add(handoffKey);
+          fireAlarm("shift", handoff.state === "gap"
+            ? "No watcher scheduled after you — get the next slot covered!"
+            : `Next watcher (${handoff.name}) isn't online — ping them before you hand off.`);
+        }
+      }
+    }
+  }
+
+  // Drop-timer urgency: green while comfortable, amber approaching, red (pulsing) close.
+  function timerUrgencyClass(remaining) {
+    if (remaining <= 0) return "";
+    if (remaining <= 30) return "u-bad";
+    if (remaining <= 60) return "u-warn";
+    return "u-ok";
+  }
+
   function createShell() {
     if (!document.getElementById("tocw-style")) {
       const style = document.createElement("style");
@@ -633,8 +1533,11 @@
         left: 82px;
         bottom: 124px;
         width: 390px;
+        min-width: ${MIN_PANEL_W}px;
         max-height: min(680px, calc(100vh - 148px));
-        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
         z-index: 2147483646;
         background: #101923;
         color: #eaf3ff;
@@ -646,6 +1549,19 @@
         pointer-events: auto;
       }
       #tocw * { box-sizing: border-box; }
+      #tocw-resize {
+        position: absolute;
+        right: 1px;
+        bottom: 1px;
+        width: 18px;
+        height: 18px;
+        cursor: nwse-resize;
+        touch-action: none;
+        z-index: 3;
+        border-bottom-right-radius: 9px;
+        background: linear-gradient(135deg, transparent 46%, #46596f 46%, #46596f 56%, transparent 56%, transparent 68%, #46596f 68%, #46596f 78%, transparent 78%);
+      }
+      #tocw-resize:hover { background: linear-gradient(135deg, transparent 46%, #6f88a6 46%, #6f88a6 56%, transparent 56%, transparent 68%, #6f88a6 68%, #6f88a6 78%, transparent 78%); }
       #tocw button, #tocw-modal button {
         cursor: pointer;
         border: 1px solid #34465d;
@@ -658,7 +1574,7 @@
       #tocw button.primary, #tocw-modal button.primary { background: #ff3b45; border-color: #ff3b45; }
       #tocw button.small { padding: 4px 7px; font-size: 11px; }
       #tocw button:disabled { opacity: .55; cursor: wait; }
-      .tocw-head { padding: 14px 14px 10px; border-bottom: 1px solid #25384d; cursor: move; touch-action: none; user-select: none; }
+      .tocw-head { flex: 0 0 auto; padding: 14px 14px 10px; border-bottom: 1px solid #25384d; cursor: move; touch-action: none; user-select: none; }
       .tocw-head button { cursor: pointer; }
       .tocw-title { font-size: 19px; font-weight: 800; margin: 0 0 5px; }
       .tocw-muted { color: #9eb4ce; font-size: 12px; line-height: 1.35; }
@@ -667,13 +1583,24 @@
       .tocw-pill.ok { background: #103d2b; color: #d6ffe8; }
       .tocw-pill.warn { background: #67420c; color: #ffe1a7; }
       .tocw-pill.bad { background: #651922; color: #ffc6cc; }
-      .tocw-body { padding: 12px 14px 14px; display: grid; gap: 10px; }
+      .tocw-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 14px 14px; display: grid; gap: 10px; align-content: start; }
       .tocw-card { background: #0d141d; border: 1px solid #2b3d52; border-radius: 8px; padding: 10px; }
       .tocw-card-title { font-weight: 800; margin-bottom: 6px; }
       .tocw-big { font-size: 32px; font-weight: 900; letter-spacing: 0; line-height: 1; }
       .tocw-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      .tocw-row { display: grid; grid-template-columns: 92px 1fr auto; gap: 8px; align-items: center; padding: 7px 0; border-top: 1px solid #25384d; }
+      .tocw-row { display: grid; grid-template-columns: 108px 1fr; gap: 12px; align-items: start; padding: 10px 4px 10px 10px; border-top: 1px solid #25384d; border-radius: 6px; }
       .tocw-row:first-child { border-top: 0; }
+      /* Shift time: two non-breaking lines (TCT window, then local), tiny zone tags */
+      .tocw-when-tct { display: block; white-space: nowrap; font-weight: 700; color: #eaf3ff; font-size: 12.5px; }
+      .tocw-when-local { display: block; white-space: nowrap; font-size: 11px; color: #93a8c2; margin-top: 2px; }
+      .tocw-when-zone { font-weight: 400; font-size: 10px; color: #7385a0; }
+      /* Main + backup stack vertically, each its own clear line (role · who · action) */
+      .tocw-slots { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+      .tocw-slot { display: flex; align-items: center; gap: 8px; }
+      .tocw-slot__role { min-width: 52px; font-weight: 700; color: #9eb4ce; }
+      .tocw-slot--backup .tocw-slot__role { color: #7f93ad; }
+      .tocw-slot__who { flex: 1; min-width: 0; }
+      .tocw-slot__actions { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; flex-shrink: 0; }
       .tocw-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 5px; background: #789; }
       .tocw-dot.ok { background: #32d47b; }
       .tocw-dot.warn { background: #f2b13c; }
@@ -683,42 +1610,61 @@
       .tocw-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
       .tocw-progress { height: 8px; background: #0a1018; border-radius: 999px; overflow: hidden; border: 1px solid #28394d; margin-top: 6px; }
       .tocw-progress span { display: block; height: 100%; background: #35b76f; }
-      .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-      .tocw-table th, .tocw-table td { text-align: right; padding: 5px 4px; border-top: 1px solid #25384d; }
-      .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; }
-      #tocw.collapsed { width: 210px; max-height: none; overflow: visible; }
+      /* Drop-timer urgency */
+      .tocw-big.u-ok, .tocw-focus-timer.u-ok, .tocw-cstatus-timer.u-ok { color: #6ff0a8; }
+      .tocw-big.u-warn, .tocw-focus-timer.u-warn, .tocw-cstatus-timer.u-warn { color: #ffcf6b; }
+      .tocw-big.u-bad, .tocw-focus-timer.u-bad, .tocw-cstatus-timer.u-bad { color: #ff6d76; animation: tocw-pulse .9s ease-in-out infinite; }
+      @keyframes tocw-pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+      /* Focus (on-watch) mode + HIT button */
+      .tocw-focus { text-align: center; padding: 6px 0 2px; }
+      .tocw-focus-timer { font-size: 58px; font-weight: 900; line-height: 1; letter-spacing: -1px; }
+      .tocw-focus-sub { font-size: 15px; margin-top: 4px; }
+      .tocw-hit { display: block; width: 100%; text-align: center; text-decoration: none; padding: 12px; border-radius: 9px; font-weight: 900; font-size: 15px; background: #243447; color: #eaf3ff; border: 1px solid #3a5573; }
+      .tocw-hit--setup { background: transparent; border-style: dashed; color: #cfe0f7; font-weight: 700; font-size: 13px; cursor: pointer; }
+      .tocw-hit-sub { display: block; font-size: 11px; font-weight: 700; opacity: .85; margin-top: 2px; }
+      .tocw-hit.urgent { background: #ff3b45; border-color: #ff6870; color: #fff; animation: tocw-pulse .8s ease-in-out infinite; }
+      #tocw-focus.on { background: #234; border-color: #46617f; }
+      /* Alarm flash on the whole panel */
+      @keyframes tocw-flashbad { 30% { box-shadow: 0 0 0 4px rgba(255,60,72,.9), 0 0 34px rgba(255,60,72,.75); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
+      @keyframes tocw-flashwarn { 30% { box-shadow: 0 0 0 4px rgba(255,190,80,.85), 0 0 30px rgba(255,190,80,.6); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
+      @keyframes tocw-flashgood { 30% { box-shadow: 0 0 0 4px rgba(53,183,111,.9), 0 0 34px rgba(53,183,111,.7); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
+      #tocw.tocw-flash-bad { animation: tocw-flashbad 1.4s ease-out; }
+      #tocw.tocw-flash-warn { animation: tocw-flashwarn 1.4s ease-out; }
+      #tocw.tocw-flash-good { animation: tocw-flashgood 1.4s ease-out; }
+      /* Active / your shift row highlight */
+      .tocw-row.active { background: #12233a; box-shadow: inset 3px 0 0 #35b76f; }
+      .tocw-row.mine { box-shadow: inset 3px 0 0 #ff9f43; }
+      .tocw-row.active.mine { background: #1a2740; box-shadow: inset 3px 0 0 #ffce54; }
+      .tocw-you { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 10px; font-weight: 800; background: #ff9f43; color: #201200; vertical-align: middle; }
+      /* Watcher status banner + alarm button */
+      .tocw-watch-banner { padding: 9px 10px; border-radius: 8px; font-weight: 800; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+      .tocw-watch-banner.on { background: #103d2b; color: #d6ffe8; border: 1px solid #2f7d55; }
+      .tocw-watch-banner.soon { background: #1d344f; color: #d9ebff; border: 1px solid #34506f; }
+      .tocw-watch-banner .tocw-shift-time { font-size: 17px; font-weight: 900; }
+      #tocw-alarm.on { background: #ff3b45; border-color: #ff6870; color: #fff; }
+      /* Wide content (the leaderboard table) scrolls inside its own box, never the panel */
+      .tocw-scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      /* Explicit colors so torn.com's own table styles can't bleed in (was black text) */
+      .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; color: #eaf3ff; background: transparent; }
+      .tocw-table th, .tocw-table td { text-align: right; padding: 5px 6px; border-top: 1px solid #25384d; white-space: nowrap; color: #eaf3ff; background: transparent; }
+      .tocw-table th { color: #9eb4ce; font-weight: 700; }
+      .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; position: sticky; left: 0; background: #0d141d; }
+      /* Compact drop-timer status shown only when minimized (hidden when expanded) */
+      .tocw-cstatus { display: none; margin-top: 1px; white-space: nowrap; }
+      .tocw-cstatus-timer { font-weight: 900; font-size: 21px; line-height: 1; }
+      #tocw.collapsed { width: 240px; min-width: 0; height: auto; max-height: none; overflow: visible; }
       #tocw.collapsed .tocw-head { padding: 10px; border-bottom: 0; }
       #tocw.collapsed .tocw-pills { margin-bottom: 6px; }
       #tocw.collapsed .tocw-pills .tocw-pill:nth-child(n+2) { display: none; }
-      #tocw.collapsed .tocw-title { font-size: 16px; margin-bottom: 2px; }
-      #tocw.collapsed .tocw-muted { max-width: 126px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      #tocw.collapsed #tocw-collapse { padding: 5px 8px; font-size: 12px; }
+      #tocw.collapsed .tocw-title, #tocw.collapsed .tocw-subtitle { display: none; }
+      #tocw.collapsed .tocw-cstatus { display: block; }
+      #tocw.collapsed #tocw-focus { display: none; }
+      #tocw.collapsed #tocw-collapse, #tocw.collapsed #tocw-hide, #tocw.collapsed #tocw-alarm { padding: 5px 8px; font-size: 12px; }
       #tocw.collapsed .tocw-body { display: none; }
-      #tocw-backdrop {
-        position: fixed;
-        inset: 0;
-        z-index: 1000000;
-        background: rgba(0,0,0,.55);
-      }
-      #tocw-modal {
-        position: fixed;
-        top: 70px;
-        left: 50%;
-        transform: translateX(-50%);
-        width: min(660px, calc(100vw - 24px));
-        max-height: calc(100vh - 100px);
-        overflow: auto;
-        z-index: 1000001;
-        background: #101923;
-        color: #eaf3ff;
-        border: 1px solid #33465e;
-        border-radius: 10px;
-        box-shadow: 0 14px 34px rgba(0,0,0,.42);
-        font-family: Arial, sans-serif;
-        padding: 16px;
-      }
-      #tocw-modal label { display: grid; gap: 5px; margin-bottom: 10px; color: #cfe0f7; font-size: 12px; font-weight: 700; }
-      #tocw-modal input {
+      #tocw.collapsed #tocw-resize { display: none; }
+      /* In-panel settings view (was a modal — now inherits the panel's z-index + drag) */
+      .tocw-settings label { display: grid; gap: 5px; margin-bottom: 10px; color: #cfe0f7; font-size: 12px; font-weight: 700; }
+      .tocw-settings input, .tocw-settings select, .tocw-settings textarea {
         width: 100%;
         padding: 9px 10px;
         border-radius: 7px;
@@ -726,11 +1672,20 @@
         background: #0b1119;
         color: #f8fbff;
       }
-      #tocw-modal .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-      #tocw-modal .tocw-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+      .tocw-settings textarea { font-family: inherit; font-size: 13px; resize: vertical; }
+      .tocw-settings input[type="range"] { padding: 0; }
+      .tocw-settings input[type="checkbox"] { width: auto; }
+      .tocw-settings .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .tocw-settings .tocw-check { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-weight: 700; color: #cfe0f7; font-size: 13px; }
+      .tocw-settings .tocw-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 14px; }
       @media (max-width: 760px) {
-        #tocw { left: 8px; right: 8px; top: auto; bottom: 8px; width: auto; max-height: 68vh; }
-        #tocw-modal .grid { grid-template-columns: 1fr; }
+        #tocw { left: 8px; right: 8px; top: auto; bottom: 8px; width: auto; max-height: 80vh; font-size: 14px; }
+        #tocw .tocw-body { padding: 12px 12px 16px; gap: 12px; }
+        #tocw button.small { padding: 8px 11px; font-size: 13px; }
+        #tocw .tocw-actions button { padding: 11px 9px; }
+        .tocw-settings .grid { grid-template-columns: 1fr; }
+        .tocw-big { font-size: 30px; }
+        .tocw-focus-timer { font-size: 64px; }
       }
     `;
       document.head.appendChild(style);
@@ -783,11 +1738,79 @@
     });
   }
 
+  // Bottom-right grip: drag to resize the panel (touch-friendly for PDA). The
+  // top-left is pinned so it grows toward the corner; the chosen size persists.
+  function bindResize(box) {
+    const grip = document.getElementById("tocw-resize");
+    if (!grip || grip.dataset.bound === "1") return;
+    grip.dataset.bound = "1";
+    grip.addEventListener("pointerdown", (event) => {
+      if (event.button != null && event.button !== 0) return;
+      const rect = box.getBoundingClientRect();
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startW = rect.width;
+      const startH = rect.height;
+      // Anchor the top-left corner so only width/height change under the grip.
+      box.style.left = `${rect.left}px`;
+      box.style.top = `${rect.top}px`;
+      box.style.right = "auto";
+      box.style.bottom = "auto";
+      box.style.maxHeight = "none";
+      grip.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+      event.stopPropagation();
+
+      const move = (moveEvent) => {
+        const next = clampSize(startW + (moveEvent.clientX - startX), startH + (moveEvent.clientY - startY));
+        box.style.width = `${next.width}px`;
+        box.style.height = `${next.height}px`;
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        savePanelSize(box);
+        savePanelPosition(box);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointercancel", up, { once: true });
+    });
+  }
+
+  let lastRenderView = null;
   function render() {
     createShell();
     const box = document.getElementById("tocw");
     if (!box) return;
+    // Fully hidden: leave only the floating "TO" launcher (tap it to bring the
+    // panel back). Cheap early-out so the 1s render tick does no work while hidden.
+    const launcher = document.getElementById("tocw-launcher");
+    if (state.hidden) {
+      box.style.display = "none";
+      if (launcher) launcher.style.display = "";
+      return;
+    }
+    box.style.display = "";
+    if (launcher) launcher.style.display = "none";
     box.classList.toggle("collapsed", state.collapsed);
+    // Collapsed uses the compact auto size; otherwise honor a saved resize.
+    if (state.collapsed) {
+      box.style.width = "";
+      box.style.height = "";
+      box.style.maxHeight = "";
+    } else {
+      applyPanelSize(box);
+    }
+
+    // Preserve the body's scroll position across the full innerHTML rebuild — otherwise
+    // every poll (and any re-render) snaps the user back to the top mid-read. But when
+    // the VIEW changes (main ↔ focus ↔ settings) start that view at the top instead.
+    const viewKind = state.settingsOpen ? "settings" : state.focus ? "focus" : "main";
+    const prevBody = box.querySelector(".tocw-body");
+    const savedScroll = prevBody && viewKind === lastRenderView ? prevBody.scrollTop : 0;
+    lastRenderView = viewKind;
 
     const cfg = settings();
     const event = state.watch?.event || state.signup?.event || null;
@@ -816,59 +1839,119 @@
       <div class="tocw-head" id="tocw-drag-handle" title="Drag to move Chain Watch">
         <div class="tocw-pills">
           <span class="tocw-pill ${live ? "ok" : "warn"}">${live ? "LIVE" : "SCHEDULED"}</span>
-          <span class="tocw-pill">SITE SYNC</span>
+          ${state.liveSource === "torn"
+            ? `<span class="tocw-pill ok" title="Chain data is pulled straight from Torn — no backend lag">TORN LIVE</span>`
+            : state.liveSource === "cache"
+              ? `<span class="tocw-pill warn" title="Falling back to the Overseer cache (add a Torn API key with faction access for zero-lag data)">CACHED</span>`
+              : `<span class="tocw-pill">SITE SYNC</span>`}
           <span class="tocw-pill">READ-ONLY</span>
         </div>
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
-          <div>
+          <div style="min-width:0;">
             <div class="tocw-title">Chain Watch</div>
-            <div class="tocw-muted">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
+            <div class="tocw-muted tocw-subtitle">v${VERSION} - ${event ? escapeHtml(event.title) : "No chain scheduled"}</div>
+            <div class="tocw-cstatus">${live
+              ? `<span class="tocw-cstatus-timer ${timerUrgencyClass(remaining)}" id="tocw-ctimer">${duration(remaining)}</span> <span class="tocw-muted">· ${chain.current} hit${chain.current === 1 ? "" : "s"}</span>`
+              : event
+                ? `<span class="tocw-muted">Starts in ${duration(scheduledSeconds)}</span>`
+                : `<span class="tocw-muted">No chain scheduled</span>`}</div>
           </div>
-          <button id="tocw-collapse">${state.collapsed ? "Open" : "Hide"}</button>
+          <div style="display:flex;gap:6px;align-items:flex-start;flex-shrink:0;">
+            <button id="tocw-focus" class="small ${state.focus ? "on" : ""}" title="${state.focus ? "Exit focus (full panel)" : "Focus mode — giant timer only"}" aria-label="Toggle focus mode">⛶</button>
+            <button id="tocw-alarm" class="small ${state.alarm ? "on" : ""}" title="${state.alarm ? "Watcher alarms ON — click to mute" : "Turn on watcher alarms (drop timer + your shift)"}" aria-label="Toggle alarms">${state.alarm ? "🔔" : "🔕"}</button>
+            <button id="tocw-collapse" class="small" title="${state.collapsed ? "Expand the panel" : "Minimize to the header"}">${state.collapsed ? "Open" : "Min"}</button>
+            <button id="tocw-hide" class="small" title="Hide — reopen with the TO button" aria-label="Hide panel">✕</button>
+          </div>
         </div>
       </div>
       <div class="tocw-body">
         ${state.error ? `<div class="tocw-alert bad">${escapeHtml(state.error)}</div>` : ""}
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
+        ${state.settingsOpen ? renderSettingsBody() : state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : `
         ${versionAlert}
         ${mode === "token"
-          ? `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""}. Anyone can view; signing up verifies you with your Torn key.</div>`
+          ? (state.signup?.needs_verification
+              ? `<div class="tocw-alert">This chain sheet is faction-only. Add your Torn API key in Settings to verify and view it.</div>`
+              : `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""} — verified with your key.</div>`)
           : mode === "none"
-            ? `<div class="tocw-alert">Open a chain-watch signup link, or add your Torn API key and connect the site session in Settings.</div>`
+            ? `<div class="tocw-alert">Add your Torn API key in Settings and connect the site session — or paste a chain-watch signup link there.</div>`
             : !cfg.sessionToken
               ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
               : ""}
+        ${renderAccessHint()}
+        ${renderChainSummary()}
+        ${renderWatchBanner()}
+        ${renderCoverage()}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
         ${renderShifts()}
+        ${renderAbsence()}
         <div class="tocw-actions">
           <button id="tocw-refresh" class="primary" ${state.loading ? "disabled" : ""}>${state.loading ? "Loading" : "Refresh"}</button>
           <button id="tocw-copy">Copy</button>
           <button id="tocw-settings">Settings</button>
         </div>
         <div class="tocw-muted" style="text-align:center;">No auto attacks</div>
+        `}
       </div>
+      <div id="tocw-resize" title="Drag to resize"></div>
     `;
 
+    // Restore the pre-rebuild scroll position (content height is stable poll-to-poll).
+    if (savedScroll > 0) {
+      const newBody = box.querySelector(".tocw-body");
+      if (newBody) newBody.scrollTop = savedScroll;
+    }
+
+    document.getElementById("tocw-focus")?.addEventListener("click", () => {
+      state.focus = !state.focus;
+      gmSet(STORE.focus, state.focus);
+      render();
+    });
+    document.getElementById("tocw-alarm")?.addEventListener("click", () => {
+      state.alarm = !state.alarm;
+      gmSet(STORE.alarm, state.alarm);
+      if (state.alarm) {
+        primeAudio(); // this click is the user gesture that unlocks audio
+        if (state.alarmSound) beep(1);
+        state.notice = "Watcher alarms on — you'll be alerted near the drop and at your shift.";
+      } else {
+        state.notice = "Watcher alarms muted.";
+      }
+      render();
+    });
     document.getElementById("tocw-collapse")?.addEventListener("click", () => {
       state.collapsed = !state.collapsed;
       gmSet(STORE.collapsed, state.collapsed);
       render();
     });
+    document.getElementById("tocw-hide")?.addEventListener("click", () => {
+      state.hidden = true;
+      gmSet(STORE.hidden, true);
+      render();
+    });
     document.getElementById("tocw-refresh")?.addEventListener("click", () => void refreshAll(true));
     document.getElementById("tocw-copy")?.addEventListener("click", () => void copySummary());
+    document.getElementById("tocw-summary-dismiss")?.addEventListener("click", () => {
+      state.chainSummary = null;
+      render();
+    });
     document.getElementById("tocw-settings")?.addEventListener("click", () => {
       state.settingsOpen = true;
-      renderSettings();
+      render();
     });
+    document.getElementById("tocw-hit-setup")?.addEventListener("click", () => {
+      state.settingsOpen = true;
+      render();
+    });
+    document.getElementById("tocw-hit-next")?.addEventListener("click", () => hitNextTarget());
+    document.getElementById("tocw-absence-out")?.addEventListener("click", () => void reportOut());
+    document.getElementById("tocw-absence-in")?.addEventListener("click", () => void reportIn());
     for (const btn of box.querySelectorAll("[data-tocw-action]")) {
       btn.addEventListener("click", () => void handleAction(btn));
     }
     bindDrag(box);
-    if (state.settingsOpen) {
-      if (!document.getElementById("tocw-modal")) renderSettings();
-    } else {
-      closeSettings();
-    }
+    bindResize(box);
+    if (state.settingsOpen) wireSettings();
   }
 
   function renderScheduled(event, seconds) {
@@ -876,7 +1959,7 @@
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">${event ? "Next scheduled chain" : "No scheduled chain"}</div>
-        <div class="tocw-big">${event ? `Starts in ${duration(seconds)}` : "--"}</div>
+        <div class="tocw-big" id="tocw-timer">${event ? `Starts in ${duration(seconds)}` : "--"}</div>
         <div class="tocw-muted">${event ? `${escapeHtml(event.title)} - ${tctTime(event.starts_at, true)}` : "Ask a chain-watch manager to schedule one."}</div>
         ${event && event.status === "draft" && canManage
           ? `<div class="tocw-muted" style="margin-top:6px;">Draft — <a href="https://${OVERSEER_HOST}/faction/chains" target="_blank" rel="noreferrer noopener">publish it &amp; mint the signup link on the site ↗</a></div>`
@@ -886,24 +1969,277 @@
     `;
   }
 
+  // Personal watcher banner: "you're on watch now — ends in X" or "your shift starts
+  // in X". Shown above the chain HUD in every mode so a watcher always knows their
+  // status at a glance. The countdown element is updated in place each second by tick().
+  function renderWatchBanner() {
+    const { active, next } = viewerShiftStatus();
+    if (active) {
+      const ends = Math.max(0, Math.floor((new Date(active.end).getTime() - Date.now()) / 1000));
+      return `<div class="tocw-watch-banner on">
+        <span>🟢 You're on watch now${active.role === "backup" ? " (backup)" : ""}</span>
+        <span>ends in <span class="tocw-shift-time" id="tocw-shift-timer">${duration(ends)}</span></span>
+      </div>`;
+    }
+    if (next) {
+      return `<div class="tocw-watch-banner soon">
+        <span>⏰ Your ${next.role === "backup" ? "backup " : ""}shift</span>
+        <span>starts in <span class="tocw-shift-time" id="tocw-shift-timer">${duration(countdownTo(next.start))}</span></span>
+      </div>`;
+    }
+    return "";
+  }
+
+  // ---- Whole-chain "I'm out" opt-out (mode-aware) -----------------------------
+  // A verified member can flag they can't make THIS chain, with an optional reason.
+  // Session mode writes chain-watch report_absence; token mode writes the same absence
+  // through the public signup endpoint (session-verified). Leadership sees it WITH the
+  // reason on the Faction -> Chains tab; here we surface only who's out (names).
+  function myAbsenceInfo() {
+    if (panelMode() === "token") {
+      const my = state.signup?.my_absence;
+      return { out: Boolean(my), reason: my?.reason ?? null };
+    }
+    const vid = viewerId();
+    const rows = Array.isArray(state.watch?.absences) ? state.watch.absences : [];
+    const mine = vid != null ? rows.find((a) => Number(a.player_id) === vid && !a.cleared_at) : null;
+    return { out: Boolean(mine), reason: mine?.reason ?? null };
+  }
+
+  function absentNames() {
+    if (panelMode() === "token") return (state.signup?.absent || []).map((a) => a.name);
+    const rows = Array.isArray(state.watch?.absences) ? state.watch.absences : [];
+    return rows.filter((a) => !a.cleared_at).map((a) => a.player_name);
+  }
+
+  function renderAbsence() {
+    const mode = panelMode();
+    if (mode === "none") return "";
+    if (mode === "token" && state.signup?.needs_verification) return "";
+    const event = state.watch?.event || state.signup?.event || null;
+    if (!event) return "";
+    const readOnly = mode === "token" ? Boolean(event.read_only) : watchEventReadOnly(event);
+    if (readOnly) return "";
+    const { out, reason } = myAbsenceInfo();
+    const others = absentNames();
+    const othersLine = others.length
+      ? `<div class="tocw-muted" style="margin-top:6px;">Out this chain (${others.length}): ${escapeHtml(others.join(", "))}</div>`
+      : "";
+    const control = out
+      ? `<div class="tocw-watch-banner soon"><span>🚫 You're out for this chain${reason ? ` — "${escapeHtml(reason)}"` : ""}</span><button class="small" id="tocw-absence-in">I'm back in</button></div>`
+      : `<div style="margin-top:8px;"><button class="small" id="tocw-absence-out">I can't make this chain</button></div>`;
+    return `${control}${othersLine}`;
+  }
+
+  async function reportOut() {
+    const raw = prompt("Can't make this chain? Add a reason for leadership (optional):");
+    if (raw === null) return; // cancelled
+    try {
+      const reason = raw.trim();
+      if (panelMode() === "token") {
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("report_absence", { reason }, session);
+      } else {
+        state.watch = await callFunction("chain-watch", { action: "report_absence", reason });
+      }
+      state.error = null;
+      state.notice = "You're marked out for this chain — leadership can see it.";
+      render();
+    } catch (e) {
+      state.error = e.message || "Couldn't update your status.";
+      render();
+    }
+  }
+
+  async function reportIn() {
+    try {
+      if (panelMode() === "token") {
+        const session = await ensureVerifiedSession();
+        state.signup = await callSignup("clear_absence", {}, session);
+      } else {
+        state.watch = await callFunction("chain-watch", { action: "clear_absence" });
+      }
+      state.error = null;
+      state.notice = "You're back in for this chain.";
+      render();
+    } catch (e) {
+      state.error = e.message || "Couldn't update your status.";
+      render();
+    }
+  }
+
+  // Upcoming shifts (current + future) with NO main watcher assigned — the gaps that
+  // silently drop a chain. Works across the session and token payload shapes.
+  function coverageGaps() {
+    const now = Date.now();
+    const out = [];
+    if (Array.isArray(state.watch?.shifts)) {
+      for (const s of state.watch.shifts) {
+        if (new Date(s.shift_end).getTime() > now && s.watcher_id == null) out.push(s.shift_start);
+      }
+    } else if (Array.isArray(state.signup?.shifts)) {
+      for (const s of state.signup.shifts) {
+        if (new Date(s.shift_end).getTime() > now && !s.main?.filled) out.push(s.shift_start);
+      }
+    }
+    return out;
+  }
+
+  function renderCoverage() {
+    const gaps = coverageGaps();
+    if (!gaps.length) return "";
+    const shown = gaps.slice(0, 4).map((iso) => tctTime(iso).replace(" TCT", "")).join(", ");
+    const more = gaps.length > 4 ? ` +${gaps.length - 4}` : "";
+    return `<div class="tocw-alert bad">⚠️ ${gaps.length} unmanned shift${gaps.length > 1 ? "s" : ""} ahead — ${shown}${more} TCT. Fill the gaps or the chain can drop.</div>`;
+  }
+
+  // Post-chain recap, shown once a chain ends (until dismissed or the next one starts).
+  function renderChainSummary() {
+    const s = state.chainSummary;
+    if (!s || state.chain?.active) return "";
+    return `
+      <div class="tocw-card" style="border-color:#2f7d55;">
+        <div class="tocw-card-title">🎉 Chain ended</div>
+        <div><strong>${s.totalHits.toLocaleString()}</strong> hits${s.yourHits ? ` · You: <strong>${s.yourHits.toLocaleString()}</strong> hits, ${Math.round(s.yourRespect).toLocaleString()} respect` : ""}</div>
+        <button class="small" id="tocw-summary-dismiss" style="margin-top:8px;">Dismiss</button>
+      </div>
+    `;
+  }
+
+  // Recent hit pace (your rate, the faction's total rate, and the per-hitter average),
+  // computed from the direct-Torn attack sample. Reworded per feedback: it never implies
+  // an individual "bonus ETA" — the bonus is a faction milestone, shown separately.
+  function renderHitPace(attacks) {
+    const p = attacks?.pace;
+    if (!p) return "";
+    const fmt = (n) => (n == null ? "—" : n.toFixed(1));
+    const you = p.you != null ? `You <strong>${fmt(p.you)}</strong>/min` : "";
+    return `
+      <div class="tocw-card">
+        <div class="tocw-card-title">Hit pace <span class="tocw-muted">(recent)</span></div>
+        ${you ? `<div style="font-size:15px;">${you}</div>` : ""}
+        <div class="tocw-muted">Faction ${fmt(p.faction)}/min total · avg ${fmt(p.avg)}/min across ${p.hitters} hitter${p.hitters === 1 ? "" : "s"}</div>
+      </div>
+    `;
+  }
+
+  // When we hold a key but the direct chain read keeps failing (stuck on CACHED), the
+  // most likely cause is the key lacking faction API access — say so, don't stay silent.
+  function renderAccessHint() {
+    if (settings().tornKey && state.tornFailCount >= 3 && state.liveSource !== "torn") {
+      return `<div class="tocw-alert">Your Torn key isn't returning live chain data — it likely needs <strong>faction API access</strong>. Ask leadership to enable it for you to get zero-lag hits.</div>`;
+    }
+    return "";
+  }
+
+  // The HIT button cycles YOUR target list (player ids you set in Settings): each click
+  // opens the next target's attack page and advances the loop. Turns big + red near the
+  // drop. Falls back to a legacy target URL, or a "set your list" prompt when nothing's set.
+  function renderHitButton(remaining) {
+    const urgent = Boolean(state.chain?.active) && remaining > 0 && remaining <= 60;
+    const ids = state.targetIds;
+    if (ids.length > 0) {
+      const idx = state.targetIndex % ids.length;
+      const id = ids[idx];
+      const pos = ids.length > 1 ? ` · ${idx + 1}/${ids.length}` : "";
+      return `<button id="tocw-hit-next" type="button" class="tocw-hit${urgent ? " urgent" : ""}">${urgent ? "⚔️ HIT NOW" : "⚔️ Hit next"}<span class="tocw-hit-sub">→ target ${id}${pos}</span></button>`;
+    }
+    const url = effHitUrl();
+    if (url) {
+      return `<a id="tocw-hit" class="tocw-hit${urgent ? " urgent" : ""}" href="${escapeHtml(url)}" target="_self" rel="noreferrer noopener">${urgent ? "⚔️ HIT NOW" : "⚔️ Go hit"}</a>`;
+    }
+    return `<button id="tocw-hit-setup" type="button" class="tocw-hit tocw-hit--setup">⚙️ Set your target list</button>`;
+  }
+
+  // Open the current target's attack page and advance the loop (persisted, so the next
+  // click — even after the page reloads on the attack screen — goes to the next one).
+  function hitNextTarget() {
+    const ids = state.targetIds;
+    if (!ids.length) return;
+    const idx = state.targetIndex % ids.length;
+    const id = ids[idx];
+    state.targetIndex = (idx + 1) % ids.length;
+    gmSet(STORE.targetIndex, state.targetIndex);
+    window.location.href = `https://www.torn.com/loader.php?sid=attack&user2ID=${id}`;
+  }
+
+  // Compact "on watch" view: a giant drop timer, hits, your pace, the HIT button, and
+  // the handoff/your-shift banners — nothing else. For glance-and-hit during a shift.
+  function renderFocus(chain, remaining, live, event, scheduledSeconds) {
+    const cur = chain?.current || 0;
+    const you = state.attacks?.pace?.you;
+    const timerText = live ? duration(remaining) : (event ? `Starts in ${duration(scheduledSeconds)}` : "--");
+    const label = live ? "Drop timer" : (event ? "Next chain" : "No chain scheduled");
+    return `
+      ${renderWatchBanner()}
+      ${renderHandoff()}
+      <div class="tocw-focus">
+        <div class="tocw-muted">${label}</div>
+        <div class="tocw-focus-timer ${live ? timerUrgencyClass(remaining) : ""}" id="tocw-timer">${timerText}</div>
+        ${live ? `<div class="tocw-focus-sub">Hits <strong>${cur}</strong>${you != null ? ` · You <strong>${you.toFixed(1)}</strong>/min` : ""}</div>` : ""}
+      </div>
+      ${renderHitButton(remaining)}
+      <div class="tocw-actions" style="grid-template-columns:1fr 1fr;">
+        <button id="tocw-refresh" class="primary" ${state.loading ? "disabled" : ""}>${state.loading ? "…" : "Refresh"}</button>
+        <button id="tocw-settings">Settings</button>
+      </div>
+    `;
+  }
+
+  // Optional personal chain goal: progress + an ETA off the faction's recent pace. This
+  // is a FACTION-total ETA (the whole chain reaching N), never a personal-bonus claim.
+  function renderGoal(chain, attacks) {
+    const goal = effGoal();
+    if (!goal || !chain?.active) return "";
+    const cur = chain.current || 0;
+    const toGo = goal - cur;
+    const eta = etaText(toGo, attacks?.pace?.faction);
+    const pct = Math.max(0, Math.min(100, Math.round((cur / goal) * 100)));
+    return `
+      <div class="tocw-card">
+        <div class="tocw-card-title">Goal ${goal.toLocaleString()}</div>
+        <div>${cur.toLocaleString()} / ${goal.toLocaleString()}${toGo > 0 ? ` · ${toGo.toLocaleString()} to go${eta ? ` (${eta})` : ""}` : " ✅ reached"}</div>
+        <div class="tocw-progress"><span style="width:${pct}%"></span></div>
+      </div>
+    `;
+  }
+
+  // Handoff readiness alert for the shift that's ending soon (see handoffStatus).
+  function renderHandoff() {
+    const h = handoffStatus();
+    if (!h) return "";
+    if (h.state === "gap") {
+      return `<div class="tocw-alert bad">🚨 Handoff gap — no watcher after this shift (ends in ${duration(h.endsIn)}). Get it covered.</div>`;
+    }
+    if (h.state === "risk") {
+      return `<div class="tocw-alert bad">🚨 Next watcher ${escapeHtml(h.name || "")} is ${escapeHtml(h.online || "not online")} — ping them (handoff in ${duration(h.endsIn)}).</div>`;
+    }
+    return `<div class="tocw-watch-banner on">✅ Handoff ready — ${escapeHtml(h.name || "")} is online (in ${duration(h.endsIn)})</div>`;
+  }
+
   function renderLive(chain, remaining, bonus, bonusPct, current, next) {
     const attacks = state.attacks || { leaderboard: [], last: null, error: null };
     const currentOffline = current?.watcher_id && current.watcher_online_status !== "Online";
-    const nextIdle = next?.watcher_id && next.watcher_online_status !== "Online";
+    const facPace = attacks?.pace?.faction;
+    const bonusEta = bonus ? etaText(bonus.toGo, facPace) : "";
     return `
       <div class="tocw-card">
         <div class="tocw-grid">
           <div>
             <div class="tocw-muted">Drop timer</div>
-            <div class="tocw-big">${duration(remaining)}</div>
+            <div class="tocw-big ${timerUrgencyClass(remaining)}" id="tocw-timer">${duration(remaining)}</div>
           </div>
           <div>
             <div class="tocw-muted">Hits</div>
             <div class="tocw-big">${chain.current}</div>
           </div>
         </div>
-        ${bonus ? `<div class="tocw-muted" style="margin-top:8px;">Next bonus: ${bonus.toGo} to ${bonus.target}</div><div class="tocw-progress"><span style="width:${bonusPct}%"></span></div>` : ""}
+        ${bonus ? `<div class="tocw-muted" style="margin-top:8px;">Next bonus: ${bonus.toGo} to ${bonus.target}${bonusEta ? ` (${bonusEta})` : ""}</div><div class="tocw-progress"><span style="width:${bonusPct}%"></span></div>` : ""}
       </div>
+      ${renderHitButton(remaining)}
+      ${renderGoal(chain, attacks)}
+      ${renderHitPace(attacks)}
+      ${renderHandoff()}
       <div class="tocw-card">
         <div class="tocw-card-title">Current watcher</div>
         ${renderWatcherLine(current, "No watcher assigned")}
@@ -915,7 +2251,6 @@
         <div class="tocw-muted">${next ? `Starts ${tctTime(next.shift_start)}` : ""}</div>
       </div>
       ${currentOffline ? `<div class="tocw-alert bad">Current watcher is not online.</div>` : ""}
-      ${nextIdle ? `<div class="tocw-alert">Next watcher is ${escapeHtml(next.watcher_online_status || "not online")}.</div>` : ""}
       <div class="tocw-card">
         <div class="tocw-card-title">Last attack</div>
         ${attacks.last ? `<div>${escapeHtml(attacks.last.attackerName)} vs ${escapeHtml(attacks.last.defenderName)} - ${duration(Math.floor(Date.now() / 1000 - attacks.last.timestamp))} ago</div>` : `<div class="tocw-muted">${escapeHtml(attacks.error || "Attack log unavailable.")}</div>`}
@@ -924,10 +2259,24 @@
     `;
   }
 
+  // Resolve a player id to a real name using the roster the payload already sends
+  // (signup.roster in token mode; watch.roster for managers). This upgrades a slot
+  // stored as a bare "ID <n>" client-side, so names read right even before the backend
+  // re-resolution deploys. Falls back to the stored name / id when the roster can't help.
+  function rosterName(id, fallback) {
+    const nid = Number(id);
+    if (!Number.isFinite(nid) || nid <= 0) return fallback;
+    const roster = state.signup?.roster || state.watch?.roster || [];
+    const member = roster.find((r) => Number(r.id) === nid);
+    const name = member && typeof member.name === "string" ? member.name.trim() : "";
+    return name && !/^ID \d+$/.test(name) ? name : fallback;
+  }
+
   function renderWatcherLine(shift, fallback) {
     if (!shift?.watcher_id) return `<div class="tocw-muted">${escapeHtml(fallback)}</div>`;
     const tone = statusClass(shift.watcher_online_status);
-    return `<div><span class="tocw-dot ${tone}"></span><strong>${escapeHtml(shift.watcher_name || `ID ${shift.watcher_id}`)}</strong> <span class="tocw-muted">${escapeHtml(shift.watcher_online_status || "Unknown")}</span></div>`;
+    const name = rosterName(shift.watcher_id, shift.watcher_name || `ID ${shift.watcher_id}`);
+    return `<div><span class="tocw-dot ${tone}"></span><strong>${escapeHtml(name)}</strong> <span class="tocw-muted">${escapeHtml(shift.watcher_online_status || "Unknown")}</span></div>`;
   }
 
   function renderLeaderboard(attacks) {
@@ -936,12 +2285,14 @@
       <div class="tocw-card">
         <div class="tocw-card-title">Leaderboard</div>
         ${rows.length ? `
-          <table class="tocw-table">
-            <thead><tr><th>Member</th><th>Hits</th><th>Total respect</th><th>Avg</th></tr></thead>
-            <tbody>
-              ${rows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${r.hits}</td><td>${r.respect.toFixed(1)}</td><td>${r.avg.toFixed(2)}</td></tr>`).join("")}
-            </tbody>
-          </table>
+          <div class="tocw-scroll-x">
+            <table class="tocw-table">
+              <thead><tr><th>Member</th><th>Hits</th><th>Respect</th><th>Avg</th></tr></thead>
+              <tbody>
+                ${rows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${r.hits}</td><td>${r.respect.toFixed(1)}</td><td>${r.avg.toFixed(2)}</td></tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
         ` : `<div class="tocw-muted">${escapeHtml(attacks?.error || "No leaderboard data yet.")}</div>`}
       </div>
     `;
@@ -973,11 +2324,17 @@
   }
 
   function renderShiftRow(shift, viewer, readOnly) {
+    const now = Date.now();
+    const active = new Date(shift.shift_start).getTime() <= now && new Date(shift.shift_end).getTime() > now;
+    const vid = viewer.player_id != null ? Number(viewer.player_id) : null;
+    const mine = vid != null && (Number(shift.watcher_id) === vid || Number(shift.backup_watcher_id) === vid);
     return `
-      <div class="tocw-row">
-        <div class="tocw-muted">${shiftLabel(shift)}</div>
-        ${renderSlot(shift, "main", viewer, readOnly)}
-        ${renderSlot(shift, "backup", viewer, readOnly)}
+      <div class="tocw-row${active ? " active" : ""}${mine ? " mine" : ""}">
+        <div class="tocw-muted">${shiftLabel(shift)}${mine ? `<span class="tocw-you">YOU</span>` : ""}</div>
+        <div class="tocw-slots">
+          ${renderSlot(shift, "main", viewer, readOnly)}
+          ${renderSlot(shift, "backup", viewer, readOnly)}
+        </div>
       </div>
     `;
   }
@@ -1015,16 +2372,16 @@
     }
 
     const who = assigned
-      ? `<span class="tocw-dot ${statusClass(onlineStatus)}"></span>${escapeHtml(watcherName || `ID ${watcherId}`)} <span class="tocw-muted">${escapeHtml(onlineStatus || "")}</span>`
+      ? `<span class="tocw-dot ${statusClass(onlineStatus)}"></span>${escapeHtml(rosterName(watcherId, watcherName || `ID ${watcherId}`))} <span class="tocw-muted">${escapeHtml(onlineStatus || "")}</span>`
       : locked
         ? `<span class="tocw-muted">Locked</span>`
         : `<span class="tocw-muted">Open</span>`;
 
     return `
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
-        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
-        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
-        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
+      <div class="tocw-slot tocw-slot--${role}">
+        <span class="tocw-slot__role">${roleLabel}</span>
+        <span class="tocw-slot__who">${locked ? "🔒 " : ""}${who}</span>
+        <span class="tocw-slot__actions">${actions.join("")}</span>
       </div>
     `;
   }
@@ -1051,18 +2408,26 @@
     return `
       <div class="tocw-card">
         <div class="tocw-card-title">Chainwatch shifts</div>
-        ${identity && identity.name
-          ? `<div class="tocw-muted">Signed in as ${escapeHtml(identity.name)} ✓</div>`
+        ${identity && identity.id != null
+          ? `<div class="tocw-muted">Signed in as ${escapeHtml(rosterName(identity.id, identity.name || `ID ${identity.id}`))} ✓</div>`
           : canClaim
             ? `<div class="tocw-muted">Signing up verifies you with your Torn key${settings().tornKey || settings().sessionToken ? "" : " — add it in Settings"}.</div>`
             : ""}
-        ${shifts.map((shift) => `
-          <div class="tocw-row">
-            <div class="tocw-muted">${shiftLabel(shift)}</div>
-            ${renderSignupSlot(shift, "main", canClaim, identity)}
-            ${renderSignupSlot(shift, "backup", canClaim, identity)}
+        ${shifts.map((shift) => {
+          const now = Date.now();
+          const active = new Date(shift.shift_start).getTime() <= now && new Date(shift.shift_end).getTime() > now;
+          const vid = identity && identity.id != null ? Number(identity.id) : null;
+          const mine = vid != null && (Number(shift.main?.watcher_id) === vid || Number(shift.backup?.watcher_id) === vid);
+          return `
+          <div class="tocw-row${active ? " active" : ""}${mine ? " mine" : ""}">
+            <div class="tocw-muted">${shiftLabel(shift)}${mine ? `<span class="tocw-you">YOU</span>` : ""}</div>
+            <div class="tocw-slots">
+              ${renderSignupSlot(shift, "main", canClaim, identity)}
+              ${renderSignupSlot(shift, "backup", canClaim, identity)}
+            </div>
           </div>
-        `).join("")}
+        `;
+        }).join("")}
         ${closedNote}
       </div>
     `;
@@ -1083,16 +2448,16 @@
     }
 
     const who = filled
-      ? `<span class="tocw-dot ${statusClass(slot.online_status)}"></span>${escapeHtml(slot.watcher_name || `ID ${slot.watcher_id}`)}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
+      ? `<span class="tocw-dot ${statusClass(slot.online_status)}"></span>${escapeHtml(rosterName(slot.watcher_id, slot.watcher_name || `ID ${slot.watcher_id}`))}${slot.verified ? "" : ` <span class="tocw-muted">(unverified)</span>`}`
       : locked
         ? `<span class="tocw-muted">Locked</span>`
         : `<span class="tocw-muted">Open</span>`;
 
     return `
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;">
-        <span class="tocw-muted" style="min-width:52px;">${roleLabel}</span>
-        <span style="flex:1;">${locked ? "🔒 " : ""}${who}</span>
-        <span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">${actions.join("")}</span>
+      <div class="tocw-slot tocw-slot--${role}">
+        <span class="tocw-slot__role">${roleLabel}</span>
+        <span class="tocw-slot__who">${locked ? "🔒 " : ""}${who}</span>
+        <span class="tocw-slot__actions">${actions.join("")}</span>
       </div>
     `;
   }
@@ -1215,100 +2580,220 @@
     return Number.isNaN(d.getTime()) ? null : d.toISOString();
   }
 
+  // Paste-ready status block for faction chat: state of the chain + coverage at a
+  // glance so a manager can drop it in and everyone knows what's needed.
   async function copySummary() {
     const event = state.watch?.event || state.signup?.event;
     const chain = state.chain;
     const { current, next } = currentAndNextShift();
-    const lines = [
-      "Chain Watch",
-      event ? `${event.title}: ${tctTime(event.starts_at, true)}` : "No chain scheduled",
-      chain?.active ? `Live: ${chain.current} hits, ${duration(chainRemaining())} drop timer` : "Live: no active chain",
-      current?.watcher_id ? `Current watcher: ${current.watcher_name} (${current.watcher_online_status})` : "Current watcher: none",
-      next?.watcher_id ? `Next watcher: ${next.watcher_name} (${next.watcher_online_status})` : "Next watcher: none",
-    ];
+    const gaps = coverageGaps();
+    const h = handoffStatus();
+    const lines = ["🔗 Chain Watch"];
+    if (chain?.active) lines.push(`LIVE: ${chain.current} hits · ${duration(chainRemaining())} to drop`);
+    else if (event) lines.push(`Next: ${event.title} — ${tctTime(event.starts_at, true)}`);
+    else lines.push("No chain scheduled");
+    lines.push(current?.watcher_id ? `On watch: ${current.watcher_name} (${current.watcher_online_status})` : "On watch: nobody ⚠️");
+    lines.push(next?.watcher_id ? `Next: ${next.watcher_name} @ ${tctTime(next.shift_start)} (${next.watcher_online_status})` : "Next: unassigned ⚠️");
+    if (h && h.state === "risk") lines.push(`🚨 Handoff: ${h.name} isn't online`);
+    if (h && h.state === "gap") lines.push("🚨 Handoff: no watcher after the current shift");
+    if (gaps.length) lines.push(`⚠️ Unmanned: ${gaps.slice(0, 6).map((iso) => tctTime(iso).replace(" TCT", "")).join(", ")} TCT`);
     const text = lines.join("\n");
     try {
       await navigator.clipboard.writeText(text);
-      state.notice = "Summary copied.";
+      state.notice = "Status copied — paste it in faction chat.";
     } catch {
       state.notice = text;
     }
     render();
   }
 
-  function closeSettings() {
-    document.getElementById("tocw-backdrop")?.remove();
-    document.getElementById("tocw-modal")?.remove();
-  }
-
-  function renderSettings() {
-    closeSettings();
+  // Settings render INSIDE the panel body (not a floating modal) — so they inherit the
+  // panel's z-index + drag, and work on mobile where a modal was buried behind the
+  // full-width panel. Same input ids as before; wireSettings() attaches the handlers.
+  function renderSettingsBody() {
     const cfg = settings();
-    const backdrop = document.createElement("div");
-    backdrop.id = "tocw-backdrop";
-    const modal = document.createElement("div");
-    modal.id = "tocw-modal";
-    modal.innerHTML = `
-      <h2 style="margin:0 0 6px;font-size:20px;">Chain Watch Settings</h2>
-      <p class="tocw-muted" style="margin:0 0 14px;">
-        Data Storage: local script settings plus faction schedule on Torn Overseer.
-        Data Sharing: every request goes to your configured Overseer backend only — never to api.torn.com.
-        Purpose: scheduled chain countdown, watcher shifts, live chain timer, and read-only chain summaries.
-      </p>
-      <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— only to connect a site session; never used to fetch data</span>
-        <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
-      </label>
-      <label>Site session token
-        <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
-      </label>
-      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
-        <div style="font-weight:700;">Signup link (token mode)</div>
-        <div class="tocw-muted" style="margin:4px 0 8px;">
-          ${cfg.signupToken
-            ? "Linked to a signup event. Open the link leadership posts to switch events. Viewing is open; signing up uses your Torn key to verify your faction."
-            : "Open a chain-watch signup link (from faction chat) once to bind this panel. Viewing needs no key; signing up verifies you with your key."}
-        </div>
-        <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
-          <label style="margin:0;">Paste a link or token (fallback)
-            <input id="tocw-set-signup" value="" autocomplete="off" placeholder="https://${OVERSEER_HOST}/chain/e/…" />
-          </label>
-          <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
-        </div>
+    const idx = state.targetIds.length ? (state.targetIndex % state.targetIds.length) + 1 : 0;
+    return `
+      <div class="tocw-settings">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;">
+        <div style="font-weight:800;font-size:17px;">Settings</div>
+        <button id="tocw-set-back" class="small">← Back</button>
       </div>
+
+      <div style="padding:10px;border:1px solid #333;border-radius:8px;">
+        <label style="margin-bottom:4px;">Your attack targets <span class="tocw-muted">— player IDs (one per line or comma-separated)</span>
+          <textarea id="tocw-set-target-ids" rows="3" placeholder="123456&#10;789012&#10;…">${escapeHtml(state.targetIds.join("\n"))}</textarea>
+        </label>
+        <div class="tocw-muted">The ⚔️ HIT button opens each one in turn (one per click), so you hit down your list.${state.targetIds.length ? ` ${state.targetIds.length} target${state.targetIds.length === 1 ? "" : "s"} · currently at #${idx}. <button id="tocw-target-reset" class="small" type="button">Restart</button>` : ""}</div>
+      </div>
+
+      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+        <div style="font-weight:700;font-size:14px;">Watcher alarms <span class="tocw-muted" style="font-weight:400;">— ${state.alarm ? "ON" : "OFF"}</span></div>
+        <div class="tocw-muted" style="margin:2px 0 8px;">
+          Turn alarms on/off with the ${state.alarm ? "🔔" : "🔕"} button in the header (that's the master switch).
+          These control what fires when they're on — alerts near the chain drop and before + at your own shift.
+        </div>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-sound" ${state.alarmSound ? "checked" : ""} /> Sound (beep)</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-vibrate" ${state.alarmVibrate ? "checked" : ""} /> Vibrate (mobile / PDA)</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-flash" ${state.alarmFlash ? "checked" : ""} /> Visual flash</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-notify" ${state.alarmNotify ? "checked" : ""} /> Desktop notification</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-voice" ${state.alarmVoice ? "checked" : ""} /> Voice countdown (speak alerts)</label>
+        <div class="grid" style="margin-top:8px;">
+          <label>Sound
+            <select id="tocw-set-alarm-tone">
+              ${ALARM_TONES.map((t) => `<option value="${t}" ${state.alarmTone === t ? "selected" : ""}>${t[0].toUpperCase()}${t.slice(1)}</option>`).join("")}
+            </select>
+          </label>
+          <label>Volume
+            <input id="tocw-set-alarm-volume" type="range" min="0" max="100" value="${Math.round(state.alarmVolume * 100)}" />
+          </label>
+        </div>
+        <label style="margin-top:8px;">Drop alerts at (seconds to drop) <span class="tocw-muted">— blank = faction default</span>
+          <input id="tocw-set-alarm-thresholds" value="${escapeHtml(state.thresholdsPref)}" placeholder="${escapeHtml((cleanThresholdArray(state.factionConfig?.drop_thresholds) || DEFAULT_DROP_THRESHOLDS).join(", "))}" />
+        </label>
+        <label class="tocw-check" style="margin-top:8px;"><input type="checkbox" id="tocw-set-wakelock" ${state.wakeLockEnabled ? "checked" : ""} /> Keep screen awake while on watch</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-autofocus" ${state.autoFocus ? "checked" : ""} /> Auto-focus mode when on watch</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-celebrate" ${state.celebrate ? "checked" : ""} /> Celebrate bonus milestones</label>
+        <button id="tocw-alarm-test" class="small" style="margin-top:6px;">Test alarm</button>
+      </div>
+      <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+        ${state.factionConfig && (state.factionConfig.chain_goal || state.factionConfig.drop_thresholds)
+          ? `<div class="tocw-muted" style="margin-bottom:8px;">Your faction has set watcher defaults (thresholds / goal). Leave a field blank to use them.</div>`
+          : ""}
+        <label>Chain goal (hits, 0 = off) <span class="tocw-muted">— blank = faction</span>
+          <input id="tocw-set-goal" type="number" min="0" step="100" value="${state.chainGoalPref || ""}" placeholder="${Number(state.factionConfig?.chain_goal) > 0 ? Number(state.factionConfig.chain_goal) : "e.g. 5000"}" />
+        </label>
+        ${state.watch?.viewer?.can_manage ? `
+          <div style="margin-top:4px;border-top:1px solid #2b3d52;padding-top:8px;">
+            <div style="font-weight:700;">Faction defaults (managers)</div>
+            <div class="tocw-muted" style="margin:2px 0 6px;">Push your current thresholds + goal as the faction defaults — every member's panel adopts them (each member can still override). The HIT target stays per-member.</div>
+            <button id="tocw-save-faction-config" class="small">Save thresholds + goal as faction defaults</button>
+          </div>` : ""}
+      </div>
+
       <details style="margin-top:10px;">
-        <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Advanced backend settings</summary>
-        <div class="grid" style="margin-top:10px;">
-          <label>Functions URL
-            <input id="tocw-set-functions" value="${escapeHtml(cfg.functionsUrl)}" />
+        <summary class="tocw-muted" style="cursor:pointer;font-weight:700;">Connection &amp; setup</summary>
+        <div style="margin-top:10px;">
+          <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
+            <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
           </label>
-          <label>Supabase publishable key
-            <input id="tocw-set-anon" type="password" value="${escapeHtml(cfg.anonKey)}" autocomplete="off" />
+          <label>Site session token
+            <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
           </label>
+          <div style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
+            <div style="font-weight:700;">Signup link (token mode)</div>
+            <div class="tocw-muted" style="margin:4px 0 8px;">
+              ${cfg.signupToken
+                ? "Linked to a signup event. Paste a different link to switch events. Signing up uses your Torn key to verify your faction."
+                : "Paste a chain-watch signup link (from faction chat) to view + sign up for that specific event here. Optional — session mode already shows your faction's current chain."}
+            </div>
+            <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
+              <label style="margin:0;">Paste a link or token
+                <input id="tocw-set-signup" value="" autocomplete="off" placeholder="https://${OVERSEER_HOST}/chain/e/…" />
+              </label>
+              <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
+            </div>
+          </div>
+          <p class="tocw-muted" style="margin:10px 0 0;">
+            Data: your live chain + leaderboard come straight from api.torn.com with your key (via the userscript
+            manager / Torn PDA — never exposed to torn.com's page scripts); schedule &amp; signups go to your Overseer backend.
+          </p>
+          <div style="margin-top:8px;">
+            <button id="tocw-modal-connect">Connect site from Torn key</button>
+          </div>
         </div>
       </details>
+
       <div class="tocw-modal-actions">
-        <button id="tocw-modal-close">Close</button>
-        <button id="tocw-modal-connect">Connect site from Torn key</button>
         <button id="tocw-modal-save" class="primary">Save</button>
       </div>
+      </div>
     `;
-    document.body.appendChild(backdrop);
-    document.body.appendChild(modal);
+  }
 
+  // Attach the settings handlers after the settings body is in the DOM (called from
+  // render() when state.settingsOpen). Same logic as the old modal, minus the overlay.
+  function wireSettings() {
+    // The backend URL + publishable key are fixed (the DEFAULT_* constants); there's no
+    // UI to override them, so settings()/saveSettings just use the defaults.
     const collect = () => ({
       tornKey: valueOf("tocw-set-torn-key"),
-      functionsUrl: valueOf("tocw-set-functions"),
-      anonKey: valueOf("tocw-set-anon"),
       sessionToken: valueOf("tocw-set-session"),
     });
+    const checked = (id) => Boolean(document.getElementById(id)?.checked);
+    const applyAlarmSettings = () => {
+      // NB: state.alarm (the master on/off) is owned by the header 🔔 toggle, NOT this
+      // form — so saving settings never flips it, and the two can't disagree.
+      state.alarmSound = checked("tocw-set-alarm-sound");
+      state.alarmVibrate = checked("tocw-set-alarm-vibrate");
+      state.alarmFlash = checked("tocw-set-alarm-flash");
+      state.alarmNotify = checked("tocw-set-alarm-notify");
+      state.wakeLockEnabled = checked("tocw-set-wakelock");
+      // Personal PREFS ("" / 0 = inherit the faction default): normalize to a clean
+      // stored form (parsed thresholds, valid URL or "", non-negative goal).
+      const parsedT = parseThresholds(valueOf("tocw-set-alarm-thresholds"), null);
+      state.thresholdsPref = parsedT ? parsedT.join(", ") : "";
+      const tone = valueOf("tocw-set-alarm-tone");
+      state.alarmTone = ALARM_TONES.includes(tone) ? tone : "beep";
+      state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
+      state.chainGoalPref = Math.max(0, Math.round(Number(valueOf("tocw-set-goal")) || 0));
+      // Your rotating attack list. If it changed, keep the loop position in range.
+      const targetEl = document.getElementById("tocw-set-target-ids");
+      const newTargets = parseTargetIds(targetEl && "value" in targetEl ? String(targetEl.value) : "");
+      const targetsChanged = newTargets.join(",") !== state.targetIds.join(",");
+      state.targetIds = newTargets;
+      if (targetsChanged || state.targetIndex >= newTargets.length) state.targetIndex = 0;
+      state.alarmVoice = checked("tocw-set-alarm-voice");
+      state.autoFocus = checked("tocw-set-autofocus");
+      state.celebrate = checked("tocw-set-celebrate");
+      gmSet(STORE.alarmSound, state.alarmSound);
+      gmSet(STORE.alarmVibrate, state.alarmVibrate);
+      gmSet(STORE.alarmFlash, state.alarmFlash);
+      gmSet(STORE.alarmNotify, state.alarmNotify);
+      gmSet(STORE.wakeLock, state.wakeLockEnabled);
+      gmSet(STORE.alarmThresholds, state.thresholdsPref);
+      gmSet(STORE.alarmTone, state.alarmTone);
+      gmSet(STORE.alarmVolume, state.alarmVolume);
+      gmSet(STORE.chainGoal, state.chainGoalPref);
+      gmSet(STORE.targetIds, state.targetIds.join(","));
+      gmSet(STORE.targetIndex, state.targetIndex);
+      gmSet(STORE.alarmVoice, state.alarmVoice);
+      gmSet(STORE.autoFocus, state.autoFocus);
+      gmSet(STORE.celebrate, state.celebrate);
+      if (state.alarm) primeAudio(); // Save is a user gesture → (re)unlock audio while armed
+      updateWakeLock();
+    };
     const close = () => {
       state.settingsOpen = false;
       render();
     };
-    backdrop.addEventListener("click", close);
-    document.getElementById("tocw-modal-close")?.addEventListener("click", close);
+    document.getElementById("tocw-set-back")?.addEventListener("click", close);
+    document.getElementById("tocw-target-reset")?.addEventListener("click", () => {
+      state.targetIndex = 0;
+      gmSet(STORE.targetIndex, 0);
+      state.notice = "Target list restarted.";
+      close();
+    });
+    document.getElementById("tocw-alarm-test")?.addEventListener("click", () => {
+      primeAudio();
+      // Preview the CURRENT form's tone/volume without needing to save first.
+      const prevTone = state.alarmTone;
+      const prevVol = state.alarmVolume;
+      const tone = valueOf("tocw-set-alarm-tone");
+      state.alarmTone = ALARM_TONES.includes(tone) ? tone : "beep";
+      state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
+      if (checked("tocw-set-alarm-sound")) playAlarmSound("drop");
+      if (checked("tocw-set-alarm-vibrate")) {
+        try { navigator.vibrate?.([130, 60, 130, 60, 220]); } catch { /* unsupported */ }
+      }
+      if (checked("tocw-set-alarm-flash")) flashPanel("drop");
+      if (checked("tocw-set-alarm-voice")) speak("Ten seconds — hit now");
+      state.alarmTone = prevTone;
+      state.alarmVolume = prevVol;
+    });
     document.getElementById("tocw-modal-save")?.addEventListener("click", () => {
       const ok = saveSettings(collect());
+      applyAlarmSettings();
       // Last-resort manual link entry: bind a pasted signup link/token.
       const pasted = extractSignupToken(valueOf("tocw-set-signup"));
       if (pasted) gmSet(STORE.signupToken, pasted);
@@ -1318,6 +2803,27 @@
         state.error = "Install Tampermonkey or use Torn PDA — your key and session can't be stored securely otherwise, so they were not saved.";
       }
       close();
+    });
+    document.getElementById("tocw-save-faction-config")?.addEventListener("click", async () => {
+      // Managers push the CURRENT effective values as the faction-wide defaults, so
+      // every member's panel adopts them. Persist personal prefs first so "effective"
+      // reflects exactly what's in the form.
+      applyAlarmSettings();
+      try {
+        // The HIT target URL is deliberately NOT pushed — it's per-member.
+        const res = await callFunction("chain-watch", {
+          action: "save_config",
+          drop_thresholds: effThresholds(),
+          chain_goal: effGoal() || null,
+        });
+        state.watch = res;
+        state.factionConfig = res?.watch_config ?? state.factionConfig;
+        state.notice = "Saved thresholds + goal as faction defaults.";
+        close();
+      } catch (e) {
+        state.error = e.message || "Could not save faction defaults.";
+        render();
+      }
     });
     document.getElementById("tocw-signup-clear")?.addEventListener("click", () => {
       gmSet(STORE.signupToken, "");
@@ -1352,14 +2858,14 @@
     launcher.id = "tocw-launcher";
     launcher.type = "button";
     launcher.textContent = "TO";
-    launcher.title = "Open Torn Overseer";
+    launcher.title = "Open Torn Overseer (drag to move)";
     launcher.style.cssText = [
       "position:fixed",
       "left:58px",
       "bottom:76px",
       "z-index:2147483647",
-      "width:46px",
-      "height:38px",
+      `width:${LAUNCHER_W}px`,
+      `height:${LAUNCHER_H}px`,
       "border-radius:9px",
       "border:2px solid #ff6870",
       "background:#ff3b45",
@@ -1367,37 +2873,71 @@
       "font:bold 15px Arial,sans-serif",
       "box-shadow:0 8px 22px rgba(0,0,0,.45)",
       "cursor:pointer",
+      "touch-action:none",
     ].join(";");
+    applyLauncherPosition(launcher);
     launcher.addEventListener("click", () => {
+      // A drag ends in a click too — swallow that one so moving the button
+      // doesn't also open the panel.
+      if (launcher.dataset.dragged === "1") {
+        launcher.dataset.dragged = "";
+        return;
+      }
+      state.hidden = false;
       state.collapsed = false;
+      gmSet(STORE.hidden, false);
       gmSet(STORE.collapsed, false);
       createShell();
       render();
       const box = document.getElementById("tocw");
       if (box) box.scrollIntoView({ block: "nearest", inline: "nearest" });
     });
+    bindLauncherDrag(launcher);
     document.body.appendChild(launcher);
   }
 
-  // On the Overseer site we ONLY capture the signup token from a /chain/e/:token link
-  // and hand off to the torn.com panel — never render our own UI over the site's app.
-  function bootOverseerCapture() {
-    migrateSecretsFromLocalStorage();
-    const token = captureSignupToken();
-    if (token) showCaptureToast();
-  }
+  // Make the "TO" launcher draggable (persisted), while a plain tap still opens the
+  // panel. A small movement threshold tells a drag from a tap so it never misfires.
+  function bindLauncherDrag(launcher) {
+    launcher.addEventListener("pointerdown", (event) => {
+      if (event.button != null && event.button !== 0) return;
+      const rect = launcher.getBoundingClientRect();
+      const offsetX = event.clientX - rect.left;
+      const offsetY = event.clientY - rect.top;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      let moved = false;
+      launcher.dataset.dragged = "";
+      launcher.setPointerCapture?.(event.pointerId);
 
-  function showCaptureToast() {
-    if (document.getElementById("tocw-capture-toast")) return;
-    const toast = document.createElement("div");
-    toast.id = "tocw-capture-toast";
-    toast.textContent = "Chain Watch: this event is now linked in your in-game panel. Open Torn to sign up from the game.";
-    toast.style.cssText =
-      "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;" +
-      "max-width:min(92vw,420px);background:#111;color:#fff;border:1px solid #3a3a3a;border-radius:10px;" +
-      "padding:12px 16px;font:14px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.4);";
-    document.body.appendChild(toast);
-    setTimeout(() => toast.remove(), 8000);
+      const move = (moveEvent) => {
+        if (!moved && Math.abs(moveEvent.clientX - startX) < 4 && Math.abs(moveEvent.clientY - startY) < 4) return;
+        moved = true;
+        // Switch to top/left anchoring the moment a drag begins.
+        launcher.style.right = "auto";
+        launcher.style.bottom = "auto";
+        const next = clampPosition(
+          moveEvent.clientX - offsetX,
+          moveEvent.clientY - offsetY,
+          launcher.offsetWidth || LAUNCHER_W,
+          launcher.offsetHeight || LAUNCHER_H,
+        );
+        launcher.style.left = `${next.left}px`;
+        launcher.style.top = `${next.top}px`;
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        if (moved) {
+          launcher.dataset.dragged = "1";
+          saveLauncherPosition(launcher);
+        }
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointercancel", up, { once: true });
+    });
   }
 
   function boot() {
@@ -1405,31 +2945,78 @@
       setTimeout(boot, 100);
       return;
     }
-    if (isOverseerSite()) {
-      bootOverseerCapture();
-      return;
-    }
     console.info("[Torn Overseer Chain Watch] loaded", location.href);
     migrateSecretsFromLocalStorage();
     createLauncher();
+    // Persisted-on alarms: browsers block audio until a user gesture, so prime the
+    // audio context on the first tap/click anywhere on the page.
+    if (state.alarm) document.addEventListener("pointerdown", () => primeAudio(), { once: true });
     try {
       createShell();
       render();
     } catch (error) {
       console.error("[Torn Overseer Chain Watch] render failed", error);
     }
+    // A screen wake lock is dropped whenever the tab hides; re-evaluate (re-acquire or
+    // release) each time visibility changes, and resume the poll loop on return.
+    document.addEventListener("visibilitychange", () => {
+      updateWakeLock();
+      if (document.visibilityState === "visible") scheduleNextRefresh();
+    });
+    // Kick off the live-data loop (refreshAll re-arms itself via scheduleNextRefresh,
+    // polling fast while a chain is live and easing off otherwise).
     setTimeout(() => void refreshAll(false), 800);
-    setInterval(safeRender, 1000);
-    setInterval(() => {
-      if (document.visibilityState === "visible") void refreshAll(false);
-    }, 30_000);
+    // 1s tick updates ONLY the countdown text in place — no innerHTML rebuild, so it
+    // never resets the user's scroll position or fights their interaction between polls.
+    setInterval(tick, 1000);
   }
 
-  function safeRender() {
+  // Surgical per-second update: refresh the drop-timer / "starts in" text without
+  // re-rendering the panel. Full re-renders happen on data polls (which preserve scroll).
+  function tick() {
     try {
-      render();
+      // Alarms run regardless of visibility — they exist to alert you when the panel
+      // is collapsed or hidden and you're not watching it.
+      evaluateAlarms();
+      updateWakeLock();
+      if (state.hidden) return;
+      if (state.collapsed) {
+        // Minimized: only the compact status drop-timer is visible — keep it ticking.
+        const cel = document.getElementById("tocw-ctimer");
+        if (cel && state.chain?.active) {
+          const remaining = chainRemaining();
+          cel.textContent = duration(remaining);
+          cel.className = `tocw-cstatus-timer ${timerUrgencyClass(remaining)}`;
+        }
+        return;
+      }
+
+      const el = document.getElementById("tocw-timer");
+      if (el) {
+        // Preserve the base class (full-panel .tocw-big vs focus-mode .tocw-focus-timer),
+        // only swapping the urgency modifier.
+        const base = el.classList.contains("tocw-focus-timer") ? "tocw-focus-timer" : "tocw-big";
+        if (state.chain?.active) {
+          const remaining = chainRemaining();
+          el.textContent = duration(remaining);
+          el.className = `${base} ${timerUrgencyClass(remaining)}`;
+        } else {
+          const event = state.watch?.event || state.signup?.event || null;
+          const seconds = event ? countdownTo(event.starts_at) : null;
+          el.textContent = event ? `Starts in ${duration(seconds)}` : "--";
+          el.className = base;
+        }
+      }
+
+      // The viewer's own shift countdown ("on watch — ends in / starts in").
+      const shiftEl = document.getElementById("tocw-shift-timer");
+      if (shiftEl) {
+        const { active, next } = viewerShiftStatus();
+        if (active) shiftEl.textContent = duration(Math.max(0, Math.floor((new Date(active.end).getTime() - Date.now()) / 1000)));
+        else if (next) shiftEl.textContent = duration(countdownTo(next.start));
+      }
     } catch (error) {
-      console.error("[Torn Overseer Chain Watch] render failed", error);
+      console.error("[Torn Overseer Chain Watch] tick failed", error);
     }
   }
 
