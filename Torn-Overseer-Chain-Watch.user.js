@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.11.0
+// @version      0.12.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.11.0";
+  const VERSION = "0.12.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -1362,11 +1362,11 @@
       .tocw-watch-banner.soon { background: #1d344f; color: #d9ebff; border: 1px solid #34506f; }
       .tocw-watch-banner .tocw-shift-time { font-size: 17px; font-weight: 900; }
       #tocw-alarm.on { background: #ff3b45; border-color: #ff6870; color: #fff; }
-      #tocw-modal .tocw-check { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-weight: 700; color: #cfe0f7; font-size: 12px; }
-      #tocw-modal .tocw-check input { width: auto; }
+      /* Wide content (the leaderboard table) scrolls inside its own box, never the panel */
+      .tocw-scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .tocw-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-      .tocw-table th, .tocw-table td { text-align: right; padding: 5px 4px; border-top: 1px solid #25384d; }
-      .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; }
+      .tocw-table th, .tocw-table td { text-align: right; padding: 5px 6px; border-top: 1px solid #25384d; white-space: nowrap; }
+      .tocw-table th:first-child, .tocw-table td:first-child { text-align: left; position: sticky; left: 0; background: #0d141d; }
       #tocw.collapsed { width: 210px; min-width: 0; height: auto; max-height: none; overflow: visible; }
       #tocw.collapsed .tocw-head { padding: 10px; border-bottom: 0; }
       #tocw.collapsed .tocw-pills { margin-bottom: 6px; }
@@ -1376,31 +1376,9 @@
       #tocw.collapsed #tocw-collapse, #tocw.collapsed #tocw-hide { padding: 5px 8px; font-size: 12px; }
       #tocw.collapsed .tocw-body { display: none; }
       #tocw.collapsed #tocw-resize { display: none; }
-      #tocw-backdrop {
-        position: fixed;
-        inset: 0;
-        z-index: 1000000;
-        background: rgba(0,0,0,.55);
-      }
-      #tocw-modal {
-        position: fixed;
-        top: 70px;
-        left: 50%;
-        transform: translateX(-50%);
-        width: min(660px, calc(100vw - 24px));
-        max-height: calc(100vh - 100px);
-        overflow: auto;
-        z-index: 1000001;
-        background: #101923;
-        color: #eaf3ff;
-        border: 1px solid #33465e;
-        border-radius: 10px;
-        box-shadow: 0 14px 34px rgba(0,0,0,.42);
-        font-family: Arial, sans-serif;
-        padding: 16px;
-      }
-      #tocw-modal label { display: grid; gap: 5px; margin-bottom: 10px; color: #cfe0f7; font-size: 12px; font-weight: 700; }
-      #tocw-modal input, #tocw-modal select {
+      /* In-panel settings view (was a modal — now inherits the panel's z-index + drag) */
+      .tocw-settings label { display: grid; gap: 5px; margin-bottom: 10px; color: #cfe0f7; font-size: 12px; font-weight: 700; }
+      .tocw-settings input, .tocw-settings select {
         width: 100%;
         padding: 9px 10px;
         border-radius: 7px;
@@ -1408,12 +1386,19 @@
         background: #0b1119;
         color: #f8fbff;
       }
-      #tocw-modal input[type="range"] { padding: 0; }
-      #tocw-modal .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-      #tocw-modal .tocw-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+      .tocw-settings input[type="range"] { padding: 0; }
+      .tocw-settings input[type="checkbox"] { width: auto; }
+      .tocw-settings .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .tocw-settings .tocw-check { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-weight: 700; color: #cfe0f7; font-size: 13px; }
+      .tocw-settings .tocw-modal-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 14px; }
       @media (max-width: 760px) {
-        #tocw { left: 8px; right: 8px; top: auto; bottom: 8px; width: auto; max-height: 68vh; }
-        #tocw-modal .grid { grid-template-columns: 1fr; }
+        #tocw { left: 8px; right: 8px; top: auto; bottom: 8px; width: auto; max-height: 80vh; font-size: 14px; }
+        #tocw .tocw-body { padding: 12px 12px 16px; gap: 12px; }
+        #tocw button.small { padding: 8px 11px; font-size: 13px; }
+        #tocw .tocw-actions button { padding: 11px 9px; }
+        .tocw-settings .grid { grid-template-columns: 1fr; }
+        .tocw-big { font-size: 30px; }
+        .tocw-focus-timer { font-size: 64px; }
       }
     `;
       document.head.appendChild(style);
@@ -1507,6 +1492,7 @@
     });
   }
 
+  let lastRenderView = null;
   function render() {
     createShell();
     const box = document.getElementById("tocw");
@@ -1532,9 +1518,12 @@
     }
 
     // Preserve the body's scroll position across the full innerHTML rebuild — otherwise
-    // every poll (and any re-render) snaps the user back to the top mid-read.
+    // every poll (and any re-render) snaps the user back to the top mid-read. But when
+    // the VIEW changes (main ↔ focus ↔ settings) start that view at the top instead.
+    const viewKind = state.settingsOpen ? "settings" : state.focus ? "focus" : "main";
     const prevBody = box.querySelector(".tocw-body");
-    const savedScroll = prevBody ? prevBody.scrollTop : 0;
+    const savedScroll = prevBody && viewKind === lastRenderView ? prevBody.scrollTop : 0;
+    lastRenderView = viewKind;
 
     const cfg = settings();
     const event = state.watch?.event || state.signup?.event || null;
@@ -1586,7 +1575,7 @@
       <div class="tocw-body">
         ${state.error ? `<div class="tocw-alert bad">${escapeHtml(state.error)}</div>` : ""}
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
-        ${state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : `
+        ${state.settingsOpen ? renderSettingsBody() : state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : `
         ${versionAlert}
         ${mode === "token"
           ? `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""}. Anyone can view; signing up verifies you with your Torn key.</div>`
@@ -1648,18 +1637,14 @@
     document.getElementById("tocw-copy")?.addEventListener("click", () => void copySummary());
     document.getElementById("tocw-settings")?.addEventListener("click", () => {
       state.settingsOpen = true;
-      renderSettings();
+      render();
     });
     for (const btn of box.querySelectorAll("[data-tocw-action]")) {
       btn.addEventListener("click", () => void handleAction(btn));
     }
     bindDrag(box);
     bindResize(box);
-    if (state.settingsOpen) {
-      if (!document.getElementById("tocw-modal")) renderSettings();
-    } else {
-      closeSettings();
-    }
+    if (state.settingsOpen) wireSettings();
   }
 
   function renderScheduled(event, seconds) {
@@ -1865,12 +1850,14 @@
       <div class="tocw-card">
         <div class="tocw-card-title">Leaderboard</div>
         ${rows.length ? `
-          <table class="tocw-table">
-            <thead><tr><th>Member</th><th>Hits</th><th>Total respect</th><th>Avg</th></tr></thead>
-            <tbody>
-              ${rows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${r.hits}</td><td>${r.respect.toFixed(1)}</td><td>${r.avg.toFixed(2)}</td></tr>`).join("")}
-            </tbody>
-          </table>
+          <div class="tocw-scroll-x">
+            <table class="tocw-table">
+              <thead><tr><th>Member</th><th>Hits</th><th>Respect</th><th>Avg</th></tr></thead>
+              <tbody>
+                ${rows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${r.hits}</td><td>${r.respect.toFixed(1)}</td><td>${r.avg.toFixed(2)}</td></tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
         ` : `<div class="tocw-muted">${escapeHtml(attacks?.error || "No leaderboard data yet.")}</div>`}
       </div>
     `;
@@ -2175,20 +2162,17 @@
     render();
   }
 
-  function closeSettings() {
-    document.getElementById("tocw-backdrop")?.remove();
-    document.getElementById("tocw-modal")?.remove();
-  }
-
-  function renderSettings() {
-    closeSettings();
+  // Settings render INSIDE the panel body (not a floating modal) — so they inherit the
+  // panel's z-index + drag, and work on mobile where a modal was buried behind the
+  // full-width panel. Same input ids as before; wireSettings() attaches the handlers.
+  function renderSettingsBody() {
     const cfg = settings();
-    const backdrop = document.createElement("div");
-    backdrop.id = "tocw-backdrop";
-    const modal = document.createElement("div");
-    modal.id = "tocw-modal";
-    modal.innerHTML = `
-      <h2 style="margin:0 0 6px;font-size:20px;">Chain Watch Settings</h2>
+    return `
+      <div class="tocw-settings">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;">
+        <div style="font-weight:800;font-size:17px;">Settings</div>
+        <button id="tocw-set-back" class="small">← Back</button>
+      </div>
       <p class="tocw-muted" style="margin:0 0 14px;">
         Data Storage: local script settings plus faction schedule on Torn Overseer.
         Data Sharing: schedule &amp; signups go to your Overseer backend; the live chain and
@@ -2265,14 +2249,16 @@
         </div>
       </details>
       <div class="tocw-modal-actions">
-        <button id="tocw-modal-close">Close</button>
         <button id="tocw-modal-connect">Connect site from Torn key</button>
         <button id="tocw-modal-save" class="primary">Save</button>
       </div>
+      </div>
     `;
-    document.body.appendChild(backdrop);
-    document.body.appendChild(modal);
+  }
 
+  // Attach the settings handlers after the settings body is in the DOM (called from
+  // render() when state.settingsOpen). Same logic as the old modal, minus the overlay.
+  function wireSettings() {
     const collect = () => ({
       tornKey: valueOf("tocw-set-torn-key"),
       functionsUrl: valueOf("tocw-set-functions"),
@@ -2312,8 +2298,7 @@
       state.settingsOpen = false;
       render();
     };
-    backdrop.addEventListener("click", close);
-    document.getElementById("tocw-modal-close")?.addEventListener("click", close);
+    document.getElementById("tocw-set-back")?.addEventListener("click", close);
     document.getElementById("tocw-alarm-test")?.addEventListener("click", () => {
       primeAudio();
       // Preview the CURRENT form's tone/volume without needing to save first.
