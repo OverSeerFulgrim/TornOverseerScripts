@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.12.0
+// @version      0.13.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim
 // @license      MIT
@@ -26,7 +26,7 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.12.0";
+  const VERSION = "0.13.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
   // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
@@ -81,6 +81,9 @@
     alarmTone: "tocw_alarm_tone",
     chainGoal: "tocw_chain_goal",
     hitUrl: "tocw_hit_url",
+    autoFocus: "tocw_auto_focus",
+    alarmVoice: "tocw_alarm_voice",
+    celebrate: "tocw_celebrate",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -129,6 +132,11 @@
     chainGoal: Math.max(0, Math.round(readNumber(STORE.chainGoal, 0))),
     // Where the HIT button sends you (a shared target list / enemy faction page).
     hitUrl: readString(STORE.hitUrl, "") || DEFAULT_HIT_URL,
+    // Auto-enter focus mode while you're the active watcher; speak drop alerts (TTS);
+    // flash + chime when a chain-bonus milestone lands.
+    autoFocus: readBool(STORE.autoFocus, true),
+    alarmVoice: readBool(STORE.alarmVoice, false),
+    celebrate: readBool(STORE.celebrate, true),
     // Fire-once bookkeeping so an alarm sounds at each threshold only once per chain
     // run / shift (cleared when the drop timer resets on a fresh hit, or the chain ends).
     firedDrop: new Set(),
@@ -136,6 +144,15 @@
     lastRemaining: null,
     // Consecutive direct-Torn chain failures — used to hint at missing faction API access.
     tornFailCount: 0,
+    // Per-chain lifecycle bookkeeping (post-chain summary, bonus celebration, auto-focus).
+    wasChainActive: false,
+    wasOnWatch: false,
+    chainPeak: 0,
+    chainYourHits: 0,
+    chainYourRespect: 0,
+    chainSeenTs: new Set(),
+    lastBonusPassed: 0,
+    chainSummary: null,
   };
 
   function readNumber(key, fallback) {
@@ -747,6 +764,8 @@
     let yourHits = 0;
     let minTs = Infinity;
     let maxTs = 0;
+    const yourTs = [];
+    const yourResp = [];
     const vid = viewerId != null ? Number(viewerId) : null;
     for (const row of rows) {
       const attacker = row?.attacker && typeof row.attacker === "object" ? row.attacker : {};
@@ -763,7 +782,10 @@
       prior.respect += respect;
       byId.set(attackerId, prior);
       total += 1;
-      if (vid != null && attackerId === vid) yourHits += 1;
+      if (vid != null && attackerId === vid) {
+        yourHits += 1;
+        if (timestamp > 0) { yourTs.push(timestamp); yourResp.push(respect); }
+      }
       if (timestamp > 0) {
         if (timestamp < minTs) minTs = timestamp;
         if (timestamp > maxTs) maxTs = timestamp;
@@ -792,7 +814,7 @@
         hitters,
       };
     }
-    return { leaderboard, last, error: null, mine: { hits: yourHits }, pace };
+    return { leaderboard, last, error: null, mine: { hits: yourHits, ts: yourTs, respect: yourResp }, pace };
   }
 
   // Freshness bookkeeping so the two heavier reads (attacks, backend schedule) run on
@@ -884,6 +906,7 @@
         state.attacks = serverLeaderboard(serverRes);
       }
 
+      updateChainLifecycle();
       state.fetchedAt = Date.now();
 
       // Only surface an error when we're left with nothing to show. A failed direct
@@ -1147,6 +1170,61 @@
     }
   }
 
+  // Speak an alert aloud (voice countdown). cancel() first so alerts don't queue up
+  // into a backlog when several fire close together near the drop.
+  function speak(message) {
+    try {
+      const synth = window.speechSynthesis;
+      if (!synth || typeof SpeechSynthesisUtterance !== "function") return;
+      const u = new SpeechSynthesisUtterance(String(message));
+      u.rate = 1.1;
+      u.volume = Math.max(0.15, state.alarmVolume);
+      synth.cancel();
+      synth.speak(u);
+    } catch {
+      /* TTS unavailable on this webview */
+    }
+  }
+
+  // A short rising chime (distinct from the alarm) for bonus celebrations.
+  function chime(freqs) {
+    if (!audioCtx) primeAudio();
+    if (!audioCtx) return;
+    const peak = Math.max(0.0002, state.alarmVolume);
+    try {
+      const t0 = audioCtx.currentTime;
+      (freqs || [660, 880, 1174]).forEach((f, i) => {
+        const at = t0 + i * 0.13;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = f;
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(peak, at + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.22);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(at);
+        osc.stop(at + 0.24);
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Bonus milestone landed: a green flash + rising chime + a celebratory notice.
+  function celebrate(milestone) {
+    const box = document.getElementById("tocw");
+    if (box) {
+      box.classList.remove("tocw-flash-good");
+      void box.offsetWidth;
+      box.classList.add("tocw-flash-good");
+      setTimeout(() => box.classList.remove("tocw-flash-good"), 1500);
+    }
+    chime();
+    state.notice = `🎉 ${Number(milestone).toLocaleString()} chain bonus!`;
+  }
+
   function fireAlarm(kind, message) {
     if (state.alarmSound) playAlarmSound(kind);
     if (state.alarmVibrate) {
@@ -1158,6 +1236,7 @@
     }
     if (state.alarmFlash) flashPanel(kind);
     if (state.alarmNotify) notify(message);
+    if (state.alarmVoice) speak(message);
     state.notice = message;
   }
 
@@ -1189,6 +1268,73 @@
       && (Boolean(viewerShiftStatus().active) || (Boolean(state.chain?.active) && state.alarm));
     if (want && !wakeLock) void acquireWakeLock();
     else if (!want && wakeLock) releaseWakeLock();
+  }
+
+  // Per-poll chain lifecycle: accumulate YOUR hits across the chain (dedup by
+  // timestamp), celebrate bonus milestones, snapshot a post-chain summary when it
+  // ends, and auto-enter/exit focus mode on your shift. Runs after each data poll.
+  function updateChainLifecycle() {
+    const active = Boolean(state.chain?.active);
+    const cur = state.chain?.current || 0;
+
+    if (active && !state.wasChainActive) {
+      // A fresh chain started — reset the per-chain accumulators.
+      state.chainYourHits = 0;
+      state.chainYourRespect = 0;
+      state.chainSeenTs = new Set();
+      state.chainPeak = 0;
+      state.lastBonusPassed = BONUS_MILESTONES.filter((n) => n <= cur).pop() || 0;
+      state.chainSummary = null;
+    }
+
+    if (active) {
+      state.chainPeak = Math.max(state.chainPeak, cur);
+      // Accumulate your hits over the whole chain from the direct attack feed (deduped
+      // by timestamp so overlapping poll windows don't double-count).
+      const mine = state.attacks?.mine;
+      if (Array.isArray(mine?.ts)) {
+        for (let i = 0; i < mine.ts.length; i += 1) {
+          const t = mine.ts[i];
+          if (!state.chainSeenTs.has(t)) {
+            state.chainSeenTs.add(t);
+            state.chainYourHits += 1;
+            state.chainYourRespect += mine.respect?.[i] || 0;
+          }
+        }
+      }
+      // Bonus celebration when a milestone is crossed.
+      if (state.celebrate) {
+        const passed = BONUS_MILESTONES.filter((n) => n <= cur).pop() || 0;
+        if (passed > state.lastBonusPassed) {
+          state.lastBonusPassed = passed;
+          celebrate(passed);
+        }
+      }
+    }
+
+    if (!active && state.wasChainActive && state.chainPeak > 0) {
+      // Chain just ended — snapshot the recap.
+      state.chainSummary = {
+        totalHits: state.chainPeak,
+        yourHits: state.chainYourHits,
+        yourRespect: state.chainYourRespect,
+      };
+    }
+
+    if (state.autoFocus && !state.settingsOpen) {
+      // React only to on-watch TRANSITIONS so a manual focus toggle mid-shift sticks.
+      const onWatch = Boolean(viewerShiftStatus().active);
+      if (onWatch && !state.wasOnWatch && !state.focus) {
+        state.focus = true;
+        gmSet(STORE.focus, true);
+      } else if (!onWatch && state.wasOnWatch && state.focus) {
+        state.focus = false;
+        gmSet(STORE.focus, false);
+      }
+      state.wasOnWatch = onWatch;
+    }
+
+    state.wasChainActive = active;
   }
 
   // Runs every second (even while collapsed/hidden — the whole point is to alert you
@@ -1349,8 +1495,10 @@
       /* Alarm flash on the whole panel */
       @keyframes tocw-flashbad { 30% { box-shadow: 0 0 0 4px rgba(255,60,72,.9), 0 0 34px rgba(255,60,72,.75); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
       @keyframes tocw-flashwarn { 30% { box-shadow: 0 0 0 4px rgba(255,190,80,.85), 0 0 30px rgba(255,190,80,.6); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
+      @keyframes tocw-flashgood { 30% { box-shadow: 0 0 0 4px rgba(53,183,111,.9), 0 0 34px rgba(53,183,111,.7); } 100% { box-shadow: 0 14px 34px rgba(0,0,0,.42); } }
       #tocw.tocw-flash-bad { animation: tocw-flashbad 1.4s ease-out; }
       #tocw.tocw-flash-warn { animation: tocw-flashwarn 1.4s ease-out; }
+      #tocw.tocw-flash-good { animation: tocw-flashgood 1.4s ease-out; }
       /* Active / your shift row highlight */
       .tocw-row.active { background: #12233a; border-radius: 6px; box-shadow: inset 3px 0 0 #35b76f; padding-left: 6px; }
       .tocw-row.mine { box-shadow: inset 3px 0 0 #ff9f43; }
@@ -1585,6 +1733,7 @@
               ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
               : ""}
         ${renderAccessHint()}
+        ${renderChainSummary()}
         ${renderWatchBanner()}
         ${renderCoverage()}
         ${live ? renderLive(chain, remaining, bonus, bonusPct, current, next) : renderScheduled(event, scheduledSeconds)}
@@ -1635,6 +1784,10 @@
     });
     document.getElementById("tocw-refresh")?.addEventListener("click", () => void refreshAll(true));
     document.getElementById("tocw-copy")?.addEventListener("click", () => void copySummary());
+    document.getElementById("tocw-summary-dismiss")?.addEventListener("click", () => {
+      state.chainSummary = null;
+      render();
+    });
     document.getElementById("tocw-settings")?.addEventListener("click", () => {
       state.settingsOpen = true;
       render();
@@ -1706,6 +1859,19 @@
     const shown = gaps.slice(0, 4).map((iso) => tctTime(iso).replace(" TCT", "")).join(", ");
     const more = gaps.length > 4 ? ` +${gaps.length - 4}` : "";
     return `<div class="tocw-alert bad">⚠️ ${gaps.length} unmanned shift${gaps.length > 1 ? "s" : ""} ahead — ${shown}${more} TCT. Fill the gaps or the chain can drop.</div>`;
+  }
+
+  // Post-chain recap, shown once a chain ends (until dismissed or the next one starts).
+  function renderChainSummary() {
+    const s = state.chainSummary;
+    if (!s || state.chain?.active) return "";
+    return `
+      <div class="tocw-card" style="border-color:#2f7d55;">
+        <div class="tocw-card-title">🎉 Chain ended</div>
+        <div><strong>${s.totalHits.toLocaleString()}</strong> hits${s.yourHits ? ` · You: <strong>${s.yourHits.toLocaleString()}</strong> hits, ${Math.round(s.yourRespect).toLocaleString()} respect` : ""}</div>
+        <button class="small" id="tocw-summary-dismiss" style="margin-top:8px;">Dismiss</button>
+      </div>
+    `;
   }
 
   // Recent hit pace (your rate, the faction's total rate, and the per-hitter average),
@@ -2141,21 +2307,27 @@
     return Number.isNaN(d.getTime()) ? null : d.toISOString();
   }
 
+  // Paste-ready status block for faction chat: state of the chain + coverage at a
+  // glance so a manager can drop it in and everyone knows what's needed.
   async function copySummary() {
     const event = state.watch?.event || state.signup?.event;
     const chain = state.chain;
     const { current, next } = currentAndNextShift();
-    const lines = [
-      "Chain Watch",
-      event ? `${event.title}: ${tctTime(event.starts_at, true)}` : "No chain scheduled",
-      chain?.active ? `Live: ${chain.current} hits, ${duration(chainRemaining())} drop timer` : "Live: no active chain",
-      current?.watcher_id ? `Current watcher: ${current.watcher_name} (${current.watcher_online_status})` : "Current watcher: none",
-      next?.watcher_id ? `Next watcher: ${next.watcher_name} (${next.watcher_online_status})` : "Next watcher: none",
-    ];
+    const gaps = coverageGaps();
+    const h = handoffStatus();
+    const lines = ["🔗 Chain Watch"];
+    if (chain?.active) lines.push(`LIVE: ${chain.current} hits · ${duration(chainRemaining())} to drop`);
+    else if (event) lines.push(`Next: ${event.title} — ${tctTime(event.starts_at, true)}`);
+    else lines.push("No chain scheduled");
+    lines.push(current?.watcher_id ? `On watch: ${current.watcher_name} (${current.watcher_online_status})` : "On watch: nobody ⚠️");
+    lines.push(next?.watcher_id ? `Next: ${next.watcher_name} @ ${tctTime(next.shift_start)} (${next.watcher_online_status})` : "Next: unassigned ⚠️");
+    if (h && h.state === "risk") lines.push(`🚨 Handoff: ${h.name} isn't online`);
+    if (h && h.state === "gap") lines.push("🚨 Handoff: no watcher after the current shift");
+    if (gaps.length) lines.push(`⚠️ Unmanned: ${gaps.slice(0, 6).map((iso) => tctTime(iso).replace(" TCT", "")).join(", ")} TCT`);
     const text = lines.join("\n");
     try {
       await navigator.clipboard.writeText(text);
-      state.notice = "Summary copied.";
+      state.notice = "Status copied — paste it in faction chat.";
     } catch {
       state.notice = text;
     }
@@ -2213,6 +2385,7 @@
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-vibrate" ${state.alarmVibrate ? "checked" : ""} /> Vibrate (mobile / PDA)</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-flash" ${state.alarmFlash ? "checked" : ""} /> Visual flash</label>
         <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-notify" ${state.alarmNotify ? "checked" : ""} /> Desktop notification</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-alarm-voice" ${state.alarmVoice ? "checked" : ""} /> Voice countdown (speak alerts)</label>
         <div class="grid" style="margin-top:8px;">
           <label>Sound
             <select id="tocw-set-alarm-tone">
@@ -2227,6 +2400,8 @@
           <input id="tocw-set-alarm-thresholds" value="${escapeHtml(state.dropThresholds.join(", "))}" placeholder="60, 30, 10" />
         </label>
         <label class="tocw-check" style="margin-top:8px;"><input type="checkbox" id="tocw-set-wakelock" ${state.wakeLockEnabled ? "checked" : ""} /> Keep screen awake while on watch</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-autofocus" ${state.autoFocus ? "checked" : ""} /> Auto-focus mode when on watch</label>
+        <label class="tocw-check"><input type="checkbox" id="tocw-set-celebrate" ${state.celebrate ? "checked" : ""} /> Celebrate bonus milestones</label>
         <button id="tocw-alarm-test" class="small" style="margin-top:6px;">Test alarm</button>
       </div>
       <div class="grid" style="margin-top:10px;padding:10px;border:1px solid #333;border-radius:8px;">
@@ -2280,6 +2455,9 @@
       state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
       state.chainGoal = Math.max(0, Math.round(Number(valueOf("tocw-set-goal")) || 0));
       state.hitUrl = sanitizeHitUrl(valueOf("tocw-set-hit-url"));
+      state.alarmVoice = checked("tocw-set-alarm-voice");
+      state.autoFocus = checked("tocw-set-autofocus");
+      state.celebrate = checked("tocw-set-celebrate");
       gmSet(STORE.alarm, state.alarm);
       gmSet(STORE.alarmSound, state.alarmSound);
       gmSet(STORE.alarmVibrate, state.alarmVibrate);
@@ -2291,6 +2469,9 @@
       gmSet(STORE.alarmVolume, state.alarmVolume);
       gmSet(STORE.chainGoal, state.chainGoal);
       gmSet(STORE.hitUrl, state.hitUrl);
+      gmSet(STORE.alarmVoice, state.alarmVoice);
+      gmSet(STORE.autoFocus, state.autoFocus);
+      gmSet(STORE.celebrate, state.celebrate);
       if (state.alarm && wasOff) primeAudio(); // Save click is a user gesture → unlock audio
       updateWakeLock();
     };
@@ -2312,6 +2493,7 @@
         try { navigator.vibrate?.([130, 60, 130, 60, 220]); } catch { /* unsupported */ }
       }
       if (checked("tocw-set-alarm-flash")) flashPanel("drop");
+      if (checked("tocw-set-alarm-voice")) speak("Ten seconds — hit now");
       state.alarmTone = prevTone;
       state.alarmVolume = prevVol;
     });
