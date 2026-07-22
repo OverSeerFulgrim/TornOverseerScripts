@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.17.5
+// @version      0.18.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -9,7 +9,6 @@
 // @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @match        https://www.torn.com/*
-// @match        https://torn-overseer-v2.pages.dev/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -26,10 +25,11 @@
   if (window.__tornOverseerChainWatchLoaded) return;
   window.__tornOverseerChainWatchLoaded = true;
 
-  const VERSION = "0.17.5";
+  const VERSION = "0.18.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
-  // The Overseer web app host. The script @match'es it ONLY to auto-capture the signup
-  // token from a /chain/e/:token link the user opens, then hands off to the torn.com panel.
+  // The Overseer web app host — used for the "open the site to publish" deep-link and the
+  // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
+  // signup links are bound by pasting them in Settings, not auto-captured.)
   const OVERSEER_HOST = "torn-overseer-v2.pages.dev";
   const DEFAULT_FUNCTIONS_URL = "https://ijolgywtybadfuvyopeg.supabase.co/functions/v1";
   const DEFAULT_ANON_KEY = "sb_publishable_Kz_QcUJAD6wzEdCEr6FbSg_3TO5JXek";
@@ -430,31 +430,7 @@
     };
   }
 
-  function isOverseerSite() {
-    return location.host === OVERSEER_HOST;
-  }
-
-  // Grab the capability token from a /chain/e/:token link the user opened on the
-  // Overseer site and stash it in (shared) GM storage so the torn.com panel picks it
-  // up. Token entry is never manual — this is the one-click bind.
-  function captureSignupToken() {
-    const m = location.pathname.match(/\/chain\/e\/([^/?#]+)/);
-    if (!m) return null;
-    let token = m[1];
-    try {
-      token = decodeURIComponent(m[1]);
-    } catch {
-      /* keep raw */
-    }
-    token = String(token).trim();
-    if (token && token.length <= 128) {
-      gmSet(STORE.signupToken, token);
-      return token;
-    }
-    return null;
-  }
-
-  // Pull a token out of a pasted signup LINK or a raw token (last-resort manual entry).
+  // Pull a token out of a pasted signup LINK or a raw token (Settings → paste a link).
   function extractSignupToken(input) {
     const s = String(input || "").trim();
     if (!s) return "";
@@ -1889,7 +1865,7 @@
         ${mode === "token"
           ? `<div class="tocw-alert">Viewing via link${event ? ` — ${escapeHtml(event.title)}` : ""}. Anyone can view; signing up verifies you with your Torn key.</div>`
           : mode === "none"
-            ? `<div class="tocw-alert">Open a chain-watch signup link, or add your Torn API key and connect the site session in Settings.</div>`
+            ? `<div class="tocw-alert">Add your Torn API key in Settings and connect the site session — or paste a chain-watch signup link there.</div>`
             : !cfg.sessionToken
               ? `<div class="tocw-alert">Connect the site session in Settings to load the schedule.</div>`
               : ""}
@@ -2618,11 +2594,11 @@
             <div style="font-weight:700;">Signup link (token mode)</div>
             <div class="tocw-muted" style="margin:4px 0 8px;">
               ${cfg.signupToken
-                ? "Linked to a signup event. Open the link leadership posts to switch events. Viewing is open; signing up uses your Torn key to verify your faction."
-                : "Open a chain-watch signup link (from faction chat) once to bind this panel. Viewing needs no key; signing up verifies you with your key."}
+                ? "Linked to a signup event. Paste a different link to switch events. Signing up uses your Torn key to verify your faction."
+                : "Paste a chain-watch signup link (from faction chat) to view + sign up for that specific event here. Optional — session mode already shows your faction's current chain."}
             </div>
             <div class="grid" style="grid-template-columns:1fr auto;gap:8px;align-items:end;">
-              <label style="margin:0;">Paste a link or token (fallback)
+              <label style="margin:0;">Paste a link or token
                 <input id="tocw-set-signup" value="" autocomplete="off" placeholder="https://${OVERSEER_HOST}/chain/e/…" />
               </label>
               <button id="tocw-signup-clear" ${cfg.signupToken ? "" : "disabled"}>Clear link</button>
@@ -2874,34 +2850,9 @@
     });
   }
 
-  // On the Overseer site we ONLY capture the signup token from a /chain/e/:token link
-  // and hand off to the torn.com panel — never render our own UI over the site's app.
-  function bootOverseerCapture() {
-    migrateSecretsFromLocalStorage();
-    const token = captureSignupToken();
-    if (token) showCaptureToast();
-  }
-
-  function showCaptureToast() {
-    if (document.getElementById("tocw-capture-toast")) return;
-    const toast = document.createElement("div");
-    toast.id = "tocw-capture-toast";
-    toast.textContent = "Chain Watch: this event is now linked in your in-game panel. Open Torn to sign up from the game.";
-    toast.style.cssText =
-      "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;" +
-      "max-width:min(92vw,420px);background:#111;color:#fff;border:1px solid #3a3a3a;border-radius:10px;" +
-      "padding:12px 16px;font:14px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.4);";
-    document.body.appendChild(toast);
-    setTimeout(() => toast.remove(), 8000);
-  }
-
   function boot() {
     if (!document.body) {
       setTimeout(boot, 100);
-      return;
-    }
-    if (isOverseerSite()) {
-      bootOverseerCapture();
       return;
     }
     console.info("[Torn Overseer Chain Watch] loaded", location.href);
