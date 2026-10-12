@@ -58,6 +58,35 @@ a way in without one. When the linked chain is over, the panel offers a one-clic
   screen wake lock, a rotating HIT target list and a paste-to-chat status summary.
 - **Managers** additionally get assign / clear / lock, drafting a chain, and faction-wide
   watcher defaults. Those are enforced server-side, not just hidden in the UI.
+- **Faction leadership** (Command access on Overseer: leader, co-leader, admin, or whitelisted
+  for Leadership) gets a **LEADERSHIP** label and a **Leadership** tab — a short to-do list
+  with a count on the tab:
+  - **Not sent yet** — warnings prepared in the last week that were never sent. **Resume**
+    reopens Torn's compose page with that template; **✕** discards it (asks first, logged in
+    Command).
+  - **Needs a message** — flagged members nobody has decided on yet, worst first, with their
+    flags, three dots for check-in → formal → final (filled to the last one actually sent),
+    and the next step. Tap a member: **Are these flags excused?** *Excused* archives their
+    flags as excused; *Not excused* archives them as not excused and offers **Send <next
+    step> on Torn**. Either way the member drops off until a new flag appears, and the
+    decision is on their Overseer profile and in the Command log.
+  - **History** — the last 7 days of messages, grouped by member (collapsed by default).
+
+  "Open in Torn" on a flagged member in Overseer still lands on Torn's compose page, and the
+  script fills in the subject and message from a one-time link only the leader who made it can
+  use. On Torn's compose page an Overseer strip offers Friendly check-in / Formal / Final
+  warning for any faction member, suggesting the step after the last one sent; arriving from
+  the Leadership tab picks the template and fills an empty box for you. The script asks before
+  replacing text already in the box, refuses if the recipient doesn't match, and never presses
+  Send — it only notices when you do, to log what you sent (linked to the excused / not-excused
+  decision it followed).
+- **Bank tab** (every member with a connected session): request money from your faction vault —
+  the same request as `/bank` on Discord and the Overseer site, with "only while I'm online" and
+  your recent history. Faction **bankers** (the Discord banker role, via your linked Discord) also
+  see the open requests and can **Claim** them — the Discord banker card updates — then use the
+  Give link, which opens Torn's give-money page with the member and amount filled in. Leadership
+  without the banker role sees the queue read-only. Overseer closes a request when Torn shows the
+  payment.
 
 ### How your data flows
 
@@ -99,7 +128,7 @@ Single-file userscript, no build step for the script itself.
 
 ```bash
 npm install     # dev-only (jsdom, for the render tests)
-npm test        # 54 unit tests
+npm test        # unit tests (jsdom render tests included)
 npm run check   # node --check + tests
 ```
 
