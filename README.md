@@ -87,6 +87,11 @@ a way in without one. When the linked chain is over, the panel offers a one-clic
   Give link, which opens Torn's give-money page with the member and amount filled in. Leadership
   without the banker role sees the queue read-only. Overseer closes a request when Torn shows the
   payment.
+- **Bank alerts on the TO button** (v0.30.2): with the panel hidden, the launcher shows an amber
+  count of open requests (the same number as the Bank tab) and pulses while any of them is one
+  you haven't looked at yet; a green tick means your own request was paid. Tapping a badged
+  button opens straight onto the Bank tab, which clears the pulse and the tick. It's kept fresh
+  by one light Overseer read a minute while the Torn tab is in front — no Torn API calls.
 
 ### How your data flows
 

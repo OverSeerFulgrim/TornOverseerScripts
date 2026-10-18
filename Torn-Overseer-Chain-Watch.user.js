@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.30.1
+// @version      0.30.2
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -40,7 +40,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.30.1";
+      : "") || "0.30.2";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -58,6 +58,9 @@
   const LIVE_POLL_MS = 3000;
   const IDLE_POLL_MS = 20000;
   const HIDDEN_POLL_MS = 60000;
+  // v0.30.2: how often the Bank queue / your own request is re-read in the background so
+  // the TO launcher can badge it. Overseer-only (no Torn API cost); foreground tab only.
+  const BANK_POLL_MS = 60000;
   // Torn allows 100 req/min per ACCOUNT — not per key, so issuing a second key buys
   // nothing. That one budget is shared with every window this script runs in AND every
   // other script the member uses, whatever key each holds. A flat 3s chain poll spent
@@ -135,6 +138,10 @@
     position: "tocw_position",
     size: "tocw_size",
     launcherPos: "tocw_launcher_pos",
+    // v0.30.2 launcher badge: open bank request ids already looked at (stops the pulse),
+    // and the newest "your money was sent" time already looked at (clears the tick).
+    bankSeen: "tocw_bank_seen",
+    bankPaidSeen: "tocw_bank_paid_seen",
     alarm: "tocw_alarm",
     alarmSound: "tocw_alarm_sound",
     alarmVibrate: "tocw_alarm_vibrate",
@@ -189,7 +196,11 @@
     tab: ["leadership", "bank"].includes(readString(STORE.tab, "chain")) ? readString(STORE.tab, "chain") : "chain",
     leadership: freshLeadershipState(),
     // WO-36 Bank tab: the member's own vault request + (bankers / leadership) the queue.
-    bank: { status: null, queue: null, loading: false, error: null, notice: null, loadedAt: 0, amount: "", online: false, busy: false },
+    bank: {
+      status: null, queue: null, loading: false, error: null, notice: null, loadedAt: 0, amount: "", online: false, busy: false,
+      seen: readIdList(STORE.bankSeen),
+      paidSeenAt: readString(STORE.bankPaidSeen, ""),
+    },
     loading: false,
     error: null,
     notice: null,
@@ -442,6 +453,11 @@
   function readBool(key, fallback) {
     const value = gmGet(key, fallback);
     return typeof value === "boolean" ? value : fallback;
+  }
+
+  function readIdList(key) {
+    const value = gmGet(key, []);
+    return Array.isArray(value) ? value.map(Number).filter((n) => Number.isFinite(n)) : [];
   }
 
   // Read a persisted two-number record. The panel position, the panel size and the
@@ -2604,6 +2620,14 @@
       .tocw-pill.warn { background: #67420c; color: #ffe1a7; }
       .tocw-pill.bad { background: #651922; color: #ffc6cc; }
       .tocw-pill.lead { background: #3b1517; color: #ffb3b3; border: 1px solid #e5484d; }
+      #tocw-launcher .tocw-l-badge { display: none; position: absolute; top: -9px; right: -10px; min-width: 20px; height: 20px; padding: 0 5px; box-sizing: border-box; border-radius: 10px; border: 2px solid #1a222b; background: #ffb347; color: #201200; font: 800 11px/16px Arial, sans-serif; text-align: center; pointer-events: none; }
+      #tocw-launcher .tocw-l-badge.on { display: block; }
+      #tocw-launcher .tocw-l-badge.paid { background: #32d47b; color: #06210f; }
+      #tocw-launcher.tocw-l-pulse { animation: tocw-l-ring 1.6s ease-out infinite; }
+      #tocw-launcher.tocw-l-pulse-paid { animation: tocw-l-ring-paid 1.6s ease-out infinite; }
+      @keyframes tocw-l-ring { 0% { box-shadow: 0 8px 22px rgba(0,0,0,.45), 0 0 0 0 rgba(255,179,71,.75); } 70%, 100% { box-shadow: 0 8px 22px rgba(0,0,0,.45), 0 0 0 14px rgba(255,179,71,0); } }
+      @keyframes tocw-l-ring-paid { 0% { box-shadow: 0 8px 22px rgba(0,0,0,.45), 0 0 0 0 rgba(50,212,123,.7); } 70%, 100% { box-shadow: 0 8px 22px rgba(0,0,0,.45), 0 0 0 14px rgba(50,212,123,0); } }
+      @media (prefers-reduced-motion: reduce) { #tocw-launcher.tocw-l-pulse, #tocw-launcher.tocw-l-pulse-paid { animation: none; } }
       .tocw-tab-count { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 8px; background: #67420c; color: #ffe1a7; font-size: 10px; }
       .tocw-bank-row { border: 1px solid #2b3d52; border-radius: 7px; padding: 8px 9px; display: flex; flex-direction: column; gap: 5px; }
       .tocw-bank-row.mine { border-color: #3f84c4; }
@@ -2890,6 +2914,11 @@
     // Fully hidden: leave only the floating "TO" launcher (tap it to bring the
     // panel back). Cheap early-out so the 1s render tick does no work while hidden.
     const launcher = document.getElementById("tocw-launcher");
+    // The Bank tab on screen marks its requests seen (stops the launcher pulse).
+    if (!state.hidden && !state.collapsed && !state.settingsOpen && !state.focus && activeTab() === "bank") {
+      markBankSeen(state.bank);
+    }
+    updateLauncher();
     if (state.hidden) {
       box.style.display = "none";
       if (launcher) launcher.style.display = "";
@@ -3485,9 +3514,7 @@
     const tabs = availableTabs();
     if (tabs.length < 2) return "";
     const tab = activeTab();
-    const openCount = Array.isArray(state.bank.queue?.requests)
-      ? state.bank.queue.requests.filter((r) => r.status === "open").length
-      : 0;
+    const openCount = bankOpenRequests(state.bank).length;
     // v0.30: the Leadership count (unsent drafts + members needing a message) is
     // fetched once per page so the badge shows before the tab is opened.
     const L = state.leadership;
@@ -4113,6 +4140,7 @@
       B.status = status;
       B.queue = queue;
       B.loadedAt = Date.now();
+      noteBankStatus(B);
     } catch (error) {
       B.error = error?.message || "Banking is unavailable right now.";
     } finally {
@@ -4171,6 +4199,113 @@
         ? `Claimed. Discord's banker card is updated. Use "Give ${money(row.owed)} on Torn" — member and amount are filled in, you press Give.`
         : (res?.message || "Couldn't claim that one.");
     });
+  }
+
+  // ---- v0.30.2: bank alerts on the TO launcher ---------------------------------------
+  // The hidden panel never renders, so the launcher is the only thing on screen. It gets:
+  //   - an amber COUNT of open (unclaimed) requests — the same number as the Bank tab;
+  //   - a PULSE while any of those is one you haven't looked at on the Bank tab yet;
+  //   - a green TICK when your own request was paid since you last looked.
+  // Looking = the Bank tab actually on screen (panel open, not minimised).
+
+  function bankOpenRequests(bank) {
+    const rows = bank?.queue?.requests;
+    return Array.isArray(rows) ? rows.filter((r) => r && r.status === "open") : [];
+  }
+
+  function bankAlert(bank) {
+    const open = bankOpenRequests(bank);
+    const seen = new Set(Array.isArray(bank?.seen) ? bank.seen.map(Number) : []);
+    const fresh = open.filter((r) => !seen.has(Number(r.id))).length;
+    const paidAt = Date.parse(bank?.status?.lastPaid?.at ?? "");
+    const seenAt = Date.parse(bank?.paidSeenAt ?? "");
+    // No baseline yet means we have never read a status: don't tick for an old payment.
+    const paid = Number.isFinite(paidAt) && Number.isFinite(seenAt) && paidAt > seenAt;
+    return { count: open.length, fresh, paid };
+  }
+
+  // First status ever read sets the "paid" baseline, so installing the script (or this
+  // version) doesn't greet you with a tick for a payment from last week.
+  function noteBankStatus(bank) {
+    if (bank.paidSeenAt || !bank.status) return;
+    bank.paidSeenAt = bank.status.lastPaid?.at || "1970-01-01T00:00:00Z";
+    gmSet(STORE.bankPaidSeen, bank.paidSeenAt);
+  }
+
+  // The Bank tab is on screen: everything it shows counts as seen.
+  function markBankSeen(bank) {
+    let changed = false;
+    const openIds = bankOpenRequests(bank).map((r) => Number(r.id)).filter(Number.isFinite);
+    const seen = new Set(Array.isArray(bank.seen) ? bank.seen : []);
+    if (openIds.some((id) => !seen.has(id))) {
+      // Keep only ids still open: the list stays small and a closed id can't linger.
+      bank.seen = openIds;
+      gmSet(STORE.bankSeen, bank.seen);
+      changed = true;
+    }
+    const paidAt = bank.status?.lastPaid?.at;
+    if (paidAt && Date.parse(paidAt) > (Date.parse(bank.paidSeenAt ?? "") || 0)) {
+      bank.paidSeenAt = paidAt;
+      gmSet(STORE.bankPaidSeen, paidAt);
+      changed = true;
+    }
+    return changed;
+  }
+
+  function updateLauncher() {
+    const launcher = document.getElementById("tocw-launcher");
+    if (!launcher) return;
+    const alert = hasBank() ? bankAlert(state.bank) : { count: 0, fresh: 0, paid: false };
+    let badge = launcher.querySelector(".tocw-l-badge");
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "tocw-l-badge";
+      badge.setAttribute("aria-hidden", "true");
+      launcher.appendChild(badge);
+    }
+    const showCount = alert.count > 0;
+    const showPaid = !showCount && alert.paid;
+    badge.textContent = showCount ? (alert.count > 9 ? "9+" : String(alert.count)) : showPaid ? "✓" : "";
+    badge.className = `tocw-l-badge${showCount ? " on" : showPaid ? " on paid" : ""}`;
+    launcher.classList.toggle("tocw-l-pulse", alert.fresh > 0);
+    launcher.classList.toggle("tocw-l-pulse-paid", alert.fresh === 0 && alert.paid);
+    launcher.style.borderColor = alert.fresh > 0 ? "#ffb347" : alert.paid ? "#32d47b" : "#ff6870";
+    const parts = [];
+    if (showCount) parts.push(`${alert.count} bank request${alert.count === 1 ? "" : "s"} waiting`);
+    if (alert.paid) parts.push("your bank request was paid");
+    const label = `Open Torn Overseer${parts.length ? ` — ${parts.join(", ")}` : ""}`;
+    launcher.title = `${label} (drag to move)`;
+    launcher.setAttribute("aria-label", label);
+  }
+
+  // Background read for the badge. Unlike loadBank it never shows a spinner or an error
+  // (nobody asked for it), and it re-renders as a background render so an open form keeps
+  // what's typed in it.
+  async function pollBankQuietly() {
+    const B = state.bank;
+    if (!hasBank() || B.loading || B.busy) return;
+    try {
+      const [status, queue] = await Promise.all([
+        callFunction("member-bank", { action: "status" }),
+        callFunction("member-bank", { action: "queue" }).catch(() => null),
+      ]);
+      B.status = status;
+      B.queue = queue;
+      B.loadedAt = Date.now();
+      noteBankStatus(B);
+    } catch {
+      return; // the badge just keeps its last reading
+    }
+    if (!state.hidden) render({ background: true });
+    updateLauncher();
+  }
+
+  function startBankWatch() {
+    const tick = () => {
+      if (document.visibilityState === "visible") void pollBankQuietly();
+    };
+    setTimeout(tick, 4000);
+    setInterval(tick, BANK_POLL_MS);
   }
 
   // ---- WO-36: pick a template on Torn's compose page (leaders) ---------------------
@@ -5407,6 +5542,14 @@
       state.collapsed = false;
       gmSet(STORE.hidden, false);
       gmSet(STORE.collapsed, false);
+      // A badge means banking wants you: open straight onto the Bank tab.
+      const alert = hasBank() ? bankAlert(state.bank) : null;
+      if (alert && (alert.count > 0 || alert.paid)) {
+        state.settingsOpen = false;
+        state.focus = false;
+        state.tab = "bank";
+        gmSet(STORE.tab, "bank");
+      }
       createShell();
       render();
       const box = document.getElementById("tocw");
@@ -5414,6 +5557,7 @@
     });
     bindLauncherDrag(launcher);
     document.body.appendChild(launcher);
+    updateLauncher();
   }
 
   // Make the "TO" launcher draggable (persisted), while a plain tap still opens the
@@ -5502,6 +5646,7 @@
     // 1s tick updates ONLY the countdown text in place — no innerHTML rebuild, so it
     // never resets the user's scroll position or fights their interaction between polls.
     setInterval(tick, 1000);
+    startBankWatch();
   }
 
   // Surgical per-second update: refresh the drop-timer / "starts in" text without
@@ -5639,6 +5784,12 @@
         availableTabs,
         renderBankTab,
         renderBankQueue,
+        bankOpenRequests,
+        bankAlert,
+        noteBankStatus,
+        markBankSeen,
+        updateLauncher,
+        createLauncher,
         recipientId,
         editorText,
         money,
