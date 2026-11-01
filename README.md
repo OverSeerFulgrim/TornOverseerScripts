@@ -87,6 +87,37 @@ a way in without one. When the linked chain is over, the panel offers a one-clic
   Give link, which opens Torn's give-money page with the member and amount filled in. Leadership
   without the banker role sees the queue read-only. Overseer closes a request when Torn shows the
   payment.
+- **War tab** (v0.32.0): while your faction has a War Room open — a ranked war is announced or
+  live, or a leader opened one on Overseer — a **War** tab appears next to Chain (tagged NEW until
+  you open it, gone again when the war is over). It is the Overseer War Room, in the same look as
+  the site on a phone:
+  - **War rules** from Command (Offline targets only, Stop at X points) with progress to the stop;
+  - the **score** (read from Torn with your key) or, before the war starts, a countdown;
+  - **My target**: your claim with its countdown, Attack and Release, and a notice when someone
+    else ends your claim or hits your target while you hold it;
+  - **My status**: Ready / Away and "When can you fight?";
+  - the **target board** (All / Priority): status dot, idle/hospital/flight line, FF Scouter stats if
+    you added an FF Scouter key, Retal and Assist links, and Reserve / Attack with the same locks as
+    the site (someone else's claim, Avoid, the war rules, the leader's per-member limit). Leaders with
+    release rights (Leader, Co-leader, the War officer, or the "who can unreserve" list) also get
+    **Unreserve** on other members' claims — checked live with your faction's capture key.
+  - On **Torn's attack page** a strip above the fight says whose target it is: *your claim · 3:12
+    left*, *Held by X — don't hit*, or *Free → Reserve 5 min*.
+  - The **TO** button gets a red **!** when your claim was taken, released by someone else, or the
+    stop was reached. With 🔔 alarms on, the panel also chirps 30 seconds before a target you hold
+    comes out of hospital, when your claim is taken, and at the stop.
+  - While the War tab is open your energy and life are shared with Command (as on the site). It
+    polls Overseer every 8 seconds only while the tab is on screen; otherwise one light check a
+    minute, and nothing at all between wars. Attack only ever opens Torn's attack page.
+- **War Room Assist** (v0.31.0): while you are on Torn's attack page against a War Room enemy, the
+  script tells Overseer who you are fighting (every 10s, and once more when you leave), so the War
+  Room's List view can show "<you> is fighting them · In combat now" with an Assist button for the
+  rest of the faction. It sends only the target's player ID, stops when the fight is over (or after
+  Torn's 5 minutes), and never touches the fight itself. Fights against anyone who isn't the
+  current War Room opponent are not recorded.
+- **Unclaim** (v0.30.3): a banker who claimed a request and can't pay after all presses Unclaim
+  next to the Give link — the request goes back to the queue and the Discord banker card returns
+  to "Waiting for a banker". Only the banker who claimed it can, and not once it's part-paid.
 - **Bank alerts on the TO button** (v0.30.2): with the panel hidden, the launcher shows an amber
   count of open requests (the same number as the Bank tab) and pulses while any of them is one
   you haven't looked at yet; a green tick means your own request was paid. Tapping a badged
@@ -100,10 +131,14 @@ a way in without one. When the linked chain is over, the panel offers a one-clic
 | Live chain, hit count, roster, attack log | **`api.torn.com` directly, using your key** |
 | Chain schedule, shifts, signups, absences | Overseer backend (Supabase functions) |
 | Fallback chain + leaderboard | Overseer backend, when your own Torn read fails |
+| Who you are fighting (War Room Assist) | Sent **to** the Overseer backend from Torn's attack page: the target's ID only |
+| War Room board, claims, rules (War tab) | Overseer backend (`war-room`) |
+| War score, your energy / life | **`api.torn.com` directly, using your key** (`/faction/wars`, `/user/bars`); energy and life are then sent to Overseer for Command |
+| Stat estimates (optional) | **`ffscouter.com`**, with your own FF Scouter key, only if you added one |
 
 Both are reached through the userscript manager (`GM_xmlhttpRequest`) or Torn PDA — never
 through the page's own `fetch` — so torn.com's scripts never see your credentials. The
-`@connect` entries in the metadata block list exactly these two hosts.
+`@connect` entries in the metadata block list exactly these hosts (plus `ffscouter.com`, used only with your own FF Scouter key).
 
 **Rate limits:** Torn allows 100 requests/minute **per account**, not per key, so it's shared
 with every other Torn script you run and a second key won't widen it. Chain Watch keeps its

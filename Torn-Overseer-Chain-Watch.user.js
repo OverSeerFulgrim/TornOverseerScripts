@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.30.2
-// @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup. Read-only — never attacks for you.
+// @version      0.32.0
+// @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
+// @icon         https://tornoverseer.com/favicon-32.png
+// @icon64       https://tornoverseer.com/icon-64.png
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
 // @downloadURL  https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
 // @updateURL    https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js
@@ -16,6 +18,7 @@
 // @grant        GM_notification
 // @connect      ijolgywtybadfuvyopeg.supabase.co
 // @connect      api.torn.com
+// @connect      ffscouter.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -40,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.30.2";
+      : "") || "0.32.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -166,6 +169,11 @@
     // hand-off from "Send <step>" / "Resume" to the compose picker on messages.php.
     leadHistory: "tocw_lead_history",
     composeHandoff: "tocw_compose_handoff",
+    // v0.32.0 War tab: All / Priority on the board, the war whose NEW tag was seen, and the
+    // optional FF Scouter key (a third-party key, so GM-only like the Torn key).
+    warView: "tocw_war_view",
+    warSeenRoom: "tocw_war_seen_room",
+    ffKey: "tocw_ff_key",
   };
 
   // Secrets must live in the userscript manager's per-script GM storage ONLY — never
@@ -173,7 +181,7 @@
   // storage is unavailable we refuse to persist them rather than leak to the page.
   // The signup token is a capability (posted in faction chat, but still) and the claim
   // secret proves ownership of a slot, so both are GM-only too.
-  const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken, STORE.signupToken, STORE.claimSecret]);
+  const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken, STORE.signupToken, STORE.claimSecret, STORE.ffKey]);
 
   function hasGmStorage() {
     return typeof GM_getValue === "function" && typeof GM_setValue === "function";
@@ -193,7 +201,9 @@
 
   const state = {
     // WO-36 Leadership tab: "chain" | "leadership", and the warnings it lists.
-    tab: ["leadership", "bank"].includes(readString(STORE.tab, "chain")) ? readString(STORE.tab, "chain") : "chain",
+    tab: ["leadership", "bank", "war"].includes(readString(STORE.tab, "chain")) ? readString(STORE.tab, "chain") : "chain",
+    // v0.32.0 War tab (only while a War Room is open).
+    war: freshWarState(),
     leadership: freshLeadershipState(),
     // WO-36 Bank tab: the member's own vault request + (bankers / leadership) the queue.
     bank: {
@@ -2639,6 +2649,69 @@
       .tocw-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; background: #0a101c; border: 1px solid #2b3d52; border-radius: 7px; padding: 3px; }
       #tocw .tocw-tabs button { border: 0; background: transparent; color: #9fb2cf; font-weight: 700; }
       #tocw .tocw-tabs button.on { background: #1b2740; color: #fff; }
+      /* v0.32.0 War tab — the site's War Room look (cards, red segmented buttons, stacked rows). */
+      .tocw-tab-count.war { background: #e23b3b; color: #fff; }
+      #tocw .tocw-war-pill { display: flex; width: 100%; justify-content: space-between; text-align: left; background: #3b1517; border: 1px solid #e5484d; color: #ffd7da; font-weight: 800; }
+      .tocw-wr { display: flex; flex-direction: column; gap: 10px; }
+      .tocw-wr-card { background: #161d28; border: 1px solid #232c3a; border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 9px; }
+      .tocw-wr-card h3 { margin: 0; font-size: 14px; font-weight: 700; color: #e6ebf2; }
+      .tocw-wr-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .tocw-wr-muted { color: #9aa7b8; font-weight: 400; }
+      .tocw-wr-fine { font-size: 12px; color: #9aa7b8; line-height: 1.35; }
+      .tocw-wr-fine.ok { color: #3ecf8e; } .tocw-wr-fine.warn { color: #e0a23b; } .tocw-wr-fine.note { color: #c7b8ff; }
+      .tocw-wr-label { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #9aa7b8; margin-bottom: 5px; }
+      .tocw-wr-big { font-size: 28px; font-weight: 800; letter-spacing: .02em; }
+      .tocw-wr-score { display: flex; align-items: baseline; gap: 8px; }
+      .tocw-wr-score .us { font-size: 24px; font-weight: 800; color: #3ecf8e; } .tocw-wr-score .them { font-size: 24px; font-weight: 800; color: #f25151; }
+      .tocw-wr-bar { height: 6px; border-radius: 3px; background: #3b1517; overflow: hidden; } .tocw-wr-bar.thin { height: 4px; background: #0b0e13; }
+      .tocw-wr-bar > div { height: 100%; background: #3ecf8e; } .tocw-wr-strip.stop .tocw-wr-bar > div { background: #e23b3b; } .tocw-wr-strip.warn .tocw-wr-bar > div { background: #e0a23b; }
+      .tocw-wr-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+      .tocw-wr-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; background: #1d2633; color: #9aa7b8; }
+      .tocw-wr-badge.ready { background: rgba(62,207,142,.14); color: #3ecf8e; } .tocw-wr-badge.hosp { background: rgba(226,59,59,.16); color: #f25151; }
+      .tocw-wr-badge.away { background: rgba(62,166,224,.14); color: #6cb6e6; } .tocw-wr-badge.jail { background: rgba(224,162,59,.16); color: #e0a23b; }
+      .tocw-wr-strip { display: flex; flex-direction: column; gap: 6px; padding: 9px 11px; border: 1px solid #2f3b4d; border-radius: 8px; background: #11161f; }
+      .tocw-wr-strip.warn { border-color: #6b4b16; background: #2a1f0d; color: #f0c27a; } .tocw-wr-strip.stop { border: 2px solid #e23b3b; background: #3b1517; color: #ffd7da; }
+      .tocw-wr-alert { padding: 8px 10px; border-radius: 6px; font-size: 12px; background: #1d2638; border: 1px solid #34465d; color: #d9ebff; }
+      .tocw-wr-alert.warn { background: #2a1f0d; border-color: #6b4b16; color: #f0c27a; } .tocw-wr-alert.stop { background: #3b1517; border-color: #e23b3b; color: #ffd7da; }
+      .tocw-wr-alert.muted { color: #9aa7b8; }
+      .tocw-wr-seg { display: grid; gap: 4px; padding: 4px; border: 1px solid #2f3b4d; border-radius: 8px; background: #0b0e13; }
+      .tocw-wr-seg.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #tocw .tocw-wr-seg button { min-height: 34px; border: 0; border-radius: 6px; background: transparent; color: #9aa7b8; font-weight: 700; padding: 6px 8px; }
+      #tocw .tocw-wr-seg button.on { background: #e23b3b; color: #fff; }
+      .tocw-wr-btn { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 34px; padding: 4px 12px; border: 1px solid #2f3b4d; border-radius: 6px; background: #1d2633; color: #e6ebf2 !important; font: 600 12px Arial, sans-serif; text-decoration: none !important; cursor: pointer; box-sizing: border-box; }
+      .tocw-wr-btn.small { min-height: 26px; padding: 2px 8px; font-size: 11px; }
+      .tocw-wr-btn.primary, .tocw-wr-btn.red { background: #e23b3b; border-color: transparent; color: #fff !important; }
+      .tocw-wr-btn.retal { border-color: #e23b3b; color: #f25151 !important; } .tocw-wr-btn.assist { border-color: #e0a23b; color: #e0a23b !important; }
+      .tocw-wr-btn[disabled] { opacity: .55; cursor: not-allowed; }
+      #tocw button.tocw-wr-btn { padding: 4px 12px; } #tocw button.tocw-wr-btn.small { padding: 2px 8px; }
+      #tocw button.tocw-wr-btn.primary { background: #e23b3b; border-color: transparent; }
+      .tocw-wr-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .tocw-wr-list { border: 1px solid #232c3a; border-radius: 8px; overflow: hidden; }
+      .tocw-wr-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 10px; align-items: start; padding: 10px; border-bottom: 1px solid #232c3a; }
+      .tocw-wr-row:last-child { border-bottom: 0; }
+      .tocw-wr-row.mine { background: rgba(62,207,142,.06); box-shadow: inset 3px 0 0 #3ecf8e; } .tocw-wr-row.avoid { opacity: .72; }
+      .tocw-wr-full { grid-column: 1 / -1; min-width: 0; }
+      .tocw-wr-name { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; font-size: 13px; font-weight: 700; } .tocw-wr-name.big { font-size: 15px; }
+      .tocw-wr-dot { display: inline-block; flex: none; width: 9px; height: 9px; border-radius: 50%; background: #66738a; }
+      .tocw-wr-dot.online { background: #3ecf8e; } .tocw-wr-dot.idle { background: #e6c84a; } .tocw-wr-dot.hospital { background: #e23b3b; } .tocw-wr-dot.travel { background: #6cb6e6; } .tocw-wr-dot.jail { background: #a98bf0; }
+      .tocw-wr-state { font-size: 12px; margin-top: 2px; color: #9aa7b8; }
+      .tocw-wr-state.online { color: #3ecf8e; } .tocw-wr-state.idle { color: #e6c84a; } .tocw-wr-state.hospital { color: #f25151; } .tocw-wr-state.travel { color: #6cb6e6; } .tocw-wr-state.jail { color: #a98bf0; }
+      .tocw-wr-help { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12px; } .tocw-wr-help > div:first-child { flex-basis: 100%; }
+      .tocw-wr-help.retal > div:first-child { color: #f25151; } .tocw-wr-help.assist > div:first-child { color: #e0a23b; } .tocw-wr-help + .tocw-wr-help { margin-top: 6px; }
+      .tocw-wr-mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+      .tocw-wr-tone.easy { color: #3ecf8e; font-weight: 700; } .tocw-wr-tone.fair { color: #e0a23b; font-weight: 700; } .tocw-wr-tone.tough { color: #f25151; font-weight: 700; }
+      .tocw-wr-claim { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+      .tocw-wr-attack { justify-self: end; text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; max-width: 180px; }
+      #tocw-launcher .tocw-l-badge.war { background: #e23b3b; color: #fff; }
+      /* The claim strip on Torn's attack page (outside the panel). */
+      #tocw-ab-host { position: relative; z-index: 100; margin: 6px 0; font: 13px Arial, sans-serif; }
+      #tocw-ab-host .tocw-ab { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; }
+      #tocw-ab-host .tocw-ab-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+      #tocw-ab-host .tocw-ab.mine { background: #0f2a1e; border: 1px solid #2c7a52; color: #d6ffe8; } #tocw-ab-host .tocw-ab.mine .tocw-ab-dot { background: #3fa66b; }
+      #tocw-ab-host .tocw-ab.held { background: #3b1517; border: 2px solid #e5484d; color: #ffd7da; font-size: 14px; } #tocw-ab-host .tocw-ab.held .tocw-ab-dot { background: #e5484d; }
+      #tocw-ab-host .tocw-ab.free { background: #13202f; border: 1px solid #3f84c4; color: #d9ebff; } #tocw-ab-host .tocw-ab.free .tocw-ab-dot { background: #5f6b7d; }
+      #tocw-ab-host .tocw-ab.stop { background: #3b1517; border: 2px solid #e5484d; color: #ffd7da; font-size: 14px; }
+      #tocw-ab-host .tocw-wr-fine { color: #9aa7b8; font-size: 12px; }
       .tocw-warn-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; padding: 7px 9px; border: 1px solid #1f2a3e; border-radius: 6px; }
       .tocw-warn-status { font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 999px; align-self: center; background: #2a3346; color: #c3ccda; }
       .tocw-warn-status.sent { background: #103d2b; color: #d6ffe8; }
@@ -2918,6 +2991,11 @@
     if (!state.hidden && !state.collapsed && !state.settingsOpen && !state.focus && activeTab() === "bank") {
       markBankSeen(state.bank);
     }
+    // The War tab on screen: this war's NEW tag is seen.
+    if (warTabOnScreen() && warIsNew()) {
+      state.war.seenRoom = warRoomKey();
+      gmSet(STORE.warSeenRoom, state.war.seenRoom);
+    }
     updateLauncher();
     if (state.hidden) {
       box.style.display = "none";
@@ -3028,7 +3106,16 @@
       <div class="tocw-body">
         ${state.error ? `<div class="tocw-alert bad">${escapeHtml(state.error)}</div>` : ""}
         ${state.notice ? `<div class="tocw-alert">${escapeHtml(state.notice)}</div>` : ""}
-        ${state.settingsOpen ? renderSettingsBody() : state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : activeTab() === "bank" ? `
+        ${state.settingsOpen ? renderSettingsBody() : state.focus ? renderFocus(chain, remaining, live, event, scheduledSeconds) : activeTab() === "war" ? `
+        ${versionAlert}
+        ${renderTabs()}
+        ${renderWarTab()}
+        <div class="tocw-actions">
+          <button id="tocw-war-refresh" class="primary" ${state.war.inFlight ? "disabled" : ""}>${state.war.inFlight ? "Loading" : "Refresh"}</button>
+          <a class="tocw-wr-btn" href="${OVERSEER_WAR_URL}" target="_blank" rel="noreferrer noopener">Open on site ↗</a>
+          <button id="tocw-settings">Settings</button>
+        </div>
+        ` : activeTab() === "bank" ? `
         ${versionAlert}
         ${renderTabs()}
         ${renderBankTab()}
@@ -3063,6 +3150,7 @@
         ${renderChainStale()}
         ${renderAccessHint()}
         ${renderChainSummary()}
+        ${renderWarPill()}
         ${renderWatchBanner()}
         ${renderCoverage()}
         ${renderScheduleForm()}
@@ -3173,6 +3261,8 @@
     }
     document.getElementById("tocw-lead-refresh")?.addEventListener("click", () => { state.leadership.notice = null; void loadLeadership(true); });
     wireLeadership(box);
+    wireWar(box);
+    document.getElementById("tocw-war-pill")?.addEventListener("click", () => setTab("war"));
     document.getElementById("tocw-bank-refresh")?.addEventListener("click", () => void loadBank(true));
     document.getElementById("tocw-bank-amount")?.addEventListener("input", (e) => { state.bank.amount = e.target.value; });
     document.getElementById("tocw-bank-online")?.addEventListener("change", (e) => { state.bank.online = Boolean(e.target.checked); });
@@ -3183,6 +3273,9 @@
     document.getElementById("tocw-bank-cancel")?.addEventListener("click", () => void bankCancel());
     for (const c of box.querySelectorAll("[data-tocw-bank-claim]")) {
       c.addEventListener("click", () => void bankClaim(Number(c.getAttribute("data-tocw-bank-claim"))));
+    }
+    for (const c of box.querySelectorAll("[data-tocw-bank-unclaim]")) {
+      c.addEventListener("click", () => void bankUnclaim(Number(c.getAttribute("data-tocw-bank-unclaim"))));
     }
     document.getElementById("tocw-connect-retry")?.addEventListener("click", () => {
       retryConnectNow();
@@ -3491,6 +3584,7 @@
 
   function availableTabs() {
     const tabs = ["chain"];
+    if (warRoomOpen()) tabs.push("war");
     if (canLead()) tabs.push("leadership");
     if (hasBank()) tabs.push("bank");
     return tabs;
@@ -3501,14 +3595,18 @@
   }
 
   function setTab(tab) {
-    state.tab = ["leadership", "bank"].includes(tab) ? tab : "chain";
+    state.tab = ["leadership", "bank", "war"].includes(tab) ? tab : "chain";
     gmSet(STORE.tab, state.tab);
+    if (state.tab === "war") {
+      state.war.loadedAt = 0; // poll now, not in up to 8s
+      state.war.scoreAt = 0;
+    }
     if (state.tab === "leadership") void loadLeadership(false);
     if (state.tab === "bank") void loadBank(false);
     render();
   }
 
-  const TAB_LABELS = { chain: "Chain", leadership: "Leadership", bank: "Bank" };
+  const TAB_LABELS = { chain: "Chain", war: "War", leadership: "Leadership", bank: "Bank" };
 
   function renderTabs() {
     const tabs = availableTabs();
@@ -3524,7 +3622,7 @@
     const leadCount = Number(L.todo?.count) || 0;
     const count = (t) => (t === "bank" ? openCount : t === "leadership" ? leadCount : 0);
     return `<div class="tocw-tabs" role="tablist" aria-label="Chain Watch sections" style="grid-template-columns:repeat(${tabs.length},minmax(0,1fr));">
-      ${tabs.map((t) => `<button class="small ${tab === t ? "on" : ""}" role="tab" aria-selected="${tab === t}" data-tocw-tab="${t}">${TAB_LABELS[t]}${count(t) > 0 ? ` <span class="tocw-tab-count">${count(t)}</span>` : ""}</button>`).join("")}
+      ${tabs.map((t) => `<button class="small ${tab === t ? "on" : ""}" role="tab" aria-selected="${tab === t}" data-tocw-tab="${t}">${TAB_LABELS[t]}${t === "war" && warIsNew() ? ` <span class="tocw-tab-count war">NEW</span>` : count(t) > 0 ? ` <span class="tocw-tab-count">${count(t)}</span>` : ""}</button>`).join("")}
     </div>`;
   }
 
@@ -4099,8 +4197,13 @@
       : rows.map((r) => {
         const short = r.balance_at_request != null && r.balance_at_request < r.owed;
         const hold = r.must_be_online && r.online === false;
+        // v0.30.3: the claimer can hand a claimed request back (not a part-paid one —
+        // money is already in flight there, and the backend refuses it).
+        const unclaim = r.claimed_by_me && r.status === "claimed" && q.banker
+          ? ` <button class="small" data-tocw-bank-unclaim="${r.id}" ${state.bank.busy ? "disabled" : ""} title="Put it back in the queue for another banker">Unclaim</button>`
+          : "";
         const action = r.claimed_by_me && r.give_url
-          ? `<a class="tocw-give" href="${escapeHtml(r.give_url)}">Give ${money(r.owed)} on Torn ↗</a>`
+          ? `<a class="tocw-give" href="${escapeHtml(r.give_url)}">Give ${money(r.owed)} on Torn ↗</a>${unclaim}`
           : r.status === "open"
             ? (q.banker ? `<button class="small primary" data-tocw-bank-claim="${r.id}" ${state.bank.busy ? "disabled" : ""}>Claim</button>` : "")
             : `<span class="tocw-muted">Claimed by ${escapeHtml(r.claimed_by_name || "a banker")}</span>`;
@@ -4111,14 +4214,14 @@
           </div>
           <div class="tocw-muted">${escapeHtml(agoText(r.created_at))} · via ${escapeHtml(r.source === "site" ? "Overseer" : "Discord")}${r.must_be_online ? " · only while online" : ""}</div>
           ${short ? `<div style="color:#ffc6cc;">Vault balance ${money(r.balance_at_request)} when asked — short</div>` : hold ? `<div style="color:#ffdca1;">Offline now — hold off; you'll be pinged when they come online</div>` : ""}
-          <div>${action}</div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">${action}</div>
         </div>`;
       }).join("");
     return `<div class="tocw-card">
       <div class="tocw-card-title">Requests to fill</div>
       <div style="display:flex;flex-direction:column;gap:6px;">${list}</div>
       <div class="tocw-muted" style="margin-top:6px;">${q.banker
-        ? "Claiming updates the banker card on Discord. Overseer closes the request when Torn shows the payment."
+        ? "Claiming updates the banker card on Discord. Can't pay after all? Unclaim puts it back for another banker. Overseer closes the request when Torn shows the payment."
         : q.linked
           ? "View only — claiming needs the faction's banker role on Discord."
           : "View only — link your Discord (/verify) so Overseer can see a banker role."}</div>
@@ -4201,6 +4304,21 @@
     });
   }
 
+  // v0.30.3: hand a claimed request back. Same backend path as Discord's Unclaim
+  // button (member-bank → bankButton), so the banker card is edited back to
+  // "Waiting for a banker" and only the banker who claimed it may do it.
+  function bankUnclaim(id) {
+    if (!id) return;
+    return bankAct({ action: "unclaim", id }, (res) => {
+      if (res?.queue) state.bank.queue = res.queue;
+      const row = res?.queue?.requests?.find((r) => r.id === id);
+      const released = row ? row.status === "open" : false;
+      state.bank[released ? "notice" : "error"] = released
+        ? "Unclaimed — it's back in the queue and Discord's banker card says so."
+        : (res?.message || "Couldn't unclaim that one.");
+    });
+  }
+
   // ---- v0.30.2: bank alerts on the TO launcher ---------------------------------------
   // The hidden panel never renders, so the launcher is the only thing on screen. It gets:
   //   - an amber COUNT of open (unclaimed) requests — the same number as the Bank tab;
@@ -4263,16 +4381,19 @@
       badge.setAttribute("aria-hidden", "true");
       launcher.appendChild(badge);
     }
+    const war = warAlert();
     const showCount = alert.count > 0;
-    const showPaid = !showCount && alert.paid;
-    badge.textContent = showCount ? (alert.count > 9 ? "9+" : String(alert.count)) : showPaid ? "✓" : "";
-    badge.className = `tocw-l-badge${showCount ? " on" : showPaid ? " on paid" : ""}`;
-    launcher.classList.toggle("tocw-l-pulse", alert.fresh > 0);
+    const showWar = !showCount && war != null;
+    const showPaid = !showCount && !showWar && alert.paid;
+    badge.textContent = showCount ? (alert.count > 9 ? "9+" : String(alert.count)) : showWar ? "!" : showPaid ? "✓" : "";
+    badge.className = `tocw-l-badge${showCount ? " on" : showWar ? " on war" : showPaid ? " on paid" : ""}`;
+    launcher.classList.toggle("tocw-l-pulse", alert.fresh > 0 || war != null);
     launcher.classList.toggle("tocw-l-pulse-paid", alert.fresh === 0 && alert.paid);
     launcher.style.borderColor = alert.fresh > 0 ? "#ffb347" : alert.paid ? "#32d47b" : "#ff6870";
     const parts = [];
     if (showCount) parts.push(`${alert.count} bank request${alert.count === 1 ? "" : "s"} waiting`);
     if (alert.paid) parts.push("your bank request was paid");
+    if (war) parts.push(war);
     const label = `Open Torn Overseer${parts.length ? ` — ${parts.join(", ")}` : ""}`;
     launcher.title = `${label} (drag to move)`;
     launcher.setAttribute("aria-label", label);
@@ -4298,6 +4419,1294 @@
     }
     if (!state.hidden) render({ background: true });
     updateLauncher();
+  }
+
+  // ── v0.31.0: War Room Assist heartbeat (Overseer WO-47 slice M4) ──────────────
+  // Torn's API never shows a fight in progress, so the War Room's Assist column ("Kiern0
+  // is fighting them · In combat now") comes from here: while you are on Torn's attack
+  // page and the fight is not over, post `war-room` `fighting { targetId }` every 10s,
+  // and `fighting { targetId: null }` when you leave. Display-only — it reads the URL and
+  // the page text, never presses anything. The server records it only when the target is
+  // on the current War Room enemy roster; anything else answers `recorded: false` and the
+  // heartbeat stops for that page.
+  const FIGHT_HEARTBEAT_MS = 10_000;
+  // Torn ends every fight after 5 minutes; past that (plus slack) we stop on our own even
+  // if the end-of-fight text was never recognised.
+  const FIGHT_MAX_MS = 5 * 60_000 + 30_000;
+
+  /** The defender id when `href` is Torn's attack page (loader.php?sid=attack&user2ID=…), else null. */
+  function attackTargetFromUrl(href) {
+    try {
+      const u = new URL(href);
+      if (!/(^|\.)torn\.com$/i.test(u.hostname)) return null;
+      if (!/\/loader\.php$/i.test(u.pathname) || u.searchParams.get("sid") !== "attack") return null;
+      const id = Number(u.searchParams.get("user2ID"));
+      return Number.isInteger(id) && id > 0 ? id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The end-of-fight result Torn writes in its dialog ("You hospitalized X", "You lost",
+  // "You mugged X and stole $…", "X escaped", "Stalemate"…). Matched only inside the
+  // fight's dialog element, never the whole page (faction chat would trip it).
+  const FIGHT_OVER_RE =
+    /\b(you (hospitali[sz]ed|mugged|defeated|attacked|lost|left|arrested|were defeated|took .+ down)|stalemate|escaped|fight (is )?over|timed out)\b/i;
+
+  function fightLooksOver(text) {
+    return FIGHT_OVER_RE.test(String(text || ""));
+  }
+
+  /** Keep beating? Not once stopped, not once the fight reads as over, not past Torn's 5 minutes. */
+  function shouldBeat({ stopped, over, startedMs, nowMs }) {
+    return !stopped && !over && nowMs - startedMs < FIGHT_MAX_MS;
+  }
+
+  const fight = { targetId: null, startedMs: 0, timer: null, stopped: false, sentAny: false };
+
+  function fightDialogText() {
+    const nodes = document.querySelectorAll('[class*="dialog"], [class*="Dialog"]');
+    let out = "";
+    for (const n of nodes) out += ` ${n.textContent || ""}`;
+    return out;
+  }
+
+  function stopFightWatch(clearRow) {
+    if (fight.timer) clearInterval(fight.timer);
+    fight.timer = null;
+    const wasRunning = !fight.stopped;
+    fight.stopped = true;
+    // Only clear a row we may have written; best effort (a closing tab may cut it short —
+    // the server forgets a fight 20s after its last heartbeat anyway).
+    if (clearRow && wasRunning && fight.sentAny) {
+      callFunction("war-room", { action: "fighting", targetId: null }).catch(() => {});
+    }
+  }
+
+  function startFightWatch() {
+    const id = attackTargetFromUrl(location.href);
+    if (!id || !settings().sessionToken) return;
+    fight.targetId = id;
+    fight.startedMs = Date.now();
+    fight.stopped = false;
+    const beat = async () => {
+      const go = shouldBeat({
+        stopped: fight.stopped,
+        over: fightLooksOver(fightDialogText()),
+        startedMs: fight.startedMs,
+        nowMs: Date.now(),
+      });
+      if (!go) {
+        stopFightWatch(true);
+        return;
+      }
+      try {
+        const res = await callFunction("war-room", { action: "fighting", targetId: id });
+        fight.sentAny = true;
+        // Not a War Room enemy (or no room open): nothing to show, stop asking.
+        if (res && res.recorded === false) stopFightWatch(false);
+      } catch {
+        // Offline, no session or Torn rate-limits: Assist is a nice-to-have; try next beat.
+      }
+    };
+    void beat();
+    fight.timer = setInterval(() => void beat(), FIGHT_HEARTBEAT_MS);
+    window.addEventListener("pagehide", () => stopFightWatch(true), { once: true });
+  }
+
+  // ══ v0.32.0: War tab — the Overseer War Room inside Chain Watch (WO-55) ══════════════
+  // docs/chain-watch-war-tab-plan.md. The same `war-room` function as the site's War Room,
+  // with this script's own session. The tab only exists while a War Room is open (a ranked
+  // war is announced or live, or a leader set an opponent); between wars there is nothing
+  // to see and nothing is polled beyond one light `peek` a minute.
+  //
+  // The pure helpers below (war*) are hand-ported from the site's
+  // web/src/features/faction/war/room/warRoomModel.ts + warRulesModel.ts + claimJumpModel.ts
+  // + reserveAlarmModel.ts, under the same names with a `war` prefix. test/war-room-parity
+  // runs both on the same fixtures, so a change on the site that isn't mirrored here fails.
+  const WAR_POLL_MS = 8000; // War tab on screen: the full state (the site polls every 6s)
+  const WAR_PEEK_MS = 60000; // otherwise: does a room exist? (no roster, no "in the room")
+  const WAR_SCORE_MS = 30000; // the scoreboard, read from Torn with your own key
+  const WAR_BARS_MS = 60000; // energy / life shared with Command while the tab is open
+  const WAR_POLL_TIMEOUT_MS = 15000;
+  const WAR_ATTACK_PAGE_MS = 15000; // the claim banner on Torn's attack page
+  const WAR_RESERVATION_SECONDS = 300;
+  const WAR_ALARM_LEAD_S = 30;
+  const FF_TTL_MS = 10 * 60000;
+  const OVERSEER_WAR_URL = `https://${OVERSEER_HOST}/faction/war?view=room`;
+
+  const WAR_NO_RULES = {
+    offlineOnly: false, idleCountsOffline: false, stopAt: null, score: null, scoreAvailable: false,
+    reached: false, close: false, toGo: null, stoppedAt: null, setByName: null, setAt: null, canEdit: false,
+  };
+  const WAR_PLEDGES = [
+    { id: "start", label: "At start" },
+    { id: "shortly", label: "Shortly after" },
+    { id: "later", label: "Later" },
+    { id: "away", label: "Hosp / travel" },
+  ];
+
+  function warFormatCountdown(seconds) {
+    const total = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = String(total % 60).padStart(2, "0");
+    return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
+  }
+
+  function warFormatSpan(seconds) {
+    const s = Math.max(0, Math.floor(seconds));
+    if (s < 60) return `${s}s`;
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+  }
+
+  function warFormatPoints(n) {
+    return Math.round(n).toLocaleString("en-US");
+  }
+
+  function warLocalClock(epochSec) {
+    return new Date(epochSec * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  function warActivityOf(m) {
+    const a = String(m.lastAction || "").toLowerCase();
+    return a === "online" || a === "idle" || a === "offline" ? a : "unknown";
+  }
+
+  function warStateKindOf(m, nowSec) {
+    const s = String(m.state || "").toLowerCase();
+    const timed = m.until === 0 || m.until > nowSec;
+    if (s === "okay") return "okay";
+    if (s === "hospital") return timed ? "hospital" : "okay";
+    if (s === "jail") return timed ? "jail" : "okay";
+    if (s === "traveling" || s === "abroad") return "travel";
+    return "other";
+  }
+
+  function warReservationSecondsLeft(r, nowMs) {
+    const at = new Date(r.expiresAt).getTime();
+    return Number.isFinite(at) ? Math.max(0, Math.floor((at - nowMs) / 1000)) : 0;
+  }
+
+  function warRulesOf(st) {
+    return (st && st.rules) || WAR_NO_RULES;
+  }
+
+  function warActivityAllowed(rules, activity) {
+    if (!rules.offlineOnly) return true;
+    if (activity === "offline") return true;
+    return activity === "idle" && rules.idleCountsOffline;
+  }
+
+  function warRuleLocks(rules, input) {
+    const offLimits = !warActivityAllowed(rules, input.activity);
+    if (rules.reached) {
+      const text = `Command's stop at ${warFormatPoints(rules.stopAt ?? 0)} was reached`;
+      return { offLimits, attack: text, reserve: text };
+    }
+    const closeText = "Close to the stop — no new fights";
+    if (offLimits) {
+      const attack = input.isMine ? "Came online — hold until they go offline" : "Command: offline targets only";
+      return { offLimits, attack, reserve: rules.close ? closeText : "Command: offline targets only" };
+    }
+    if (rules.close) return { offLimits, attack: input.isMine ? null : closeText, reserve: closeText };
+    return { offLimits, attack: null, reserve: null };
+  }
+
+  function warHiddenByRules(rules, input) {
+    return rules.offlineOnly && input.offLimits && !input.isMine && !input.hasRetal;
+  }
+
+  function warRetalLock(rules) {
+    return rules.reached ? `Command's stop at ${warFormatPoints(rules.stopAt ?? 0)} was reached` : null;
+  }
+
+  function warAttackCheck(input) {
+    const { reservation } = input;
+    if (input.isMine) return { mode: "open" };
+    if (reservation) {
+      const left = warFormatCountdown(warReservationSecondsLeft(reservation, input.nowMs));
+      return { mode: "locked", reason: `Reserved by ${reservation.attackerName ?? "someone"} · ${left} left` };
+    }
+    if (input.priority === "avoid") {
+      return input.isCommand ? { mode: "open" } : { mode: "locked", reason: "Command marked this Avoid" };
+    }
+    return input.reserveOnAttack ? { mode: "reserve-then-open" } : { mode: "open" };
+  }
+
+  function warFfLabel(stat) {
+    if (!stat) return null;
+    const parts = [];
+    if (stat.battleEstimateHuman) parts.push(stat.battleEstimateHuman);
+    if (stat.fairFight != null) parts.push(`FF ${stat.fairFight.toFixed(2)}`);
+    return parts.length ? parts.join(" · ") : null;
+  }
+
+  function warStateLabelOf(m, kind, left) {
+    if (kind === "okay") return "Okay";
+    if (kind === "hospital") return `Hosp ${warFormatCountdown(left ?? 0)}`;
+    if (kind === "jail") return `Jail ${warFormatCountdown(left ?? 0)}`;
+    if (kind === "travel") return m.description || m.state;
+    return m.state;
+  }
+
+  /** ff: a Map or plain object of player id → { fairFight, battleEstimate, battleEstimateHuman }. */
+  function warFfGet(ff, id) {
+    if (!ff) return undefined;
+    return typeof ff.get === "function" ? ff.get(id) : ff[id];
+  }
+
+  function warBuildCards(st, ff, nowMs) {
+    const nowSec = Math.floor(nowMs / 1000);
+    const resByTarget = new Map(st.reservations.map((r) => [r.targetId, r]));
+    const orderByTarget = new Map(st.orders.map((o) => [o.targetId, o]));
+    const held = st.reservations.filter((r) => r.attackerId === st.me.playerId).length;
+    const limit = st.limits.reservationsPerMember;
+    const rules = warRulesOf(st);
+    return st.enemy.members.map((m) => {
+      const kind = warStateKindOf(m, nowSec);
+      const timed = (kind === "hospital" || kind === "jail") && m.until > 0;
+      const left = timed ? Math.max(0, m.until - nowSec) : null;
+      const reservation = resByTarget.get(m.id) ?? null;
+      const isMine = reservation != null && reservation.attackerId === st.me.playerId;
+      const order = orderByTarget.get(m.id);
+      const priority = order?.priority ?? null;
+      const stat = warFfGet(ff, m.id);
+      const activity = warActivityOf(m);
+      const locks = warRuleLocks(rules, { activity, isMine });
+      let reserve = { ok: true };
+      if (isMine) reserve = { ok: true };
+      else if (reservation) reserve = { ok: false, reason: `Reserved by ${reservation.attackerName ?? "someone"}` };
+      else if (locks.reserve) reserve = { ok: false, reason: locks.reserve };
+      else if (priority === "avoid") reserve = { ok: false, reason: "Command marked this target Avoid" };
+      else if (held >= limit) reserve = { ok: false, reason: `You already hold ${held} — the leader's limit` };
+      return {
+        id: m.id,
+        name: m.name,
+        level: m.level,
+        activity,
+        stateKind: kind,
+        stateLabel: warStateLabelOf(m, kind, left),
+        secondsLeft: left,
+        priority,
+        note: order?.note ?? "",
+        reservation,
+        isMine,
+        ffText: warFfLabel(stat),
+        ffEstimate: stat?.battleEstimate ?? null,
+        reserve,
+        attack: locks.attack
+          ? { mode: "locked", reason: locks.attack }
+          : warAttackCheck({
+            isMine,
+            reservation,
+            priority,
+            isCommand: st.isCommand,
+            reserveOnAttack: st.settings.reserveOnAttack,
+            nowMs,
+          }),
+        canUnreserve: st.canRelease && reservation != null && !isMine,
+        flying: m.flight != null,
+        landsAt: m.flight?.landsAt ?? null,
+        offLimits: locks.offLimits,
+      };
+    });
+  }
+
+  const WAR_ACTIVITY_RANK = { online: 0, idle: 1, offline: 2, unknown: 3 };
+  const WAR_STATE_RANK = { okay: 0, hospital: 1, jail: 2, travel: 3, other: 4 };
+
+  /** The site's default "Soonest attackable" order: mine first, Avoid last. */
+  function warSortCards(cards) {
+    const head = (c) => (c.isMine ? 0 : c.priority === "avoid" ? 2 : 1);
+    const byName = (a, b) => a.name.localeCompare(b.name);
+    const body = (a, b) =>
+      WAR_STATE_RANK[a.stateKind] - WAR_STATE_RANK[b.stateKind] ||
+      (a.stateKind === "okay"
+        ? (a.priority === "priority" ? 0 : 1) - (b.priority === "priority" ? 0 : 1) ||
+          WAR_ACTIVITY_RANK[a.activity] - WAR_ACTIVITY_RANK[b.activity]
+        : (a.secondsLeft ?? 0) - (b.secondsLeft ?? 0)) ||
+      byName(a, b);
+    return [...cards].sort((a, b) => head(a) - head(b) || body(a, b));
+  }
+
+  function warPlaneLabel(planeImageType) {
+    const labels = { airliner: "Airliner", light_aircraft: "Light aircraft", private_jet: "Private jet" };
+    return planeImageType ? labels[String(planeImageType).toLowerCase()] ?? null : null;
+  }
+
+  function warStatToneOf(fairFight) {
+    if (fairFight == null || !Number.isFinite(fairFight)) return null;
+    return fairFight < 2 ? "easy" : fairFight < 3 ? "fair" : "tough";
+  }
+
+  function warFlightLines(m, nowSec) {
+    const f = m.flight;
+    if (!f) return null;
+    const where = f.country ?? "abroad";
+    const route = f.direction === "out" ? `Torn → ${where}` : `${where} → Torn`;
+    let lands;
+    if (f.landsAt == null) lands = "Landing time unknown";
+    else {
+      const left = f.landsAt - nowSec;
+      const when = left <= 0 ? "any moment" : f.exact ? `in ${warFormatSpan(left)}` : `≤ ${warFormatSpan(left)}`;
+      lands = `Lands ${f.exact ? "~" : "by "}${warLocalClock(f.landsAt)} · ${when}`;
+    }
+    const plane = warPlaneLabel(m.planeImageType);
+    const seen = f.exact && m.departedAt != null ? `seen taking off ${warLocalClock(m.departedAt)}` : "already in the air when we looked";
+    const detail = plane ? `${plane} · ${seen}` : seen.charAt(0).toUpperCase() + seen.slice(1);
+    return { route, lands, detail };
+  }
+
+  const WAR_ACTIVITY_WORD = { online: "Online", idle: "Idle", offline: "Offline" };
+
+  function warStateLine(m, kind, left, nowSec) {
+    const idleFor = m.idleSince != null ? warFormatSpan(nowSec - m.idleSince) : null;
+    if (kind === "okay") {
+      if (idleFor) return `Idle for ${idleFor}`;
+      const activity = warActivityOf(m);
+      return activity === "unknown" ? "" : WAR_ACTIVITY_WORD[activity];
+    }
+    let base;
+    if (kind === "hospital") base = `Hosp ${warFormatCountdown(left ?? 0)}`;
+    else if (kind === "jail") base = `Jail ${warFormatCountdown(left ?? 0)}`;
+    else if (kind === "travel") base = m.flight ? "Flying" : `${m.description || "Abroad"} · landed, only hittable there`;
+    else base = m.state;
+    return idleFor ? `${base} · idle for ${idleFor}` : base;
+  }
+
+  function warDotToneOf(kind, activity) {
+    if (kind !== "okay") return kind;
+    if (activity === "online") return "online";
+    return activity === "idle" ? "idle" : "offline";
+  }
+
+  /** Every enemy as a board row (the site's List view rows, same rules). */
+  function warListRows(st, ff, nowMs) {
+    const nowSec = Math.floor(nowMs / 1000);
+    const byId = new Map(st.enemy.members.map((m) => [m.id, m]));
+    const retalBy = new Map(st.retals.map((r) => [r.enemyId, r]));
+    const fightsBy = new Map();
+    for (const f of st.fights) {
+      if (f.playerId === st.me.playerId) continue;
+      fightsBy.set(f.targetId, [...(fightsBy.get(f.targetId) ?? []), f]);
+    }
+    const autoResolve = st.attacks.error == null;
+    const rules = warRulesOf(st);
+    const retalLocked = warRetalLock(rules);
+    return warBuildCards(st, ff, nowMs).map((card) => {
+      const m = byId.get(card.id);
+      const stat = warFfGet(ff, card.id);
+      const r = retalBy.get(card.id);
+      const retalLeft = r ? WAR_RESERVATION_SECONDS - (nowSec - r.endedAt) : 0;
+      const fights = fightsBy.get(card.id) ?? [];
+      let assist = null;
+      if (fights.length > 0) {
+        const first = fights[0];
+        const who = first.playerName ?? `#${first.playerId}`;
+        const startMs = new Date(first.since).getTime();
+        assist = {
+          text: fights.length === 1 ? `${who} is fighting them` : `${who} and ${fights.length - 1} more are fighting them`,
+          since: `In combat now · ${warFormatCountdown(Number.isFinite(startMs) ? (nowMs - startMs) / 1000 : 0)}`,
+          locked: retalLocked,
+        };
+      }
+      let claim = { kind: "free" };
+      if (card.reservation) {
+        const left = warFormatCountdown(warReservationSecondsLeft(card.reservation, nowMs));
+        claim = card.isMine
+          ? { kind: "mine", text: `Yours · ${left} left${autoResolve ? " · clears when your hit lands" : ""}` }
+          : { kind: "other", text: `Reserved by ${card.reservation.attackerName ?? "someone"} · ${left} left` };
+      }
+      const hasRetal = r != null && retalLeft > 0;
+      return {
+        ...card,
+        hidden: warHiddenByRules(rules, { offLimits: card.offLimits, isMine: card.isMine, hasRetal }),
+        dot: warDotToneOf(card.stateKind, card.activity),
+        stateLine: warStateLine(m, card.stateKind, card.secondsLeft, nowSec),
+        flight: warFlightLines(m, nowSec),
+        statEstimate: stat?.battleEstimateHuman ?? null,
+        statFF: stat?.fairFight != null ? `FF ${stat.fairFight.toFixed(2)}` : null,
+        statTone: warStatToneOf(stat?.fairFight),
+        retal: r && hasRetal
+          ? {
+            text: `Hit ${r.victimName ?? `#${r.victimId}`} · ${warFormatSpan(nowSec - r.endedAt)} ago · ${String(r.result).toLowerCase()}`,
+            secondsLeft: retalLeft,
+            locked: retalLocked,
+          }
+          : null,
+        assist,
+        claim,
+      };
+    });
+  }
+
+  function warAttacksNotice(attacks) {
+    if (attacks.error === "needs_key") {
+      return "No faction capture key, so Retal is empty and claims don't clear when a hit lands — they still expire.";
+    }
+    if (attacks.error === "fetch_failed") return "Torn's attack log did not answer just now — Retal may be a little behind.";
+    return null;
+  }
+
+  function warRosterNotice(enemy) {
+    if (enemy.error === "needs_key") {
+      return { tone: "error", text: "No Torn key is available to read the enemy roster. Ask leadership to add a capture key." };
+    }
+    if (enemy.error === "fetch_failed" || enemy.stale) {
+      return enemy.members.length > 0
+        ? { tone: "warn", text: "Torn did not answer just now — this is the last roster we read. Retrying." }
+        : { tone: "error", text: "Could not read the enemy roster from Torn yet. Retrying." };
+    }
+    return null;
+  }
+
+  function warReleasedNotice(releasedBy) {
+    if (!releasedBy) return null;
+    const target = releasedBy.targetName ?? `#${releasedBy.targetId}`;
+    return {
+      key: `${releasedBy.targetId}@${releasedBy.at}`,
+      text: `${releasedBy.byName ?? "Someone"} released your reservation on ${target}.`,
+    };
+  }
+
+  function warJumpNoticeText(n, attacksKnown) {
+    const target = n.targetName ?? `#${n.targetId}`;
+    if (n.byName == null) {
+      return {
+        tone: "muted",
+        text: attacksKnown
+          ? `${target} went back into hospital — not by one of us. Your claim ended.`
+          : `${target} went back into hospital. Your claim ended.`,
+      };
+    }
+    if (n.retal) {
+      return { tone: "info", text: `${n.byName} retaled on ${target} while you had it reserved — fair game under the retal rule. Your claim ended.` };
+    }
+    return { tone: "warn", text: `${n.byName} hit ${target} while you had it reserved — your claim ended. Pick a new target.` };
+  }
+
+  function warJumpTitle(n) {
+    if (!n || n.byName == null || n.retal) return null;
+    return `⚠ ${n.targetName ?? `#${n.targetId}`} taken by ${n.byName}`;
+  }
+
+  function warJumperNoticeText(n) {
+    const target = n.targetName ?? `#${n.targetId}`;
+    const holder = n.holderName ?? "someone";
+    const left = n.secondsLeft > 0 ? ` (${warFormatCountdown(n.secondsLeft)} left)` : "";
+    return n.assigned
+      ? `${target} was assigned to ${holder}${left} when you hit it. Check the board first.`
+      : `${target} was reserved by ${holder}${left} when you hit it. Check the board first.`;
+  }
+
+  /** Held targets in hospital / jail with a known release still ahead, soonest first. */
+  function warAlarmPlans(reservations, enemy, myId, nowSec) {
+    const byId = new Map(enemy.map((m) => [m.id, m]));
+    const out = [];
+    for (const r of reservations) {
+      if (r.attackerId !== myId) continue;
+      const m = byId.get(r.targetId);
+      if (!m || m.until <= nowSec) continue;
+      const kind = warStateKindOf(m, nowSec);
+      if (kind !== "hospital" && kind !== "jail") continue;
+      out.push({ key: `${m.id}:${m.until}`, targetId: m.id, name: m.name, outAt: m.until, alarmAt: m.until - WAR_ALARM_LEAD_S });
+    }
+    return out.sort((a, b) => a.outAt - b.outAt || a.targetId - b.targetId);
+  }
+
+  function warDueNow(plans, nowSec) {
+    return plans.filter((p) => nowSec >= p.alarmAt && nowSec < p.outAt);
+  }
+
+  function warRulesStrip(rules) {
+    const stopOn = rules.stopAt != null;
+    if (!rules.offlineOnly && !stopOn) return null;
+    const chips = [];
+    if (rules.offlineOnly) chips.push(rules.idleCountsOffline ? "Offline targets only · idle counts as offline" : "Offline targets only");
+    if (stopOn) chips.push(`Stop at ${warFormatPoints(rules.stopAt)}`);
+    const progress = stopOn && rules.score != null
+      ? Math.max(0, Math.min(100, Math.round((rules.score / rules.stopAt) * 100)))
+      : rules.reached ? 100 : null;
+    if (rules.reached) {
+      return {
+        tone: "stop",
+        chips,
+        headline: `STOP — we reached ${warFormatPoints(rules.stopAt)} points`,
+        detail: "Command's war rule. Don't attack anyone, here or on Torn — retals included. Every reservation has ended.",
+        progress,
+      };
+    }
+    if (rules.close) {
+      return {
+        tone: "warn",
+        chips,
+        headline: `Close to the stop — ${warFormatPoints(rules.toGo ?? 0)} points to go`,
+        detail: "Finish fights you're in. Don't start new ones. New reservations are closed.",
+        progress,
+      };
+    }
+    let detail = null;
+    if (stopOn) {
+      detail = !rules.scoreAvailable
+        ? "This room has no ranked score, so the stop can't apply."
+        : rules.score == null
+          ? "Waiting for the war score."
+          : `${warFormatPoints(rules.score)} now · ${warFormatPoints(rules.toGo ?? 0)} to go`;
+    }
+    return { tone: "info", chips, headline: null, detail, progress };
+  }
+
+  function warHiddenLine(rules, hidden) {
+    if (!rules.offlineOnly || hidden <= 0) return null;
+    const who = rules.idleCountsOffline ? "online" : "online / idle";
+    return `${hidden} ${who} target${hidden === 1 ? "" : "s"} hidden — Command: offline targets only.`;
+  }
+
+  function warBar(value) {
+    if (!value || typeof value !== "object") return null;
+    const { current, maximum } = value;
+    return typeof current === "number" && typeof maximum === "number" && Number.isInteger(current) &&
+        Number.isInteger(maximum) && current >= 0 && maximum >= 0
+      ? { current, maximum }
+      : null;
+  }
+
+  /** Energy + life out of a `/user?selections=bars` reply (top-level or under `bars`). */
+  function warParseUserBars(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const nested = raw.bars && typeof raw.bars === "object" ? raw.bars : {};
+    const energy = warBar(raw.energy) ?? warBar(nested.energy);
+    const life = warBar(raw.life) ?? warBar(nested.life);
+    if (!energy || !life || life.current > life.maximum) return null;
+    return { energy: energy.current, energyMax: energy.maximum, life: life.current, lifeMax: life.maximum };
+  }
+
+  /**
+   * The ranked war out of Torn's `/v2/faction/wars`, seen from our side: we are whichever
+   * faction is NOT the room's opponent. null when there is no ranked war (a manual room).
+   */
+  function warScoreFromWars(raw, opponentId) {
+    const ranked = raw?.wars?.ranked ?? raw?.ranked ?? null;
+    if (!ranked || typeof ranked !== "object") return null;
+    const start = Number(ranked.start);
+    if (!Number.isFinite(start) || start <= 0) return null;
+    const list = Array.isArray(ranked.factions)
+      ? ranked.factions
+      : Object.entries(ranked.factions || {}).map(([id, f]) => ({ id: Number(id), ...(f || {}) }));
+    const sides = list
+      .map((f) => ({ id: Number(f?.id) || 0, name: typeof f?.name === "string" ? f.name : "Faction", score: Number(f?.score) || 0 }))
+      .filter((s) => s.id > 0);
+    if (sides.length < 2) return null;
+    const them = sides.find((s) => s.id === Number(opponentId)) ?? null;
+    if (!them) return null;
+    const us = sides.find((s) => s !== them);
+    const end = Number(ranked.end);
+    const target = Number(ranked.target);
+    return {
+      start,
+      end: Number.isFinite(end) && end > 0 ? end : null,
+      target: Number.isFinite(target) && target > 0 ? target : null,
+      us,
+      them,
+    };
+  }
+
+  /** FF Scouter `get-stats` reply → { [id]: stat }. Unknown shapes give an empty object. */
+  function parseFfStats(data) {
+    const out = {};
+    const rows = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.players) ? data.players : Array.isArray(data?.results) ? data.results : Array.isArray(data?.data) ? data.data : [];
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const id = Number(row.player_id ?? row.id);
+      if (!Number.isInteger(id) || id <= 0) continue;
+      const ff = Number(row.fair_fight);
+      const est = Number(row.bs_estimate);
+      out[id] = {
+        fairFight: row.fair_fight == null || !Number.isFinite(ff) ? null : ff,
+        battleEstimate: row.bs_estimate == null || !Number.isFinite(est) ? null : est,
+        battleEstimateHuman: typeof row.bs_estimate_human === "string" ? row.bs_estimate_human : null,
+      };
+    }
+    return out;
+  }
+
+  /** The attack-page banner for one target: mine / held by someone else / free / nothing. */
+  function warBannerFor(st, targetId, nowMs) {
+    if (!st?.room || !targetId) return null;
+    const r = (st.reservations || []).find((x) => x.targetId === targetId);
+    const rules = warRulesOf(st);
+    if (rules.reached) {
+      return { kind: "stop", text: `STOP — Command's stop at ${warFormatPoints(rules.stopAt ?? 0)} was reached. Don't attack.` };
+    }
+    if (r && r.attackerId === st.me.playerId) {
+      return { kind: "mine", text: `Your claim on ${r.targetName ?? `#${targetId}`}`, secondsLeft: warReservationSecondsLeft(r, nowMs) };
+    }
+    if (r) {
+      return {
+        kind: "held",
+        text: `Held by ${r.attackerName ?? "someone"} — don't hit.`,
+        detail: `Their claim ends in ${warFormatCountdown(warReservationSecondsLeft(r, nowMs))}. Hitting it counts as a claim jump.`,
+      };
+    }
+    const order = (st.orders || []).find((o) => o.targetId === targetId);
+    const held = (st.reservations || []).filter((x) => x.attackerId === st.me.playerId).length;
+    const limit = st.limits?.reservationsPerMember ?? 1;
+    const reason = rules.close
+      ? "Close to the stop — no new claims"
+      : order?.priority === "avoid"
+        ? "Command marked this target Avoid"
+        : held >= limit ? `You already hold ${held} — the leader's limit` : null;
+    return { kind: "free", text: "Free · nobody holds this target", held, limit, reason };
+  }
+
+  // ── War tab state + IO ─────────────────────────────────────────────────────────────
+  function freshWarState() {
+    return {
+      st: null, loading: false, inFlight: false, error: null, notice: null, busy: false, loadedAt: 0, peekAt: 0,
+      score: null, scoreAt: 0, scoreError: null,
+      view: readString(STORE.warView, "all") === "priority" ? "priority" : "all",
+      dismissedReleased: null, dismissedJump: null, dismissedJumper: null,
+      attackNotice: null,
+      ff: {}, ffAt: 0, ffIds: "", ffError: null, ffLoading: false,
+      firedAlarms: new Set(), stopChirped: false, jumpChirped: null,
+      seenRoom: readString(STORE.warSeenRoom, ""),
+      barsAt: 0, bars: null, lastReturn: 0,
+      banner: null, bannerAt: 0,
+    };
+  }
+
+  function warRoomOpen() {
+    return Boolean(state.war.st?.room) && hasBank();
+  }
+
+  function warRoomKey() {
+    return state.war.st?.room?.warKey || "";
+  }
+
+  // "NEW" on the tab until you open it once for this war.
+  function warIsNew() {
+    return warRoomOpen() && state.war.seenRoom !== warRoomKey();
+  }
+
+  function warTabOnScreen() {
+    return !state.hidden && !state.collapsed && !state.settingsOpen && !state.focus && activeTab() === "war";
+  }
+
+  function ffKey() {
+    return readString(STORE.ffKey, "").trim();
+  }
+
+  async function warCall(action, body = {}) {
+    return callFunction("war-room", { action, ...body });
+  }
+
+  // One poll at a time, none waits past WAR_POLL_TIMEOUT_MS (the site's 2026-10-31 rule:
+  // on PDA a request can hang for minutes, and stacking new ones on top made it worse).
+  async function warPoll({ peek = false, fresh = false } = {}) {
+    const W = state.war;
+    if (!hasBank() || (W.inFlight && !fresh)) return;
+    W.inFlight = true;
+    let timer = null;
+    try {
+      const res = await Promise.race([
+        warCall("state", peek ? { peek: true } : fresh ? { fresh: true } : {}),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Lost contact with the War Room — retrying.")), WAR_POLL_TIMEOUT_MS);
+        }),
+      ]);
+      warAdopt(res, peek);
+      W.error = null;
+    } catch (error) {
+      if (!peek) W.error = error?.message || "Lost contact with the War Room — retrying.";
+    } finally {
+      if (timer) clearTimeout(timer);
+      W.inFlight = false;
+    }
+  }
+
+  // A peek carries no enemy roster: keep the last full one so the board doesn't blank.
+  function warAdopt(next, peek) {
+    const W = state.war;
+    if (!next || typeof next !== "object") return;
+    const wasOpen = warRoomOpen();
+    if (peek && W.st?.room && next.room && W.st.room.warKey === next.room.warKey) {
+      W.st = { ...next, enemy: W.st.enemy, attacks: W.st.attacks, retals: W.st.retals, fights: W.st.fights, team: W.st.team };
+      W.peekAt = Date.now();
+    } else {
+      W.st = next;
+      if (peek) W.peekAt = Date.now();
+      else W.loadedAt = Date.now();
+    }
+    if (wasOpen && !warRoomOpen() && state.tab === "war") state.tab = "chain";
+    warAfterState();
+  }
+
+  async function warAct(action, body = {}) {
+    const W = state.war;
+    if (W.busy) return false;
+    W.busy = true;
+    W.error = null;
+    W.attackNotice = null;
+    render();
+    try {
+      warAdopt(await warCall(action, body), false);
+      return true;
+    } catch (error) {
+      W.error = error?.message || "That did not go through. Try again.";
+      return false;
+    } finally {
+      W.busy = false;
+      render();
+    }
+  }
+
+  // Reserve on attack: open the tab inside the click (so it isn't blocked), claim, then
+  // send it to Torn's attack page. On PDA a new tab isn't a thing — go in place instead.
+  function warAttackWithReserve(targetId) {
+    const W = state.war;
+    const url = `https://www.torn.com/loader.php?sid=attack&user2ID=${targetId}`;
+    const inPlace = typeof window.PDA_httpGet === "function";
+    const w = inPlace ? null : window.open("about:blank", "_blank");
+    if (w) w.opener = null;
+    W.busy = true;
+    W.attackNotice = null;
+    render();
+    warCall("reserve", { targetId, viaAttack: true })
+      .then((next) => {
+        warAdopt(next, false);
+        if (inPlace) window.location.href = url;
+        else if (w) w.location.href = url;
+        else W.attackNotice = { targetId, text: "Popup blocked — press Attack again.", href: url };
+      })
+      .catch((error) => {
+        w?.close();
+        W.attackNotice = { targetId, text: error?.message || "Could not claim that target. Try again." };
+      })
+      .finally(() => {
+        W.busy = false;
+        render();
+      });
+  }
+
+  // The scoreboard: Torn's /faction/wars with YOUR key (war-watch refuses keyless sessions).
+  async function warLoadScore() {
+    const W = state.war;
+    const room = W.st?.room;
+    if (!room || room.source !== "ranked" || !settings().tornKey) {
+      W.score = null;
+      return;
+    }
+    if (Date.now() - W.scoreAt < WAR_SCORE_MS) return;
+    W.scoreAt = Date.now();
+    try {
+      W.score = warScoreFromWars(await tornFetch("/faction/wars"), room.opponentId);
+      W.scoreError = null;
+    } catch (error) {
+      W.scoreError = error?.message || "Couldn't read the score.";
+    }
+  }
+
+  async function warShareBars() {
+    const W = state.war;
+    if (!settings().tornKey || Date.now() - W.barsAt < WAR_BARS_MS) return;
+    W.barsAt = Date.now();
+    try {
+      const bars = warParseUserBars(await tornFetch("/user/bars"));
+      if (!bars) return;
+      W.bars = bars;
+      await warCall("bars", bars);
+    } catch {
+      /* best effort — Command just sees older bars */
+    }
+  }
+
+  async function warLoadFf() {
+    const W = state.war;
+    const key = ffKey();
+    const ids = (W.st?.enemy?.members || []).map((m) => m.id).filter((id) => id > 0);
+    if (!key || ids.length === 0 || W.ffLoading) return;
+    const sig = [...ids].sort((a, b) => a - b).join(",");
+    if (sig === W.ffIds && Date.now() - W.ffAt < FF_TTL_MS) return;
+    W.ffLoading = true;
+    try {
+      const next = {};
+      for (let i = 0; i < ids.length; i += 100) {
+        const url = new URL("https://ffscouter.com/api/v1/get-stats");
+        url.searchParams.set("key", key);
+        url.searchParams.set("targets", ids.slice(i, i + 100).join(","));
+        const data = await requestJson(url.toString());
+        if (data && typeof data === "object" && !Array.isArray(data) && data.error) {
+          throw new Error(typeof data.error === "string" ? data.error : data.error?.message || "FF Scouter returned an error.");
+        }
+        Object.assign(next, parseFfStats(data));
+      }
+      W.ff = next;
+      W.ffIds = sig;
+      W.ffAt = Date.now();
+      W.ffError = null;
+    } catch (error) {
+      W.ffError = error?.message || "FF Scouter didn't answer.";
+      W.ffAt = Date.now(); // don't hammer it; try again after the TTL
+      W.ffIds = sig;
+    } finally {
+      W.ffLoading = false;
+    }
+  }
+
+  // After every state: alarms, notices that make a noise, the tab title.
+  function warAfterState() {
+    const W = state.war;
+    const st = W.st;
+    if (!st?.room) return;
+    const rules = warRulesOf(st);
+    if (rules.reached && !W.stopChirped) {
+      W.stopChirped = true;
+      if (state.alarm) fireAlarm("drop", `STOP — Command's stop at ${warFormatPoints(rules.stopAt ?? 0)} was reached.`);
+    }
+    if (!rules.reached) W.stopChirped = false;
+    const jumped = st.me?.jumped;
+    if (jumped && jumped.id !== W.dismissedJump && jumped.id !== W.jumpChirped && warJumpTitle(jumped)) {
+      W.jumpChirped = jumped.id;
+      if (state.alarm) fireAlarm("shift", warJumpTitle(jumped));
+    }
+  }
+
+  // Every second: the 30s-before-release chirp (opt-in = the 🔔 alarms switch), the tab
+  // title, and the launcher badge.
+  let warTitleBase = null;
+  function warTick() {
+    const W = state.war;
+    const st = W.st;
+    const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+    let title = null;
+    if (st?.room) {
+      const plans = warAlarmPlans(st.reservations || [], st.enemy?.members || [], st.me.playerId, nowSec);
+      const due = warDueNow(plans, nowSec);
+      for (const p of due) {
+        if (W.firedAlarms.has(p.key)) continue;
+        W.firedAlarms.add(p.key);
+        if (state.alarm) fireAlarm("shift", `${p.name} is out of hospital in ${warFormatCountdown(p.outAt - nowSec)} — get ready.`);
+      }
+      if (due.length > 0 && nowSec % 2 === 0) title = `⏰ ${due[0].name} out in ${warFormatCountdown(due[0].outAt - nowSec)}`;
+      const rules = warRulesOf(st);
+      if (rules.reached) title = "⛔ STOP";
+      const jumped = st.me?.jumped && st.me.jumped.id !== W.dismissedJump ? st.me.jumped : null;
+      if (!title && warJumpTitle(jumped)) title = warJumpTitle(jumped);
+    }
+    if (title) {
+      if (warTitleBase == null) warTitleBase = document.title;
+      document.title = `${title} — ${warTitleBase}`;
+    } else if (warTitleBase != null) {
+      document.title = warTitleBase;
+      warTitleBase = null;
+    }
+    // Live countdowns in the War tab without a rebuild.
+    if (warTabOnScreen()) {
+      const box = document.getElementById("tocw");
+      if (box) {
+        for (const el of box.querySelectorAll("[data-tocw-war-until]")) {
+          const at = Number(el.getAttribute("data-tocw-war-until"));
+          if (Number.isFinite(at)) el.textContent = warFormatCountdown((at - nowMs) / 1000);
+        }
+      }
+    }
+  }
+
+  function warLoop() {
+    const W = state.war;
+    if (!hasBank() || document.visibilityState !== "visible") return;
+    const now = Date.now();
+    if (warTabOnScreen() && warRoomOpen()) {
+      if (now - W.loadedAt >= WAR_POLL_MS && !W.inFlight) {
+        void warPoll().then(async () => {
+          await Promise.all([warLoadScore(), warLoadFf()]);
+          if (warTabOnScreen()) render({ background: true });
+        });
+      }
+      void warShareBars();
+    } else if (now - Math.max(W.peekAt, W.loadedAt) >= WAR_PEEK_MS && !W.inFlight) {
+      void warPoll({ peek: true }).then(() => {
+        if (!state.hidden) render({ background: true });
+        updateLauncher();
+      });
+    }
+  }
+
+  function startWarWatch() {
+    setTimeout(() => void warPoll({ peek: true }).then(() => { render({ background: true }); updateLauncher(); }), 2500);
+    setInterval(warLoop, 1000);
+    setInterval(warTick, 1000);
+    // Coming back from Torn's attack tab: poll at once with `fresh` (reads a newer attack
+    // log, so a landed hit clears the claim), and once more a few seconds later.
+    const onReturn = () => {
+      const W = state.war;
+      if (document.visibilityState !== "visible" || !warRoomOpen()) return;
+      if (Date.now() - W.lastReturn < 2000) return;
+      W.lastReturn = Date.now();
+      const go = () => void warPoll({ fresh: true }).then(() => render({ background: true }));
+      go();
+      setTimeout(go, 4500);
+    };
+    document.addEventListener("visibilitychange", onReturn);
+    window.addEventListener("focus", onReturn);
+  }
+
+  // ── War tab rendering ───────────────────────────────────────────────────────────────
+  function warAttackUrl(id) {
+    return `https://www.torn.com/loader.php?sid=attack&user2ID=${id}`;
+  }
+
+  function warAttackButton(row, busy) {
+    if (row.attack.mode === "locked") {
+      return `<button class="tocw-wr-btn" disabled title="${escapeHtml(row.attack.reason || "")}">Attack</button>`;
+    }
+    if (row.attack.mode === "reserve-then-open") {
+      return `<button class="tocw-wr-btn" data-tocw-war-attack="${row.id}" ${busy ? "disabled" : ""} title="Claims this target for 5 minutes, then opens the attack page">Attack ↗</button>`;
+    }
+    // Ghost on the board (Reserve is the red one there), as on the site.
+    return `<a class="tocw-wr-btn" href="${warAttackUrl(row.id)}" target="_blank" rel="noreferrer noopener">Attack ↗</a>`;
+  }
+
+  function warClaimCell(row, busy, nowMs) {
+    if (row.claim.kind === "free") {
+      return `<button class="tocw-wr-btn primary" data-tocw-war-reserve="${row.id}" ${busy || !row.reserve.ok ? "disabled" : ""} ${row.reserve.ok ? "" : `title="${escapeHtml(row.reserve.reason)}"`}>Reserve</button>
+        ${row.reserve.ok ? "" : `<div class="tocw-wr-fine">${escapeHtml(row.reserve.reason)}</div>`}`;
+    }
+    const until = new Date(row.reservation.expiresAt).getTime();
+    if (row.claim.kind === "mine") {
+      return `<button class="tocw-wr-btn" data-tocw-war-release="${row.id}" ${busy ? "disabled" : ""}>Release</button>
+        <div class="tocw-wr-fine ok">Yours · <span data-tocw-war-until="${until}">${warFormatCountdown((until - nowMs) / 1000)}</span> left</div>`;
+    }
+    return `<div class="tocw-wr-fine">Held by <strong>${escapeHtml(row.reservation.attackerName ?? "someone")}</strong> · <span data-tocw-war-until="${until}">${warFormatCountdown((until - nowMs) / 1000)}</span></div>
+      ${row.canUnreserve ? `<button class="tocw-wr-btn small" data-tocw-war-unreserve="${row.id}" ${busy ? "disabled" : ""} title="End their claim">Unreserve</button>` : ""}`;
+  }
+
+  function warRowHtml(row, busy, nowMs) {
+    const W = state.war;
+    const notice = W.attackNotice && W.attackNotice.targetId === row.id ? W.attackNotice : null;
+    const badges = `${row.priority === "priority" ? `<span class="tocw-wr-badge jail">Priority</span>` : ""}${row.priority === "avoid" ? `<span class="tocw-wr-badge hosp">Avoid</span>` : ""}`;
+    const stats = row.statEstimate || row.statFF
+      ? `<div class="tocw-wr-full tocw-wr-fine">${row.statEstimate ? `<span class="tocw-wr-mono">~${escapeHtml(row.statEstimate)}</span> ` : ""}${row.statFF ? `<span class="tocw-wr-tone ${row.statTone || ""}">${escapeHtml(row.statFF)}${row.statTone ? ` · ${row.statTone}` : ""}</span>` : ""}</div>`
+      : "";
+    const help = [
+      row.retal
+        ? `<div class="tocw-wr-help retal"><div>${escapeHtml(row.retal.text)}</div>${row.retal.locked
+          ? `<button class="tocw-wr-btn small retal" disabled title="${escapeHtml(row.retal.locked)}">Retal</button>`
+          : `<a class="tocw-wr-btn small retal" href="${warAttackUrl(row.id)}" target="_blank" rel="noreferrer noopener">Retal ↗</a>`} <span class="tocw-wr-mono">${warFormatCountdown(row.retal.secondsLeft)} left</span></div>`
+        : "",
+      row.assist
+        ? `<div class="tocw-wr-help assist"><div>${escapeHtml(row.assist.text)}</div>${row.assist.locked
+          ? `<button class="tocw-wr-btn small assist" disabled>Assist</button>`
+          : `<a class="tocw-wr-btn small assist" href="${warAttackUrl(row.id)}" target="_blank" rel="noreferrer noopener">Assist ↗</a>`} <span class="tocw-wr-mono">${escapeHtml(row.assist.since)}</span></div>`
+        : "",
+    ].join("");
+    return `<div class="tocw-wr-row${row.isMine ? " mine" : ""}${row.priority === "avoid" ? " avoid" : ""}">
+      <div class="tocw-wr-full">
+        <div class="tocw-wr-name"><span class="tocw-wr-dot ${row.dot}" aria-hidden="true"></span>${profileLink(row.id, row.name)} <span class="tocw-wr-muted">[${row.id}] · lvl ${row.level}</span>${badges}</div>
+        ${row.stateLine ? `<div class="tocw-wr-state ${row.dot}">${escapeHtml(row.stateLine)}</div>` : ""}
+        ${row.flight ? `<div class="tocw-wr-fine">${escapeHtml(row.flight.route)} · ${escapeHtml(row.flight.lands)}</div>` : ""}
+        ${row.note ? `<div class="tocw-wr-fine note">Order: ${escapeHtml(row.note)}</div>` : ""}
+      </div>
+      ${stats}
+      ${help ? `<div class="tocw-wr-full">${help}</div>` : ""}
+      <div class="tocw-wr-claim">${warClaimCell(row, busy, nowMs)}</div>
+      <div class="tocw-wr-attack">${warAttackButton(row, busy)}
+        ${row.attack.mode === "locked" && row.claim.kind !== "other" && row.attack.reason ? `<div class="tocw-wr-fine">${escapeHtml(row.attack.reason)}</div>` : ""}
+        ${notice ? `<div class="tocw-wr-fine warn">${escapeHtml(notice.text)}${notice.href ? ` <a href="${escapeHtml(notice.href)}" target="_blank" rel="noreferrer noopener">Open ↗</a>` : ""}</div>` : ""}
+      </div>
+    </div>`;
+  }
+
+  function warHeaderHtml(st, nowMs) {
+    const W = state.war;
+    const room = st.room;
+    const opponent = room.opponentName ?? W.score?.them?.name ?? `Faction ${room.opponentId}`;
+    const nowSec = Math.floor(nowMs / 1000);
+    const sc = W.score;
+    let badge = room.source === "ranked" ? "Ranked war" : "Opened by Command";
+    let badgeClass = "other";
+    let body = "";
+    if (sc && sc.start > nowSec) {
+      badge = "Announced";
+      badgeClass = "jail";
+      body = `<div><div class="tocw-wr-label">Starts in</div><div class="tocw-wr-big" data-tocw-war-until="${sc.start * 1000}">${warFormatCountdown(sc.start - nowSec)}</div>
+        <div class="tocw-wr-fine">${tctTime(new Date(sc.start * 1000).toISOString(), true)}${sc.target ? ` · target ${warFormatPoints(sc.target)}` : ""}</div></div>`;
+    } else if (sc) {
+      const lead = sc.us.score - sc.them.score;
+      badge = lead >= 0 ? `Leading +${warFormatPoints(lead)}` : `Behind ${warFormatPoints(lead)}`;
+      badgeClass = lead >= 0 ? "ready" : "hosp";
+      const pct = sc.us.score + sc.them.score > 0 ? Math.round((sc.us.score / (sc.us.score + sc.them.score)) * 100) : 50;
+      body = `<div class="tocw-wr-score"><span class="us">${warFormatPoints(sc.us.score)}</span><span class="tocw-wr-muted">–</span><span class="them">${warFormatPoints(sc.them.score)}</span>${sc.target ? `<span class="tocw-wr-fine" style="margin-left:auto;">target ${warFormatPoints(sc.target)}</span>` : ""}</div>
+        <div class="tocw-wr-bar" aria-hidden="true"><div style="width:${pct}%;"></div></div>`;
+    }
+    return `<section class="tocw-wr-card">
+      <div class="tocw-wr-head"><h3>vs ${escapeHtml(opponent)}</h3><span class="tocw-wr-badge ${badgeClass}">${escapeHtml(badge)}</span></div>
+      ${body}
+      <div class="tocw-wr-fine">${st.enemy.members.length ? `${st.enemy.members.length} members · ` : ""}${st.pledges.answered} of ${st.pledges.total} of us have said when they can fight.</div>
+    </section>`;
+  }
+
+  function warRulesHtml(rules) {
+    const strip = warRulesStrip(rules);
+    if (!strip) return "";
+    return `<div class="tocw-wr-strip ${strip.tone}">
+      ${strip.headline ? `<strong>${escapeHtml(strip.headline)}</strong>` : `<span class="tocw-wr-fine">War rules · set by Command</span>`}
+      <div class="tocw-wr-chips">${strip.chips.map((c) => `<span class="tocw-wr-badge ${strip.tone === "stop" ? "hosp" : "jail"}">${escapeHtml(c)}</span>`).join("")}</div>
+      ${strip.detail ? `<div class="tocw-wr-fine">${escapeHtml(strip.detail)}</div>` : ""}
+      ${strip.progress != null ? `<div class="tocw-wr-bar thin" aria-hidden="true"><div style="width:${strip.progress}%;"></div></div>` : ""}
+    </div>`;
+  }
+
+  function warMyTargetHtml(st, rows, nowMs) {
+    const W = state.war;
+    const busy = W.busy;
+    const rules = warRulesOf(st);
+    const mine = rows.find((c) => c.isMine && c.id === st.me.targetId) ?? rows.find((c) => c.isMine) ?? null;
+    const myRes = mine ? st.reservations.find((r) => r.targetId === mine.id) : null;
+    const released = warReleasedNotice(st.me.releasedBy);
+    const releasedText = released && released.key !== W.dismissedReleased ? released : null;
+    const jumped = st.me.jumped && st.me.jumped.id !== W.dismissedJump ? st.me.jumped : null;
+    const jumpText = jumped ? warJumpNoticeText(jumped, st.attacks.error == null) : null;
+    const until = myRes ? new Date(myRes.expiresAt).getTime() : 0;
+    const left = myRes ? warReservationSecondsLeft(myRes, nowMs) : 0;
+    return `<section class="tocw-wr-card" aria-label="My target">
+      <div class="tocw-wr-head"><h3>My target</h3>${mine
+        ? `<span class="tocw-wr-badge ${left <= 60 ? "jail" : "ready"}"><span data-tocw-war-until="${until}">${warFormatCountdown(left)}</span> left</span>`
+        : `<span class="tocw-wr-badge other">Nothing reserved</span>`}</div>
+      ${jumpText ? `<div class="tocw-wr-alert ${jumpText.tone}">${escapeHtml(jumpText.text)} <button class="tocw-wr-btn small" data-tocw-war-dismiss="jump">Dismiss</button></div>` : ""}
+      ${releasedText ? `<div class="tocw-wr-alert warn">${escapeHtml(releasedText.text)} <button class="tocw-wr-btn small" data-tocw-war-dismiss="released">Dismiss</button></div>` : ""}
+      ${rules.reached ? `<div class="tocw-wr-alert stop">Command's stop at ${warFormatPoints(rules.stopAt ?? 0)} points was reached — every claim has ended.</div>` : ""}
+      ${mine ? `<div>
+          <div class="tocw-wr-name big">${profileLink(mine.id, mine.name)} <span class="tocw-wr-muted">[${mine.id}] · lvl ${mine.level}</span></div>
+          <div class="tocw-wr-chips">${mine.stateKind !== "okay" ? `<span class="tocw-wr-badge ${mine.stateKind === "hospital" ? "hosp" : mine.stateKind === "travel" ? "away" : "jail"}">${escapeHtml(mine.stateLabel)}</span>` : ""}${mine.ffText ? `<span class="tocw-wr-badge away">${escapeHtml(mine.ffText)}</span>` : ""}</div>
+          ${mine.note ? `<div class="tocw-wr-fine note">Order: ${escapeHtml(mine.note)}</div>` : ""}
+          ${mine.attack.mode === "locked" && mine.attack.reason ? `<div class="tocw-wr-alert warn">${escapeHtml(mine.attack.reason)}</div>` : ""}
+        </div>
+        <div class="tocw-wr-pair">${mine.attack.mode === "locked"
+          ? `<button class="tocw-wr-btn" disabled>Attack</button>`
+          : `<a class="tocw-wr-btn red" href="${warAttackUrl(mine.id)}" target="_blank" rel="noreferrer noopener">Attack ↗</a>`}
+          <button class="tocw-wr-btn" data-tocw-war-release="${mine.id}" ${busy ? "disabled" : ""}>Release</button></div>`
+        : `<div class="tocw-wr-fine">Reserve a target on the board below — it's yours for 5 minutes.</div>`}
+    </section>`;
+  }
+
+  function warStatusHtml(st) {
+    const W = state.war;
+    const busy = W.busy ? "disabled" : "";
+    const bars = W.bars;
+    return `<section class="tocw-wr-card" aria-label="My status">
+      <h3>My status</h3>
+      <div class="tocw-wr-seg two" role="group" aria-label="Ready or away">
+        ${["ready", "away"].map((s) => `<button data-tocw-war-status="${s}" class="${st.me.status === s ? "on" : ""}" aria-pressed="${st.me.status === s}" ${busy}>${s === "ready" ? "Ready" : "Away"}</button>`).join("")}
+      </div>
+      <div>
+        <div class="tocw-wr-label">When can you fight?</div>
+        <div class="tocw-wr-seg two" role="group" aria-label="Availability">
+          ${WAR_PLEDGES.map((p) => `<button data-tocw-war-pledge="${p.id}" class="${st.me.pledge === p.id ? "on" : ""}" aria-pressed="${st.me.pledge === p.id}" ${busy}>${p.label}</button>`).join("")}
+        </div>
+      </div>
+      <div class="tocw-wr-fine">${bars ? `Energy ${bars.energy}/${bars.energyMax} · Life ${bars.life.toLocaleString("en-US")}/${bars.lifeMax.toLocaleString("en-US")} — ` : ""}shared with Command while this tab is open.</div>
+    </section>`;
+  }
+
+  function warBoardHtml(st, rows, nowMs) {
+    const W = state.war;
+    const rules = warRulesOf(st);
+    const visible = rows.filter((r) => !r.hidden);
+    const hiddenCount = rows.length - visible.length;
+    const priorityCount = visible.filter((r) => r.priority === "priority").length;
+    const shown = warSortCards(W.view === "priority" ? visible.filter((r) => r.priority === "priority") : visible);
+    const attackable = visible.filter((r) => r.stateKind === "okay").length;
+    const hospital = visible.filter((r) => r.stateKind === "hospital").length;
+    const flying = visible.filter((r) => r.flying).length;
+    const reserved = st.reservations.length;
+    const mineCount = rows.filter((r) => r.isMine).length;
+    const hidden = warHiddenLine(rules, hiddenCount);
+    const attacksNote = warAttacksNotice(st.attacks);
+    return `<section class="tocw-wr-card" aria-label="Target board">
+      <div class="tocw-wr-head"><h3>Targets</h3><span class="tocw-wr-fine">${st.enemy.fetchedAt ? `data ${Math.max(0, Math.round((nowMs - new Date(st.enemy.fetchedAt).getTime()) / 1000))}s old` : ""}</span></div>
+      <div class="tocw-wr-chips">
+        <span class="tocw-wr-badge ready">Attackable ${attackable}</span><span class="tocw-wr-badge hosp">Hospital ${hospital}</span><span class="tocw-wr-badge away">Flying ${flying}</span><span class="tocw-wr-badge other">Reserved ${reserved}</span><span class="tocw-wr-badge other">Yours ${mineCount} / ${st.limits.reservationsPerMember}</span>
+      </div>
+      <div class="tocw-wr-seg two" role="tablist" aria-label="Board view">
+        <button data-tocw-war-view="all" class="${W.view === "all" ? "on" : ""}" role="tab" aria-selected="${W.view === "all"}">All ${visible.length}</button>
+        <button data-tocw-war-view="priority" class="${W.view === "priority" ? "on" : ""}" role="tab" aria-selected="${W.view === "priority"}">Priority ${priorityCount}</button>
+      </div>
+      ${attacksNote ? `<div class="tocw-wr-fine">${escapeHtml(attacksNote)}</div>` : ""}
+      ${!ffKey() ? `<div class="tocw-wr-fine">Add your FF Scouter key in Settings to see stat estimates on every target.</div>` : W.ffError ? `<div class="tocw-wr-fine warn">FF Scouter: ${escapeHtml(W.ffError)}</div>` : ""}
+      <div class="tocw-wr-list">
+        ${shown.length ? shown.map((r) => warRowHtml(r, W.busy, nowMs)).join("") : `<div class="tocw-wr-row"><div class="tocw-wr-full tocw-wr-muted">${st.enemy.members.length ? "Nobody matches this view right now." : "Reading the enemy roster…"}</div></div>`}
+      </div>
+      ${hidden ? `<div class="tocw-wr-fine">${escapeHtml(hidden)}</div>` : ""}
+    </section>`;
+  }
+
+  function renderWarTab() {
+    const W = state.war;
+    const st = W.st;
+    if (!st?.room) {
+      return `<div class="tocw-muted">${W.loading || W.inFlight ? "Opening the War Room…" : "No war room is open."}</div>`;
+    }
+    const nowMs = Date.now();
+    const rows = warListRows(st, W.ff, nowMs);
+    const rules = warRulesOf(st);
+    const roster = warRosterNotice(st.enemy);
+    const jumper = st.me.jumpedSomeone && st.me.jumpedSomeone.id !== W.dismissedJumper ? st.me.jumpedSomeone : null;
+    return `<div class="tocw-wr">
+      ${W.error ? `<div class="tocw-alert bad">${escapeHtml(W.error)}</div>` : ""}
+      ${W.notice ? `<div class="tocw-alert">${escapeHtml(W.notice)}</div>` : ""}
+      ${warRulesHtml(rules)}
+      ${warHeaderHtml(st, nowMs)}
+      ${jumper ? `<div class="tocw-wr-alert info">${escapeHtml(warJumperNoticeText(jumper))} <button class="tocw-wr-btn small" data-tocw-war-dismiss="jumper">Dismiss</button></div>` : ""}
+      ${roster ? `<div class="tocw-wr-alert ${roster.tone === "error" ? "stop" : "warn"}">${escapeHtml(roster.text)}</div>` : ""}
+      ${warMyTargetHtml(st, rows, nowMs)}
+      ${warStatusHtml(st)}
+      ${warBoardHtml(st, rows, nowMs)}
+      <div class="tocw-wr-fine" style="text-align:center;">Attack opens Torn's own attack page. Overseer never attacks for you.</div>
+    </div>`;
+  }
+
+  function wireWar(box) {
+    const W = state.war;
+    for (const b of box.querySelectorAll("[data-tocw-war-reserve]")) {
+      b.addEventListener("click", () => void warAct("reserve", { targetId: Number(b.getAttribute("data-tocw-war-reserve")) }));
+    }
+    for (const b of box.querySelectorAll("[data-tocw-war-release]")) {
+      b.addEventListener("click", () => void warAct("release", { targetId: Number(b.getAttribute("data-tocw-war-release")) }));
+    }
+    for (const b of box.querySelectorAll("[data-tocw-war-unreserve]")) {
+      b.addEventListener("click", () => void warAct("force_release", { targetId: Number(b.getAttribute("data-tocw-war-unreserve")) }));
+    }
+    for (const b of box.querySelectorAll("[data-tocw-war-attack]")) {
+      b.addEventListener("click", () => warAttackWithReserve(Number(b.getAttribute("data-tocw-war-attack"))));
+    }
+    for (const b of box.querySelectorAll("[data-tocw-war-status]")) {
+      b.addEventListener("click", () => void warAct("set_status", { status: b.getAttribute("data-tocw-war-status") }));
+    }
+    for (const b of box.querySelectorAll("[data-tocw-war-pledge]")) {
+      b.addEventListener("click", () => void warAct("pledge", { pledge: b.getAttribute("data-tocw-war-pledge") }));
+    }
+    for (const b of box.querySelectorAll("[data-tocw-war-view]")) {
+      b.addEventListener("click", () => {
+        W.view = b.getAttribute("data-tocw-war-view") === "priority" ? "priority" : "all";
+        gmSet(STORE.warView, W.view);
+        render();
+      });
+    }
+    for (const b of box.querySelectorAll("[data-tocw-war-dismiss]")) {
+      b.addEventListener("click", () => {
+        const what = b.getAttribute("data-tocw-war-dismiss");
+        const st = W.st;
+        if (what === "jump") W.dismissedJump = st?.me?.jumped?.id ?? null;
+        if (what === "jumper") W.dismissedJumper = st?.me?.jumpedSomeone?.id ?? null;
+        if (what === "released") W.dismissedReleased = warReleasedNotice(st?.me?.releasedBy)?.key ?? null;
+        render();
+      });
+    }
+    document.getElementById("tocw-war-refresh")?.addEventListener("click", () => {
+      W.scoreAt = 0;
+      void warPoll({ fresh: true }).then(async () => {
+        await Promise.all([warLoadScore(), warLoadFf()]);
+        render();
+      });
+    });
+  }
+
+  // ── Attack page: one strip above Torn's fight window saying whose target this is ──────
+  function warBannerHtml(b, nowMs) {
+    if (!b) return "";
+    if (b.kind === "stop") return `<div class="tocw-ab stop"><strong>${escapeHtml(b.text)}</strong></div>`;
+    if (b.kind === "mine") {
+      return `<div class="tocw-ab mine"><span class="tocw-ab-dot"></span><span style="flex:1;"><strong>${escapeHtml(b.text)}</strong> · <strong data-tocw-war-until="${nowMs + b.secondsLeft * 1000}">${warFormatCountdown(b.secondsLeft)}</strong> left · War Room</span><button class="tocw-wr-btn" data-tocw-ab-release>Release</button></div>`;
+    }
+    if (b.kind === "held") {
+      return `<div class="tocw-ab held"><span class="tocw-ab-dot"></span><span style="flex:1;"><strong>${escapeHtml(b.text)}</strong> ${escapeHtml(b.detail)}</span></div>`;
+    }
+    return `<div class="tocw-ab free"><span class="tocw-ab-dot"></span><span style="flex:1;"><strong>Free</strong> · nobody holds this target · you hold ${b.held} of ${b.limit}</span>${b.reason
+      ? `<span class="tocw-wr-fine">${escapeHtml(b.reason)}</span>`
+      : `<button class="tocw-wr-btn red" data-tocw-ab-reserve>Reserve 5 min</button>`}</div>`;
+  }
+
+  function drawAttackBanner() {
+    const W = state.war;
+    const targetId = attackTargetFromUrl(location.href);
+    let host = document.getElementById("tocw-ab-host");
+    const b = targetId ? warBannerFor(W.st, targetId, Date.now()) : null;
+    if (!b) {
+      host?.remove();
+      return;
+    }
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "tocw-ab-host";
+      const anchor = document.querySelector('[class*="playersModelWrap"], [class*="coreWrap"], #react-root, .content-wrapper') || document.body.firstChild;
+      if (anchor?.parentNode) anchor.parentNode.insertBefore(host, anchor);
+      else document.body.prepend(host);
+    }
+    host.innerHTML = warBannerHtml(b, Date.now());
+    host.querySelector("[data-tocw-ab-release]")?.addEventListener("click", async () => {
+      await warAct("release", { targetId });
+      drawAttackBanner();
+    });
+    host.querySelector("[data-tocw-ab-reserve]")?.addEventListener("click", async () => {
+      await warAct("reserve", { targetId });
+      if (W.error) W.notice = null;
+      drawAttackBanner();
+    });
+  }
+
+  function startAttackBanner() {
+    if (!attackTargetFromUrl(location.href) || !settings().sessionToken) return;
+    const refresh = async () => {
+      if (document.visibilityState !== "visible") return;
+      await warPoll({ peek: true });
+      drawAttackBanner();
+    };
+    void refresh();
+    setInterval(refresh, WAR_ATTACK_PAGE_MS);
+    setInterval(() => {
+      const host = document.getElementById("tocw-ab-host");
+      if (!host) return;
+      for (const el of host.querySelectorAll("[data-tocw-war-until]")) {
+        const at = Number(el.getAttribute("data-tocw-war-until"));
+        if (Number.isFinite(at)) el.textContent = warFormatCountdown((at - Date.now()) / 1000);
+      }
+    }, 1000);
+  }
+
+  // The launcher's red "!" — something in the War Room wants you (null = nothing).
+  function warAlert() {
+    const st = state.war.st;
+    if (!st?.room || !hasBank()) return null;
+    if (warRulesOf(st).reached) return "War: Command's stop was reached";
+    const jumped = st.me?.jumped && st.me.jumped.id !== state.war.dismissedJump ? st.me.jumped : null;
+    if (warJumpTitle(jumped)) return `War: ${warJumpTitle(jumped)}`;
+    const released = warReleasedNotice(st.me?.releasedBy);
+    if (released && released.key !== state.war.dismissedReleased) return `War: ${released.text}`;
+    return null;
+  }
+
+  // On the Chain tab during a war: one red pill that jumps to the War tab.
+  function renderWarPill() {
+    if (!warRoomOpen()) return "";
+    const sc = state.war.score;
+    const nowSec = Math.floor(Date.now() / 1000);
+    let text = "War Room open";
+    if (sc && sc.start > nowSec) text = `War vs ${sc.them.name} · starts in ${warFormatCountdown(sc.start - nowSec)}`;
+    else if (sc) {
+      const lead = sc.us.score - sc.them.score;
+      text = `War ${lead >= 0 ? "+" : ""}${warFormatPoints(lead)} · ${warFormatPoints(sc.us.score)}–${warFormatPoints(sc.them.score)}`;
+    }
+    return `<button id="tocw-war-pill" type="button" class="tocw-war-pill">${escapeHtml(text)} ›</button>`;
   }
 
   function startBankWatch() {
@@ -5302,6 +6711,9 @@
           <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
             <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
           </label>
+          <label>FF Scouter key <span class="tocw-muted">— optional; shows stat estimates on War tab targets. Register at ffscouter.com (a Torn key won't work here). Sent only to ffscouter.com.</span>
+            <input id="tocw-set-ff-key" type="password" value="${escapeHtml(readString(STORE.ffKey, ""))}" autocomplete="off" placeholder="Your FF Scouter key" />
+          </label>
           <label>Site session token
             <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
           </label>
@@ -5433,6 +6845,14 @@
       const prevSession = settings().sessionToken;
       const ok = saveSettings(collect());
       applyAlarmSettings();
+      // v0.32.0: the optional FF Scouter key (GM-only, like the Torn key).
+      const nextFf = valueOf("tocw-set-ff-key");
+      if (nextFf !== readString(STORE.ffKey, "")) {
+        gmSet(STORE.ffKey, nextFf);
+        state.war.ff = {};
+        state.war.ffIds = "";
+        state.war.ffError = null;
+      }
       // Compare the key's VALUE, not just its presence: replacing a rejected key with a
       // working one is the main recovery path, and it would otherwise sit out the
       // connect throttle doing nothing.
@@ -5544,7 +6964,13 @@
       gmSet(STORE.collapsed, false);
       // A badge means banking wants you: open straight onto the Bank tab.
       const alert = hasBank() ? bankAlert(state.bank) : null;
-      if (alert && (alert.count > 0 || alert.paid)) {
+      if (warAlert() && warRoomOpen()) {
+        state.settingsOpen = false;
+        state.focus = false;
+        state.tab = "war";
+        gmSet(STORE.tab, "war");
+        state.war.loadedAt = 0;
+      } else if (alert && (alert.count > 0 || alert.paid)) {
         state.settingsOpen = false;
         state.focus = false;
         state.tab = "bank";
@@ -5647,6 +7073,12 @@
     // never resets the user's scroll position or fights their interaction between polls.
     setInterval(tick, 1000);
     startBankWatch();
+    // v0.31.0: on Torn's attack page, tell the War Room who you are fighting (Assist).
+    startFightWatch();
+    // v0.32.0: the War tab (peek a minute, full state while it's on screen) and the claim
+    // strip on Torn's attack page.
+    startWarWatch();
+    startAttackBanner();
   }
 
   // Surgical per-second update: refresh the drop-timer / "starts in" text without
@@ -5712,6 +7144,9 @@
     if (typeof module === "object" && module && module.exports) {
       module.exports = {
         state,
+        attackTargetFromUrl,
+        fightLooksOver,
+        shouldBeat,
         parseChain,
         parseAttacks,
         serverLiveChain,
@@ -5735,6 +7170,7 @@
         allShifts,
         coversAt,
         render,
+        renderBankQueue,
         renderSlot,
         renderSignupShifts,
         renderKeyGate,
@@ -5793,6 +7229,34 @@
         recipientId,
         editorText,
         money,
+        warFormatCountdown,
+        warFormatSpan,
+        warActivityOf,
+        warStateKindOf,
+        warReservationSecondsLeft,
+        warRuleLocks,
+        warBuildCards,
+        warSortCards,
+        warListRows,
+        warAttacksNotice,
+        warRosterNotice,
+        warReleasedNotice,
+        warJumpNoticeText,
+        warJumpTitle,
+        warJumperNoticeText,
+        warAlarmPlans,
+        warDueNow,
+        warRulesStrip,
+        warHiddenLine,
+        warParseUserBars,
+        warScoreFromWars,
+        parseFfStats,
+        warBannerFor,
+        warAdopt,
+        warAlert,
+        renderWarTab,
+        renderWarPill,
+        freshWarState,
       };
     }
   } else if (document.readyState === "loading") {
