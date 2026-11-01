@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.32.0
+// @version      0.32.1
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -574,14 +574,70 @@
     return PDA_API_KEY && !PDA_API_KEY.includes("###") ? PDA_API_KEY.trim() : "";
   }
 
+  // Torn PDA keeps the Overseer session between pages (v0.32.1). PDA's GM storage does
+  // not survive a page load, so the session minted on one Torn page was gone on the next
+  // and the script signed in again on EVERY page (~3,600 sign-ins a day from one faction,
+  // 2026-10-31). In PDA only, the session token is mirrored to page localStorage. Never the
+  // Torn key — PDA injects that fresh each load. The token is identity-only (the site keeps
+  // no key), Overseer-only and lasts 12 h; the trade-off is that other scripts on torn.com
+  // can read it (owner-approved 2026-11-01). It is tagged with a hash of the key it was
+  // minted from, so a different PDA account never picks up someone else's session.
+  const PDA_SESSION_MIRROR = "tocw_pda_session";
+
+  function isTornPda() {
+    return typeof window !== "undefined" && !!window && typeof window.PDA_httpGet === "function";
+  }
+
+  // FNV-1a, 32-bit: a tag that tells keys apart, not a secret (can't recover a 16-char key).
+  function keyTag(key) {
+    let h = 0x811c9dc5;
+    const s = String(key || "");
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(36);
+  }
+
+  function readPdaSession(tornKey) {
+    if (!isTornPda() || !tornKey) return "";
+    try {
+      const raw = localStorage.getItem(PDA_SESSION_MIRROR);
+      if (!raw) return "";
+      const m = JSON.parse(raw);
+      return m && typeof m.t === "string" && m.k === keyTag(tornKey) ? m.t.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function writePdaSession(token, tornKey) {
+    if (!isTornPda()) return;
+    try {
+      if (token && tornKey) localStorage.setItem(PDA_SESSION_MIRROR, JSON.stringify({ t: token, k: keyTag(tornKey) }));
+      else localStorage.removeItem(PDA_SESSION_MIRROR);
+    } catch {
+      /* storage unavailable — the script just signs in again, as before */
+    }
+  }
+
+  // Every write of the session token goes through here so the PDA mirror stays in step.
+  function saveSessionToken(token) {
+    const value = String(token || "").trim();
+    const ok = gmSet(STORE.sessionToken, value);
+    writePdaSession(value, settings().tornKey);
+    return ok;
+  }
+
   function settings() {
     const functionsUrl = readString(STORE.functionsUrl).trim() || DEFAULT_FUNCTIONS_URL;
     const anonKey = readString(STORE.anonKey).trim() || DEFAULT_ANON_KEY;
+    const tornKey = readString(STORE.tornKey).trim() || pdaApiKey();
     return {
-      tornKey: readString(STORE.tornKey).trim() || pdaApiKey(),
+      tornKey,
       functionsUrl,
       anonKey,
-      sessionToken: readString(STORE.sessionToken).trim(),
+      sessionToken: readString(STORE.sessionToken).trim() || readPdaSession(tornKey),
       signupToken: readString(STORE.signupToken).trim(),
     };
   }
@@ -628,7 +684,7 @@
     const okKey = gmSet(STORE.tornKey, tornKey);
     gmSet(STORE.functionsUrl, (next.functionsUrl || DEFAULT_FUNCTIONS_URL).trim());
     gmSet(STORE.anonKey, (next.anonKey || DEFAULT_ANON_KEY).trim());
-    const okSession = gmSet(STORE.sessionToken, (next.sessionToken || "").trim());
+    const okSession = saveSessionToken(next.sessionToken);
     return okKey && okSession;
   }
 
@@ -971,7 +1027,7 @@
     if (!res || typeof res.sessionToken !== "string") {
       throw new Error("The site did not return a session token.");
     }
-    gmSet(STORE.sessionToken, res.sessionToken);
+    saveSessionToken(res.sessionToken);
     // Remember who the key belongs to (returned by connect-torn-key) so token mode
     // can show "signed in as X" and know which slots are yours — no Torn call needed.
     if (res.player && res.player.id != null) {
@@ -6863,7 +6919,7 @@
       // Unless the member deliberately pasted a session token in this same save, which is
       // an explicit override worth respecting.
       if (keyChanged && settings().sessionToken === prevSession) {
-        gmSet(STORE.sessionToken, "");
+        saveSessionToken("");
         gmSet(STORE.signupIdentity, null);
       }
       if (keyChanged) retryConnectNow();
@@ -7144,6 +7200,9 @@
     if (typeof module === "object" && module && module.exports) {
       module.exports = {
         state,
+        settings,
+        saveSessionToken,
+        keyTag,
         attackTargetFromUrl,
         fightLooksOver,
         shouldBeat,
