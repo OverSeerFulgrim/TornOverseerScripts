@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.7.9
+// @version      0.7.11
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, and after-fee profit on the stock market. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -326,6 +326,43 @@
   }
 
   /** What a sale at `price` puts in your pocket after Torn's item market fee. Null without a price. */
+  /**
+   * 0.7.11: how fresh the bazaar Fill targets are, for the Manage/Add header. `loadedAt` is when
+   * this page asked Overseer for the targets (your sell list is applied then — edits made on the
+   * site since need a reload), `refsAt` when the market values behind them were fetched, and
+   * `marketAt` the oldest cheapest-listing scan among the rows. All ms, or null when unknown.
+   * Returns { text, title, stale } — text "" when nothing has loaded yet.
+   */
+  const TARGETS_STALE_MS = 30 * 60000;
+  const REFS_STALE_MS = 2 * 3600000;
+  function ageText(ms) {
+    const m = Math.max(0, Math.floor(ms / 60000));
+    if (m < 1) return "just now";
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+  }
+  function targetsAge(info, nowMs) {
+    const { loadedAt, refsAt, marketAt } = info || {};
+    if (!Number.isFinite(loadedAt)) return { text: "", title: "", stale: false };
+    const ago = (at) => { const t = ageText(nowMs - at); return t === "just now" ? t : `${t} ago`; };
+    const why = [];
+    if (nowMs - loadedAt > TARGETS_STALE_MS) why.push("loaded a while ago — reload if you changed your sell list since");
+    if (Number.isFinite(refsAt) && nowMs - refsAt > REFS_STALE_MS) why.push("market values are old");
+    if (Number.isFinite(marketAt) && nowMs - marketAt > VS_STALE_MS) why.push("cheapest-listing scan is old");
+    const lines = [
+      `Fill targets loaded from Overseer ${ago(loadedAt)}.`,
+      Number.isFinite(refsAt) ? `Market values (Torn Exchange) fetched ${ago(refsAt)}.` : "Market value age unknown.",
+      Number.isFinite(marketAt) ? `Cheapest-listing scan ${ago(marketAt)} (oldest row).` : null,
+      "Your sell list is applied when targets load — after changing it on the site, press ↻.",
+    ].filter(Boolean);
+    if (why.length) lines.unshift(`Worth a reload: ${why.join("; ")}.`);
+    // The headline is the oldest thing the targets depend on.
+    const oldest = Math.min(loadedAt, Number.isFinite(refsAt) ? refsAt : loadedAt);
+    const age = ageText(nowMs - oldest);
+    return { text: age === "just now" ? "TARGETS FRESH" : `TARGETS ${age.toUpperCase()} OLD`, title: lines.join("\n"), stale: why.length > 0 };
+  }
+
   function netAfterFee(price) {
     const n = Number(price);
     if (!Number.isFinite(n) || n <= 0) return null;
@@ -860,6 +897,7 @@
   .totr-bz-profit{font-weight:700;color:#5fe0a6;white-space:nowrap}.totr-bz-profit--floor{color:#e2a6ef}
   .totr-bz-state{font-weight:700;white-space:nowrap}.totr-bz-state--ok{color:#5fe0a6}.totr-bz-state--warn{color:#f0c674}.totr-bz-state--info{color:#8ab8ff}.totr-bz-state--low{color:#e2a6ef}
   .totr-hlink{font:700 12px Arial,sans-serif;letter-spacing:.06em;color:#ccc;background:transparent;border:0;padding:0 8px;cursor:pointer;text-decoration:none}
+  .totr-hage{color:#9aa7b8;font-weight:400;letter-spacing:.03em}
   .totr-hlink--ok{color:#8bc34a}.totr-hlink--qty{color:#7fb2ff}.totr-hlink--warn{color:#f0c674}.totr-hlink--clear{color:#e57373}
   li.totr-deal{position:relative;outline:2px solid #4c8dff;outline-offset:-2px}
   li.totr-flip{position:relative;outline:2px dashed #5fe0a6;outline-offset:-2px}
@@ -882,6 +920,7 @@
   .totr-pcbtn:hover{color:#fff;border-color:#777}
   .totr-pcbar{display:flex;justify-content:flex-end;padding:6px 8px 0}
   .totr-pc{margin:8px}
+  .totr-pc--float{position:absolute;z-index:99998;margin:0;max-height:70vh;overflow:auto;box-shadow:0 18px 44px rgba(0,0,0,.65)}
   .totr-pc h4{margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#66738a}
   .totr-pc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
   .totr-pc-sec{background:#161d28;border:1px solid #232c3a;border-radius:8px;padding:10px}
@@ -1371,6 +1410,8 @@
     const pending = new Set();
     let lastError = null;
     let popup = null;
+    const fresh = { loadedAt: null, refsAt: null }; // 0.7.11: target freshness (see targetsAge)
+    let ageTimer = null;
 
     function rowOf(input) {
       return input.closest("li, tr, [class*='row___'], [class*='item___'], [class*='listItem___']") || input.parentElement;
@@ -1564,7 +1605,7 @@
       };
       draw();
       const foot = el("div", { class: "totr-pick-foot" }, el("span", { class: "totr-muted" }, "Click a price to fill it"),
-        el("button", { type: "button", class: "totr-linkbtn", onclick: () => { closePopup(); modules.priceCheck.toggle(r.itemId, r.row.closest("li, tr") || r.row, {}); } }, "Full price check"));
+        el("button", { type: "button", class: "totr-linkbtn", onclick: () => { closePopup(); modules.priceCheck.toggle(r.itemId, r.row.closest("li, tr") || r.row, { float: true }); } }, "Full price check"));
       popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, head, list, foot);
       document.body.append(popup);
       const rect = anchor.getBoundingClientRect();
@@ -1585,6 +1626,32 @@
       }
       return null;
     }
+    // 0.7.11: "TARGETS 12M OLD ↻" in the header — click to ask Overseer again.
+    function updateAge() {
+      const node = document.getElementById("totr-hage");
+      if (!node || !node.isConnected) { clearInterval(ageTimer); ageTimer = null; return; }
+      let marketAt = null;
+      for (const s of sell.values()) {
+        const at = Date.parse((s && s.market && s.market.capturedAt) || "");
+        if (Number.isFinite(at)) marketAt = marketAt == null ? at : Math.min(marketAt, at);
+      }
+      const a = targetsAge({ ...fresh, marketAt }, Date.now());
+      node.hidden = !a.text;
+      const text = a.text ? `${a.text} ↻` : "";
+      if (node.textContent !== text) node.textContent = text;
+      node.title = a.title;
+      node.classList.toggle("totr-hlink--warn", a.stale);
+      if (!ageTimer && IS_BROWSER) ageTimer = setInterval(updateAge, 30_000);
+    }
+    function reloadTargets() {
+      sell.clear();
+      fresh.loadedAt = null;
+      fresh.refsAt = null;
+      retryAfter = 0;
+      const node = document.getElementById("totr-hage");
+      if (node) node.textContent = "LOADING…";
+      run().catch(() => {});
+    }
     function headerLinks(list) {
       const manage = isManage();
       const off = manage ? list.filter((r) => { const st = stateFor(r, sell.get(r.itemId)); return st && st.off; }) : [];
@@ -1598,6 +1665,7 @@
            el("button", { type: "button", class: "totr-hlink totr-hlink--qty", onclick: () => rows().filter(shownRow).forEach(fillQty) }, "FILL QTY"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
       links.push(el("a", { class: "totr-hlink", href: `${SITE_URL}/trading/bazaar`, target: "_blank", rel: "noopener" }, "SETTINGS"));
+      links.unshift(el("button", { type: "button", id: "totr-hage", class: "totr-hlink totr-hage", onclick: reloadTargets }));
       box = el("span", { id: "totr-hlinks", "data-totr-ui": "1", "data-sig": sig }, ...links);
       const header = headerEl();
       if (header) { header.style.display = "flex"; header.style.alignItems = "center"; box.style.marginLeft = "auto"; header.append(box); }
@@ -1627,6 +1695,10 @@
       ids.forEach((id) => pending.add(id));
       try {
         const res = await callTrader("sell_prices", { itemIds: ids });
+        const now = Date.now();
+        if (fresh.loadedAt == null) fresh.loadedAt = now; // the oldest batch is the one that matters
+        const refsAt = Date.parse((res && res.referencesAt) || "");
+        if (Number.isFinite(refsAt)) fresh.refsAt = fresh.refsAt == null ? refsAt : Math.min(fresh.refsAt, refsAt);
         for (const it of (res && res.items) || []) sell.set(it.itemId, it);
         for (const id of ids) if (!sell.has(id)) sell.set(id, null);
         lastError = null;
@@ -1699,6 +1771,7 @@
       if (await load(list)) document.getElementById("totr-bzline")?.remove();
       list.forEach(decorate);
       headerLinks(list);
+      updateAge();
       statusLine(list);
       if (!lastError) scheduleStock();
     }
@@ -2170,9 +2243,43 @@
       }
     }
 
+    // Torn's bazaar lists place each row at a fixed height (absolutely positioned or clipped),
+    // so a panel dropped in after a row sits BEHIND the rows below it. There the panel floats
+    // above the page instead, just under the row, like the $ popup.
+    let floating = null;
+    function closeFloating() {
+      if (floating) { floating.remove(); floating = null; }
+      document.removeEventListener("keydown", onFloatKey, true);
+    }
+    function onFloatKey(e) { if (e.key === "Escape") closeFloating(); }
+    function needsFloat(anchor) {
+      for (let n = anchor, i = 0; n && n !== document.body && i < 4; n = n.parentElement, i++) {
+        const cs = getComputedStyle(n);
+        if (cs.position === "absolute" || cs.position === "fixed" || cs.transform !== "none") return true;
+      }
+      return false;
+    }
+
     /** Open (or close, if already open) the panel for `itemId` right after `anchor`. */
     function toggle(itemId, anchor, opts = {}) {
       if (!itemId || !anchor) return;
+      if (opts.float || needsFloat(anchor)) {
+        const same = floating && floating.isConnected && floating.dataset.item === String(itemId);
+        closeFloating();
+        if (same) return;
+        const rect = anchor.getBoundingClientRect();
+        const vw = document.documentElement.clientWidth;
+        const width = Math.min(Math.max(rect.width, 560), vw - 16);
+        const panel = el("div", { class: "totr totr-pc totr-pc--float", "data-totr-ui": "1", "data-item": String(itemId) });
+        panel.style.top = `${Math.round(window.scrollY + rect.bottom + 4)}px`;
+        panel.style.left = `${Math.round(window.scrollX + Math.max(8, Math.min(rect.left, vw - width - 8)))}px`;
+        panel.style.width = `${Math.round(width)}px`;
+        document.body.append(panel);
+        floating = panel;
+        document.addEventListener("keydown", onFloatKey, true);
+        open(itemId, panel, opts, false);
+        return;
+      }
       const next = anchor.nextElementSibling;
       if (next && next.classList.contains("totr-pc") && next.dataset.item === String(itemId)) { next.remove(); return; }
       if (next && next.classList.contains("totr-pc")) next.remove();
@@ -2730,7 +2837,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { vsCheapest, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

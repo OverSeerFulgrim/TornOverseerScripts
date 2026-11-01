@@ -366,3 +366,28 @@ test("vsCheapest: the site's bands, staleness and $1 guard (WO-53 MC-3)", () => 
   assert.match(falling.title, /vs cheapest bazaar \$800,000 .* falling/);
   assert.match(tr.vsCheapest(1_300_000, fresh(1_200_000, { weekCheapest: 1_000_000 }), now).title, /rising/);
 });
+
+test("targetsAge says how old the bazaar Fill targets are, and when a reload is worth it", () => {
+  const now = Date.parse("2026-11-01T06:00:00Z");
+  const min = 60000;
+  assert.deepEqual(tr.targetsAge({}, now), { text: "", title: "", stale: false });
+
+  const fresh = tr.targetsAge({ loadedAt: now - 20 * 1000, refsAt: now - 30 * 1000, marketAt: now - 10 * min }, now);
+  assert.equal(fresh.text, "TARGETS FRESH");
+  assert.equal(fresh.stale, false);
+  assert.match(fresh.title, /Cheapest-listing scan 10m ago/);
+
+  // The headline is the older of load time and market values.
+  const mid = tr.targetsAge({ loadedAt: now - 5 * min, refsAt: now - 47 * min }, now);
+  assert.equal(mid.text, "TARGETS 47M OLD");
+  assert.equal(mid.stale, false);
+
+  const old = tr.targetsAge({ loadedAt: now - 95 * min, refsAt: now - 150 * min, marketAt: now - 4 * 60 * min }, now);
+  assert.equal(old.text, "TARGETS 2H 30M OLD");
+  assert.equal(old.stale, true);
+  assert.match(old.title, /^Worth a reload: loaded a while ago.*market values are old; cheapest-listing scan is old\./);
+
+  const noRefs = tr.targetsAge({ loadedAt: now - 2 * 60 * min }, now);
+  assert.equal(noRefs.text, "TARGETS 2H OLD");
+  assert.match(noRefs.title, /Market value age unknown/);
+});
