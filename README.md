@@ -182,6 +182,15 @@ back to a literal, so keep that literal in step too, but the header is what actu
 
 Issues and PRs welcome.
 
+## Torn Overseer Trading (beta) (`Torn-Overseer-Trading-Beta.user.js`)
+
+The Overseer trading companion: prices trades from your Overseer pricelist, fills your bazaar from
+your Bazaar sell list (with a "vs cheapest" check beside each Fill button), shows cheaper bazaars on
+the item market, a Price check on any item, and after-fee profit on the stock market. Fills boxes
+only — never presses a Torn button for you. Needs an Overseer Trading subscription.
+
+Install from [Greasy Fork](https://greasyfork.org/scripts/599500), which syncs from this file.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

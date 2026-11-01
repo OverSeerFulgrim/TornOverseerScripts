@@ -5,7 +5,7 @@
   "description": "Torn Overseer userscripts",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check Torn-Overseer-Chain-Watch.user.js && npm test --silent"
+    "check": "node --check Torn-Overseer-Chain-Watch.user.js && node --check Torn-Overseer-Trading-Beta.user.js && npm test --silent"
   },
   "devDependencies": {
     "jsdom": "^29.1.1"
