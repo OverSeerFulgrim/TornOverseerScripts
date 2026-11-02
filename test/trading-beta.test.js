@@ -391,3 +391,35 @@ test("targetsAge says how old the bazaar Fill targets are, and when a reload is 
   assert.equal(noRefs.text, "TARGETS 2H OLD");
   assert.match(noRefs.title, /Market value age unknown/);
 });
+
+test("sellModeOf keeps the three modes and nothing else", () => {
+  assert.equal(tr.sellModeOf("bazaar"), "bazaar");
+  assert.equal(tr.sellModeOf("market"), "market");
+  assert.equal(tr.sellModeOf("trade"), "trade");
+  assert.equal(tr.sellModeOf("Bazaar"), null);
+  assert.equal(tr.sellModeOf(null), null);
+});
+
+test("showsMarketPct: only item-market sellers (and not-yet-chosen) see % of market", () => {
+  assert.equal(tr.showsMarketPct("market"), true);
+  assert.equal(tr.showsMarketPct(null), true);
+  assert.equal(tr.showsMarketPct("bazaar"), false);
+  assert.equal(tr.showsMarketPct("trade"), false);
+});
+
+test("resaleFor: market = flip after the 5% fee; bazaar = your sell-list price, no fee; trade = none", () => {
+  // MV 1,000 nets 950; buying at 900 = +50 (5.6%).
+  assert.deepEqual(tr.resaleFor("market", 900, 1000, null), { profit: 50, pct: (50 / 900) * 100, via: "market" });
+  assert.deepEqual(tr.resaleFor(null, 900, 1000, null), { profit: 50, pct: (50 / 900) * 100, via: "market" });
+  // Bazaar ignores MV: sell list 1,000 against 900 = +100, no fee.
+  assert.deepEqual(tr.resaleFor("bazaar", 900, 5000, 1000), { profit: 100, pct: (100 / 900) * 100, via: "bazaar" });
+  assert.equal(tr.resaleFor("bazaar", 900, 5000, null), null);       // no sell-list price
+  assert.equal(tr.resaleFor("bazaar", 1000, null, 1010), null);       // +1.0% is under the 1.5% bar
+  assert.equal(tr.resaleFor("bazaar", 1, null, 1000), null);          // $1 display listing
+  assert.equal(tr.resaleFor("trade", 100, 1000, 1000), null);
+});
+
+test("resaleLabel names the route", () => {
+  assert.equal(tr.resaleLabel({ profit: 100, pct: 11.11, via: "bazaar" }), "resell +$100 (11.1%)");
+  assert.equal(tr.resaleLabel({ profit: 50, pct: 5.55, via: "market" }), "flip +$50 (5.5%)");
+});

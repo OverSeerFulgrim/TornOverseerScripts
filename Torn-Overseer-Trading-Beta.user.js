@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.7.11
+// @version      0.7.14
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, and after-fee profit on the stock market. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -72,6 +72,7 @@
     ignored: "totr_ignored",
     collapsed: "totr_collapsed",
     stockSentAt: "totr_stock_sent_at",
+    sellMode: "totr_sell_mode",
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
@@ -383,6 +384,39 @@
     return profit > 0 && pct >= MIN_FLIP_PCT ? { profit, pct } : null;
   }
 
+  /**
+   * 0.7.12: how the trader mostly sells, picked once ("How do you mostly sell?"). It decides
+   * which resale chip the buy pages show, so a new trader sees only what fits their playstyle:
+   *  - "market": flip chip = resale at Torn market value after the 5% fee, plus the amber
+   *    "% OF MARKET" / "% vs MV" marks;
+   *  - "bazaar": resale chip = your own sell-list price (what Fill would type), no fee;
+   *  - "trade":  no resale chip — only "under your buy".
+   * Not chosen yet (null) keeps the pre-0.7.12 marks (market) and shows the chooser.
+   */
+  const SELL_MODES = ["bazaar", "market", "trade"];
+  const SELL_MODE_LABELS = { bazaar: "Bazaar", market: "Item Market", trade: "Trade" };
+  function sellModeOf(raw) { return SELL_MODES.includes(raw) ? raw : null; }
+  /** Whether the amber "% of market value" marks belong on this mode's pages. */
+  function showsMarketPct(mode) { return mode !== "bazaar" && mode !== "trade"; }
+  /** The resale chip for a listing at `askPrice`, or null when there is none worth showing. */
+  function resaleFor(mode, askPrice, marketValue, sellAt) {
+    if (mode === "trade") return null;
+    if (mode === "bazaar") {
+      const ask = Number(askPrice);
+      const sell = Number(sellAt);
+      if (!Number.isFinite(ask) || ask <= 1 || !Number.isFinite(sell) || sell <= 0) return null;
+      const profit = sell - ask;
+      const pct = (profit / ask) * 100;
+      return profit > 0 && pct >= MIN_FLIP_PCT ? { profit, pct, via: "bazaar" } : null;
+    }
+    const flip = flipAtMarket(askPrice, marketValue);
+    return flip ? { ...flip, via: "market" } : null;
+  }
+  /** The chip text for a resale. */
+  function resaleLabel(r) {
+    return `${r.via === "bazaar" ? "resell" : "flip"} +${fmtMoney(r.profit)} (${r.pct.toFixed(1)}%)`;
+  }
+
   /** The trade panel's money guard. */
   function moneyGuard(total, moneyInTrade) {
     if (!Number.isFinite(total) || total <= 0) return { state: "empty", diff: 0 };
@@ -682,6 +716,7 @@
       fillPct: clampPct(gmGet(STORE.fillPct, DEFAULT_FILL_PCT), DEFAULT_FILL_PCT, MAX_FILL_PCT, MIN_FILL_PCT),
       dealPct: clampPct(gmGet(STORE.dealPct, DEFAULT_DEAL_PCT), DEFAULT_DEAL_PCT, 100),
       ignored: new Set((gmGet(STORE.ignored, []) || []).map(Number).filter(Number.isSafeInteger)),
+      sellMode: sellModeOf(gmGet(STORE.sellMode, null)),
     };
   }
 
@@ -882,7 +917,11 @@
   .totr-card{display:flex;flex-direction:column;align-items:flex-start;gap:4px;padding:6px 10px;border-radius:7px;background:#161d28;border:1px solid #232c3a;color:#e6ebf2;text-decoration:none;font-size:13px}
   .totr-card-line{display:flex;gap:6px;align-items:baseline;white-space:nowrap}
   .totr-card-name{color:#9fc3ff;max-width:120px;overflow:hidden;text-overflow:ellipsis}
-  .totr-card--under{border-color:#5fe0a6}
+  .totr-card--under{border-color:#4c8dff;box-shadow:inset 0 0 0 1px #4c8dff}
+  .totr-chip--buy{background:#16263f;color:#cfe0ff;box-shadow:0 0 0 1px #4c8dff}
+  .totr-mode{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .totr-mode-btn{font:600 12px system-ui,sans-serif;color:#e6ebf2;background:#161d28;border:1px solid #3a475b;border-radius:6px;height:28px;padding:0 12px;cursor:pointer}
+  .totr-mode-btn--on{background:#e23b3b;border-color:#e23b3b;color:#fff}
   .totr-total{font-size:24px;font-weight:800;font-variant-numeric:tabular-nums}
   .totr-mv{margin-left:6px;font:600 11px system-ui,sans-serif;color:#9aa7b8;white-space:nowrap}
   .totr-bz{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:6px;font:12px system-ui,sans-serif}
@@ -894,7 +933,7 @@
   .totr-vs{font:700 11px system-ui,sans-serif;padding:1px 5px;border-radius:9px;border:1px solid #3a475b;white-space:nowrap;color:#9aa7b8}
   .totr-vs--competitive{color:#5fe0a6;border-color:#2f6b52}.totr-vs--above{color:#f0c674;border-color:#7a6431}.totr-vs--far_above{color:#ff8a80;border-color:#7a3a35}
   .totr-dollar{font:800 13px system-ui,sans-serif;color:#f5c518;background:#0b0e13;border:1px solid #3a475b;border-radius:5px;width:26px;height:24px;cursor:pointer;padding:0}
-  .totr-bz-profit{font-weight:700;color:#5fe0a6;white-space:nowrap}.totr-bz-profit--floor{color:#e2a6ef}
+  .totr-bz-profit{font-weight:700;color:#5fe0a6;white-space:nowrap}.totr-bz-profit--floor{color:#e2a6ef}.totr-bz-profit--loss{color:#ff8a8a}.totr-bz-paid{color:#c9d2de;white-space:nowrap}
   .totr-bz-state{font-weight:700;white-space:nowrap}.totr-bz-state--ok{color:#5fe0a6}.totr-bz-state--warn{color:#f0c674}.totr-bz-state--info{color:#8ab8ff}.totr-bz-state--low{color:#e2a6ef}
   .totr-hlink{font:700 12px Arial,sans-serif;letter-spacing:.06em;color:#ccc;background:transparent;border:0;padding:0 8px;cursor:pointer;text-decoration:none}
   .totr-hage{color:#9aa7b8;font-weight:400;letter-spacing:.03em}
@@ -1128,7 +1167,8 @@
         for (const line of r.lines) {
           const rowEl = el("div", { class: "totr-row" + (line.priceEach == null ? " totr-row--unpriced" : "") },
             el("span", null, line.name,
-              line.itemId ? el("button", { class: "totr-mini", type: "button", title: "Price check", onclick: () => modules.priceCheck.toggle(line.itemId, rowEl, { name: line.name }) }, "Check") : null),
+              line.itemId ? el("button", { class: "totr-mini", type: "button", title: "Price check", onclick: () => modules.priceCheck.toggle(line.itemId, rowEl, { name: line.name }) }, "Check") : null,
+              line.itemId ? el("a", { class: "totr-mini", href: itemPageUrl(line.itemId), target: "_blank", rel: "noopener", style: "display:inline-flex;align-items:center;text-decoration:none", title: "Open this item's page on Overseer" }, "Full page") : null),
             el("span", { class: "totr-num" }, line.qty),
             el("span", { class: "totr-num" }, line.priceEach == null ? (line.reason === "ranked" ? "ranked — price it" : "not on list") : fmtMoney(line.priceEach) + (line.priceSource === "unpublished" ? " · not on TE/W3b yet" : "")),
             el("span", { class: "totr-num" }, fmtMoney(line.lineTotal)));
@@ -1503,6 +1543,7 @@
       return cellOf(r.row, r.mvNode, null);
     }
 
+    const paidText = (s) => (s && s.costEach != null && Number(s.costEach) > 0 ? `paid ${fmtMoney(Math.round(Number(s.costEach)))}` : "");
     const profitText = (s, price) => (s && s.costEach != null && price != null ? `${price - s.costEach >= 0 ? "+" : "−"}${fmtMoney(Math.abs(price - s.costEach))}` : "");
 
     /** Manage only: how the listed price sits against the sell-list price. */
@@ -1562,7 +1603,16 @@
       }
       box.append(el("button", { class: "totr-dollar", type: "button", "aria-label": "Quick prices", onclick: (e) => openPopup(r, e.currentTarget) }, "$"));
       box.append(el("span", { class: "totr-bz-state", "data-totr-state": "1" }));
-      box.append(el("span", { class: "totr-bz-profit" + (s && s.heldAtFloor ? " totr-bz-profit--floor" : "") }, s && s.sellAt != null ? `${profitText(s, s.sellAt)}${s.heldAtFloor ? " · floor" : ""}` : ""));
+      // 0.7.13: what you paid, right on the Manage row — the reason to Fix or not, without
+      // opening Price check. Ledger cost of the ones you still hold (average when bought at
+      // different prices); nothing when the ledger has no open lot for the item.
+      const paid = paidText(s);
+      if (isManage() && paid) box.append(el("span", { class: "totr-bz-paid", title: "What you paid for the ones you still hold (your ledger's open lots; an average if you bought at different prices)" }, paid));
+      // 0.7.14 (WO-64): your bazaar vs the best trader vs the item market, on Overseer.
+      if (isManage() && r.itemId) box.append(el("a", { class: "totr-linkbtn", href: itemPageUrl(r.itemId, "sell"), target: "_blank", rel: "noopener", title: "Compare your bazaar, the best trader and the item market for this item" }, "Compare"));
+      // 0.7.12: a loss reads red (it used to stay green with only a minus sign).
+      const loss = s && s.sellAt != null && s.costEach != null && s.sellAt < s.costEach;
+      box.append(el("span", { class: "totr-bz-profit" + (s && s.heldAtFloor ? " totr-bz-profit--floor" : loss ? " totr-bz-profit--loss" : "") }, s && s.sellAt != null ? `${profitText(s, s.sellAt)}${s.heldAtFloor ? " · floor" : ""}` : ""));
       const spot = placeFor(r);
       if (spot) spot.append(box); else r.price.insertAdjacentElement("afterend", box);
       if (!r.price.dataset.totrListen) { r.price.dataset.totrListen = "1"; r.price.addEventListener("input", () => refresh(r)); }
@@ -1784,6 +1834,72 @@
   // --- Item market: bazaar strip (TS-5) --------------------------------------------------
   // VERIFY: item id from the market hash (#/market/view=search&itemID=206…) or the expanded
   // item's aria-controls; strip goes above Torn's seller list.
+  // ---- 0.7.12: "How do you mostly sell?" — shared by the buy pages ---------------------
+  let modeChooserOpen = false;
+  /** The chooser bar (not chosen yet, or "change" pressed). Picking reloads so every mark redraws. */
+  function sellModeBar() {
+    const mode = prefs().sellMode;
+    // 0.7.14: also saved to your Overseer account (WO-64), so every device and the site's
+    // Trading → Items page agree. The reload waits for the save (or its failure) briefly.
+    const pick = (m) => {
+      gmSet(STORE.sellMode, m);
+      modeChooserOpen = false;
+      const done = () => location.reload();
+      callTrader("sell_mode", { mode: m }).then(done, done);
+      setTimeout(done, 2500);
+    };
+    return el("div", { class: "totr-bar", id: "totr-mode-bar", "data-totr-ui": "1" },
+      el("strong", null, "Overseer"),
+      el("span", null, "How do you mostly sell?"),
+      el("span", { class: "totr-mode" }, ...SELL_MODES.map((m) =>
+        el("button", { type: "button", class: "totr-mode-btn" + (mode === m ? " totr-mode-btn--on" : ""), onclick: () => pick(m) }, SELL_MODE_LABELS[m]))),
+      el("span", { class: "totr-muted" }, "Highlights then show only what fits how you make money. Change it any time."));
+  }
+  /** 0.7.14: no choice on this device yet? Take the one saved to the account (once per page load). */
+  let modePulled = false;
+  function pullSellMode() {
+    if (modePulled || prefs().sellMode || (!prefs().tornKey && !prefs().sessionToken)) return;
+    modePulled = true;
+    callTrader("sell_mode").then((res) => {
+      const m = sellModeOf(res && res.mode);
+      if (m && !prefs().sellMode) { gmSet(STORE.sellMode, m); location.reload(); }
+    }).catch(() => { /* older server or offline: the chooser still asks */ });
+  }
+  /** The site's Item page for one item (WO-64). */
+  function itemPageUrl(itemId, tab) {
+    return `${SITE_URL}/trading/items/${itemId}${tab ? `?tab=${tab}` : ""}`;
+  }
+
+  /** "Selling via Bazaar · change" for a panel header once a mode is picked. */
+  function sellModeLink() {
+    const mode = prefs().sellMode;
+    if (!mode) return null;
+    return el("button", { type: "button", class: "totr-linkbtn", title: "Change how you mostly sell", onclick: () => { modeChooserOpen = true; document.getElementById("totr-mode-bar")?.remove(); window.dispatchEvent(new HashChangeEvent("hashchange")); } }, `Selling via ${SELL_MODE_LABELS[mode]} · change`);
+  }
+  /** Put the chooser before `anchor` when it is wanted and not already there. */
+  function placeSellModeBar(anchor) {
+    pullSellMode();
+    const want = !prefs().sellMode || modeChooserOpen;
+    const bar = document.getElementById("totr-mode-bar");
+    if (!want) { bar?.remove(); return; }
+    if (bar && bar.isConnected) return;
+    if (anchor && anchor.parentElement) anchor.insertAdjacentElement("beforebegin", sellModeBar());
+  }
+  // Bazaar mode's resale price: your sell-list price, from `sell_prices` (100 ids a call).
+  const sellAtCache = new Map(); // itemId → sellAt | null
+  async function loadSellAt(ids) {
+    const want = [...new Set(ids)].filter((id) => !sellAtCache.has(id));
+    for (let i = 0; i < want.length; i += 100) {
+      const chunk = want.slice(i, i + 100);
+      try {
+        const res = await callTrader("sell_prices", { itemIds: chunk });
+        for (const it of (res && res.items) || []) sellAtCache.set(it.itemId, it.sellAt != null ? Number(it.sellAt) : null);
+      } catch { return false; } // leave uncached; the next scan retries
+      for (const id of chunk) if (!sellAtCache.has(id)) sellAtCache.set(id, null);
+    }
+    return true;
+  }
+
   modules.itemMarket = (() => {
     let current = { itemId: null, data: null, error: null };
 
@@ -1806,14 +1922,19 @@
       // Inside Torn's seller list at the top: as its sibling it became a narrow flex column.
       if (!strip || !strip.isConnected) { strip?.remove(); strip = el("div", { id: "totr-strip", class: "totr", style: "width:100%;flex-basis:100%;box-sizing:border-box;margin-bottom:8px" }); a.prepend(strip); }
       const d = current.data;
+      const mode = prefs().sellMode;
+      placeSellModeBar(strip);
       const head = el("div", { class: "totr-head" }, el("strong", null, "Bazaars"));
       if (d) {
         head.append(...[
           el("span", { class: "totr-muted" }, `Market ${fmtMoney(d.marketValue)}`),
           netAfterFee(d.marketValue) != null ? el("span", { class: "totr-muted", title: "What a sale at market value pays you after Torn's 5% item market fee — pay more than this and reselling at MV loses money." }, `· ${fmtMoney(netAfterFee(d.marketValue))} after 5% fee`) : null,
           d.buyPrice != null ? el("span", { class: "totr-muted" }, `You buy at ${fmtMoney(d.buyPrice)}`) : null,
+          mode === "bazaar" && sellAtCache.get(current.itemId) != null ? el("span", { class: "totr-muted" }, `· You sell at ${fmtMoney(sellAtCache.get(current.itemId))}`) : null,
           el("span", { class: "totr-muted" }, "· 5 cheapest"),
-          el("button", { class: "totr-mini", type: "button", style: "margin-left:auto", onclick: () => modules.priceCheck.toggle(current.itemId, strip, { name: d.itemName }) }, "Price check"),
+          sellModeLink(),
+          el("a", { class: "totr-mini", href: itemPageUrl(current.itemId), target: "_blank", rel: "noopener", style: "margin-left:auto;display:inline-flex;align-items:center;text-decoration:none", title: "Every listing, buyers and your three ways to sell, on Overseer" }, "Full page"),
+          el("button", { class: "totr-mini", type: "button", onclick: () => modules.priceCheck.toggle(current.itemId, strip, { name: d.itemName }) }, "Price check"),
         ].filter(Boolean)); // native append() would print a null as the text "null" // native append() would print a null as the text "null"
       }
       const body = el("div", { class: "totr-body", style: "flex-direction:row;flex-wrap:wrap" });
@@ -1832,16 +1953,26 @@
               el("span", { class: "totr-card-name" }, b.name || "Bazaar"),
               el("strong", null, fmtMoney(b.price)),
               el("span", { class: "totr-muted" }, `× ${b.qty}`)),
-            under ? el("span", { class: "totr-chip totr-chip--ok" }, "Under your buy")
-              : pct != null ? el("span", { class: "totr-chip " + (pct <= 0 ? "totr-chip--ok" : "totr-chip--warn") }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`) : null));
+            stripChip(b, under, pct, mode, d)));
         }
         if (d.hiddenOutliers) body.append(el("div", { class: "totr-muted", style: "flex-basis:100%" }, `${d.hiddenOutliers} dollar-bazaar listing${d.hiddenOutliers === 1 ? "" : "s"} hidden`));
       }
       strip.replaceChildren(head, body);
     }
 
+    /** One chip per strip card: blue under your buy, else what fits the sell mode. */
+    function stripChip(b, under, pct, mode, d) {
+      if (under) return el("span", { class: "totr-chip totr-chip--buy" }, "Under your buy");
+      if (showsMarketPct(mode)) {
+        return pct != null ? el("span", { class: "totr-chip " + (pct <= 0 ? "totr-chip--ok" : "totr-chip--warn") }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`) : null;
+      }
+      const r = resaleFor(mode, b.price, d.marketValue, sellAtCache.get(current.itemId));
+      return r ? el("span", { class: "totr-chip totr-chip--ok" }, resaleLabel(r)) : null;
+    }
+
     async function load(itemId) {
       current = { itemId, data: null, error: null };
+      if (prefs().sellMode === "bazaar") loadSellAt([itemId]).then(() => { if (current.itemId === itemId) render(); });
       render();
       try {
         const res = await callTrader("quote", { itemIds: [itemId] });
@@ -1891,8 +2022,9 @@
         const deal = buyAt != null && t.price <= buyAt;
         // Buy-list deals win; otherwise a flip if reselling at MV clears the 5% fee. t.price is
         // read off the tile on every scan, so a listing that sold never leaves a stale chip.
-        const flip = deal ? null : flipAtMarket(t.price, q && q.marketValue);
-        const sig = deal ? `d${t.price}:${buyAt}` : flip ? `f${t.price}:${q.marketValue}` : "";
+        const mode = prefs().sellMode;
+        const flip = deal ? null : resaleFor(mode, t.price, q && q.marketValue, sellAtCache.get(t.itemId));
+        const sig = deal ? `d${t.price}:${buyAt}` : flip ? `f${t.price}:${flip.via}:${flip.profit}` : "";
         if ((t.li.dataset.totrDeal || "") === sig) continue;
         t.li.dataset.totrDeal = sig;
         t.li.classList.toggle("totr-deal", deal);
@@ -1905,16 +2037,24 @@
           t.li.append(el("span", { class: "totr-dealchip", "data-totr-ui": "1", title: `Cheapest listing ${fmtMoney(t.price)} · your Pricelist buy price ${fmtMoney(buyAt)}${stuckTail}` },
             under > 0 ? `${fmtMoney(under)} under your buy` : "at your buy"));
         } else if (flip) {
-          t.li.append(el("span", { class: "totr-dealchip totr-dealchip--flip", "data-totr-ui": "1", title: `Cheapest listing ${fmtMoney(t.price)} · market value ${fmtMoney(q.marketValue)} · resold at MV it nets ${fmtMoney(netAfterFee(q.marketValue))} after Torn's 5% fee. MV is an average, not a promised sale.${stuckTail}` },
-            `flip +${fmtMoney(flip.profit)} (${flip.pct.toFixed(1)}%)`));
+          const why = flip.via === "bazaar"
+            ? `Cheapest listing ${fmtMoney(t.price)} · your bazaar sell-list price ${fmtMoney(sellAtCache.get(t.itemId))} (no fee in a bazaar).`
+            : `Cheapest listing ${fmtMoney(t.price)} · market value ${fmtMoney(q.marketValue)} · resold at MV it nets ${fmtMoney(netAfterFee(q.marketValue))} after Torn's 5% fee. MV is an average, not a promised sale.`;
+          t.li.append(el("span", { class: "totr-dealchip totr-dealchip--flip", "data-totr-ui": "1", title: `${why}${stuckTail}` }, resaleLabel(flip)));
         }
       }
     }
     async function grid() {
       const list = gridTiles();
       if (!list.length) return;
+      placeSellModeBar(list[0].li.closest("ul") || list[0].li);
       markGrid(list);
-      if (await loadGrid(list)) markGrid(gridTiles());
+      let changed = await loadGrid(list);
+      if (prefs().sellMode === "bazaar") {
+        const ids = list.map((t) => t.itemId).filter((id) => !sellAtCache.has(id)).slice(0, 100);
+        if (ids.length && await loadSellAt(ids)) changed = true;
+      }
+      if (changed) markGrid(gridTiles());
     }
 
     return {
@@ -1924,7 +2064,8 @@
         const id = itemIdNow();
         if (!id) return;
         if (id !== current.itemId) { load(id); return; }
-        if (!document.getElementById("totr-strip")) render();
+        const strip = document.getElementById("totr-strip");
+        if (!strip) render(); else placeSellModeBar(strip);
       },
     };
   })();
@@ -2008,10 +2149,14 @@
         if (!q || prefs().ignored.has(c.itemId)) continue;
         if (c.price <= 1) continue; // $1 listings are display/locked items, not deals
         let label = null; let cls = null;
-        if (q.buyPrice != null && c.price < q.buyPrice) { label = "UNDER YOUR BUY"; cls = "ok"; }
-        else if (q.marketValue && c.price <= q.marketValue * dealPct / 100 && !hasQuality(c.card)) { label = `${Math.round((c.price / q.marketValue) * 100)}% OF MARKET`; cls = "warn"; }
+        const mode = prefs().sellMode;
+        const resale = mode === "bazaar" ? resaleFor(mode, c.price, q.marketValue, sellAtCache.get(c.itemId)) : null;
+        // 0.7.12: under your buy is BLUE on every page (it was green here, blue on the grid).
+        if (q.buyPrice != null && c.price < q.buyPrice) { label = "UNDER YOUR BUY"; cls = "buy"; }
+        else if (resale) { label = `RESELL +${fmtMoney(resale.profit)}`; cls = "ok"; }
+        else if (showsMarketPct(mode) && q.marketValue && c.price <= q.marketValue * dealPct / 100 && !hasQuality(c.card)) { label = `${Math.round((c.price / q.marketValue) * 100)}% OF MARKET`; cls = "warn"; }
         if (!label) continue;
-        c.card.style.boxShadow = cls === "ok" ? "inset 0 0 0 3px #5fe0a6" : "inset 0 0 0 3px #e0a23b";
+        c.card.style.boxShadow = cls === "buy" ? "inset 0 0 0 3px #4c8dff" : cls === "ok" ? "inset 0 0 0 3px #5fe0a6" : "inset 0 0 0 3px #e0a23b";
         const stuckNote = notSellingLine(q.stock, Date.now());
         c.card.querySelector("[data-testid='price']")?.after(el("span", { class: `totr-chip totr-chip--${cls}`, "data-totr-ui": "1", title: stuckNote || undefined }, stuckNote ? `${label} · HOLD ${Number(q.stock.onHand).toLocaleString("en-US")}` : label));
       }
@@ -2080,7 +2225,9 @@
         if (!prefs().tornKey && !prefs().sessionToken) return;
         const key = location.search;
         if (dealsFor !== key) { dealsFor = key; quotes = new Map(); }
+        placeSellModeBar(document.querySelector("[data-testid='bazaar-items']"));
         await loadDeals(list);
+        if (prefs().sellMode === "bazaar") await loadSellAt(list.map((c) => c.itemId).slice(0, 100));
         markDeals(list);
       },
     };
@@ -2837,7 +2984,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
