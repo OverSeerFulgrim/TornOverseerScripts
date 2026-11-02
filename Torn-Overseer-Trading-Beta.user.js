@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.7.14
+// @version      0.7.15
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, and after-fee profit on the stock market. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -709,10 +709,67 @@
     return PDA_API_KEY && !PDA_API_KEY.includes("###") ? PDA_API_KEY.trim() : "";
   }
 
+  // Torn PDA keeps the Overseer session between pages (0.7.15, same fix as Chain Watch
+  // v0.32.1). PDA's GM storage does not survive a page load, so the session minted on one
+  // Torn page was gone on the next and the script signed in again on EVERY page (~70
+  // sign-ins per PDA player a day, 2026-11-02). In PDA only, the session token is mirrored
+  // to page localStorage. Never the Torn key — PDA injects that fresh each load. The token
+  // is identity-only (the site keeps no key), Overseer-only and lasts 12 h; the trade-off is
+  // that other scripts on torn.com can read it (owner-approved for Chain Watch 2026-11-01).
+  // It is tagged with a hash of the key it was minted from, so a different PDA account
+  // never picks up someone else's session.
+  const PDA_SESSION_MIRROR = "totr_pda_session";
+
+  function isTornPda() {
+    return typeof window !== "undefined" && !!window && typeof window.PDA_httpGet === "function";
+  }
+
+  // FNV-1a, 32-bit: a tag that tells keys apart, not a secret (can't recover a 16-char key).
+  function keyTag(key) {
+    let h = 0x811c9dc5;
+    const s = String(key || "");
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(36);
+  }
+
+  function readPdaSession(tornKey) {
+    if (!isTornPda() || !tornKey) return "";
+    try {
+      const raw = localStorage.getItem(PDA_SESSION_MIRROR);
+      if (!raw) return "";
+      const m = JSON.parse(raw);
+      return m && typeof m.t === "string" && m.k === keyTag(tornKey) ? m.t.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function writePdaSession(token, tornKey) {
+    if (!isTornPda()) return;
+    try {
+      if (token && tornKey) localStorage.setItem(PDA_SESSION_MIRROR, JSON.stringify({ t: token, k: keyTag(tornKey) }));
+      else localStorage.removeItem(PDA_SESSION_MIRROR);
+    } catch {
+      /* storage unavailable — the script just signs in again, as before */
+    }
+  }
+
+  // Every write of the session token goes through here so the PDA mirror stays in step.
+  function saveSessionToken(token) {
+    const value = String(token || "").trim();
+    const ok = gmSet(STORE.sessionToken, value);
+    writePdaSession(value, prefs().tornKey);
+    return ok;
+  }
+
   function prefs() {
+    const tornKey = String(gmGet(STORE.tornKey, "") || "").trim() || pdaApiKey();
     return {
-      tornKey: String(gmGet(STORE.tornKey, "") || "").trim() || pdaApiKey(),
-      sessionToken: String(gmGet(STORE.sessionToken, "") || "").trim(),
+      tornKey,
+      sessionToken: String(gmGet(STORE.sessionToken, "") || "").trim() || readPdaSession(tornKey),
       fillPct: clampPct(gmGet(STORE.fillPct, DEFAULT_FILL_PCT), DEFAULT_FILL_PCT, MAX_FILL_PCT, MIN_FILL_PCT),
       dealPct: clampPct(gmGet(STORE.dealPct, DEFAULT_DEAL_PCT), DEFAULT_DEAL_PCT, 100),
       ignored: new Set((gmGet(STORE.ignored, []) || []).map(Number).filter(Number.isSafeInteger)),
@@ -775,7 +832,7 @@
       body: { apiKey: tornKey, persist: false },
     });
     if (!res || typeof res.sessionToken !== "string") throw new Error("The site did not return a session.");
-    gmSet(STORE.sessionToken, res.sessionToken);
+    saveSessionToken(res.sessionToken);
     return res.sessionToken;
   }
 
@@ -793,7 +850,7 @@
       });
     } catch (err) {
       if (err && err.status === 401 && !retried && prefs().tornKey) {
-        gmSet(STORE.sessionToken, "");
+        saveSessionToken("");
         await connect();
         return callTrader(action, body, true);
       }
@@ -1014,7 +1071,7 @@
   const BAD_KEY_RE = /rejected that API key|exactly as generated|does not allow basic account info|Full-access Torn key/i;
   function forgetKey() {
     gmSet(STORE.tornKey, "");
-    gmSet(STORE.sessionToken, "");
+    saveSessionToken("");
   }
   const hasKey = () => { const p = prefs(); return Boolean(p.tornKey || p.sessionToken); };
 
@@ -1039,7 +1096,7 @@
       const key = input.value.trim();
       if (!key) return;
       if (!gmSet(STORE.tornKey, key)) { msg.textContent = "This browser's script manager can't store secrets — use Tampermonkey."; return; }
-      gmSet(STORE.sessionToken, "");
+      saveSessionToken("");
       onSaved();
     };
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save(); } });
@@ -2984,7 +3041,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
