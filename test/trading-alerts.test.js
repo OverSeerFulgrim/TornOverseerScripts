@@ -148,3 +148,24 @@ test("0.8.1: finds the Information icons by their heading when the class name di
   assert.ok(eye, "eye added");
   assert.equal(eye.parentElement.className, "icons___q");
 });
+
+test("0.8.2: the eye comes back when the sidebar loads late or Torn redraws it", async () => {
+  const dom = new JSDOM("<!doctype html><html><head></head><body><div id='sidebarroot'></div></body></html>", {
+    url: "https://www.torn.com/index.php", runScripts: "outside-only", pretendToBeVisual: true,
+  });
+  const w = dom.window;
+  windows.push(w);
+  w.GM_getValue = (k, d) => (k === "totr_torn_key" ? "KEYAAAAAAAAAAAAA" : k === "totr_session_token" ? "sess" : d);
+  w.GM_setValue = () => {};
+  w.GM_xmlhttpRequest = (opts) => setTimeout(() => opts.onload({ status: 200, responseText: JSON.stringify({ watched: [], deals: [] }) }), 0);
+  w.eval(SOURCE);
+  await tick();
+  assert.equal(w.document.getElementById("totr-eye"), null, "no sidebar yet");
+  // The sidebar arrives, then gets replaced wholesale (a React redraw).
+  w.document.getElementById("sidebarroot").innerHTML = "<ul class='status-icons___n'><li></li><li></li></ul>";
+  await tick(2300);
+  assert.ok(w.document.getElementById("totr-eye"), "eye added once the sidebar exists");
+  w.document.getElementById("sidebarroot").innerHTML = "<ul class='status-icons___n'><li></li><li></li></ul>";
+  await tick(2300);
+  assert.ok(w.document.getElementById("totr-eye"), "eye put back after the redraw");
+});

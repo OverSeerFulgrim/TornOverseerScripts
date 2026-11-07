@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.1
+// @version      0.8.2
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -3402,20 +3402,26 @@
     }
 
     let started = false;
+    /** Torn redraws the sidebar: put the eye back (cheap — an id lookup first). */
+    function tick() {
+      if (!started) { start(); return; }
+      if (!document.getElementById("totr-eye") || (unseen().length > 0 && !document.getElementById("totr-fab"))) render();
+    }
+    function start() {
+      if (started || !hasKey()) return;
+      started = true;
+      render();
+      poll(false);
+      setInterval(() => poll(false), 60_000);
+      // 0.8.2: the sidebar loads after the script and is redrawn by Torn; the page watcher's
+      // debounce never settles on pages whose timers tick every second, so the eye was not put
+      // back after a refresh. A 2-second check (an id lookup) keeps it in place.
+      setInterval(() => { if (!document.hidden) tick(); }, 2_000);
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(false); });
+    }
     return {
-      start() {
-        if (started || !hasKey()) return;
-        started = true;
-        render();
-        poll(false);
-        setInterval(() => poll(false), 60_000);
-        document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(false); });
-      },
-      /** Torn redraws the sidebar: put the eye back (cheap — an id lookup first). */
-      tick() {
-        if (!started) { this.start(); return; }
-        if (!document.getElementById("totr-eye") || (unseen().length > 0 && !document.getElementById("totr-fab"))) render();
-      },
+      start,
+      tick,
       /** The item market page's buy price for one item, for the price line. */
       buyPriceFor(itemId) {
         const w = (load().watched || []).find((x) => x.itemId === itemId);
