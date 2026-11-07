@@ -189,6 +189,14 @@ your Bazaar sell list (with a "vs cheapest" check beside each Fill button), show
 the item market, a Price check on any item, and after-fee profit on the stock market. Fills boxes
 only — never presses a Torn button for you. Needs an Overseer Trading subscription.
 
+**Deal alerts (0.8.0).** The script now loads on every Torn page, but only for alerts: the
+Overseer eye joins Torn's Information icons with a green count when an item on your
+[buy list](https://tornoverseer.com/trading/buy-list) is listed at or under your price, and a round
+`$` button shows the same count on phones (stacked above Chain Watch's TO button). Bazaars are
+checked by the Overseer server; the item market is read with your own key, a few items per
+5-minute check. Without a subscription you get the eye only, opening a locked panel — nothing else
+runs. On the item market, one dashed "your price" line in the seller list replaces per-row colours.
+
 Install from [Greasy Fork](https://greasyfork.org/scripts/599500), which syncs from this file.
 
 ## License

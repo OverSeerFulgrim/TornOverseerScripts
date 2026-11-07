@@ -423,3 +423,62 @@ test("resaleLabel names the route", () => {
   assert.equal(tr.resaleLabel({ profit: 100, pct: 11.11, via: "bazaar" }), "resell +$100 (11.1%)");
   assert.equal(tr.resaleLabel({ profit: 50, pct: 5.55, via: "market" }), "flip +$50 (5.5%)");
 });
+
+// ---- 0.8.0 (WO-66): deal alerts ----------------------------------------------------------
+
+test("isTradingPage: trading modules only on their pages; alerts everywhere else", () => {
+  assert.equal(tr.isTradingPage(loc("/trade.php")), true);
+  assert.equal(tr.isTradingPage(loc("/item.php")), true);
+  assert.equal(tr.isTradingPage(loc("/page.php", "?sid=ItemMarket")), true);
+  assert.equal(tr.isTradingPage(loc("/gym.php")), false);
+  assert.equal(tr.isTradingPage(loc("/index.php")), false);
+});
+
+test("itemMarketDealFor: cheapest listing at/under the buy price, $1 listings ignored", () => {
+  const item = { itemId: 206, name: "Xanax", buyPrice: 800000 };
+  const deal = tr.itemMarketDealFor(item, [{ price: 1, amount: 1 }, { price: 790000, amount: 2 }, { price: 800000, quantity: 3 }, { price: 820000, amount: 5 }]);
+  assert.deepEqual(deal, { source: "market", itemId: 206, name: "Xanax", buyPrice: 800000, price: 790000, qtyUnder: 5, sellerId: null, sellerName: null, underPct: 1.3 });
+  assert.equal(tr.itemMarketDealFor(item, [{ price: 900000, amount: 1 }]), null);
+  assert.equal(tr.itemMarketDealFor({ ...item, buyPrice: 0 }, [{ price: 5, amount: 1 }]), null);
+  assert.equal(tr.itemMarketDealFor(item, undefined), null);
+});
+
+test("mergeDeals: bazaar + item market, off-list item-market leftovers dropped, biggest discount first", () => {
+  const watched = [{ itemId: 1 }, { itemId: 2 }];
+  const merged = tr.mergeDeals(
+    [{ itemId: 1, price: 90, underPct: 10 }],
+    [{ source: "market", itemId: 2, price: 95, underPct: 20 }, { source: "market", itemId: 3, price: 1, underPct: 99 }, null],
+    watched,
+  );
+  assert.deepEqual(merged.map((d) => [d.source, d.itemId]), [["market", 2], ["bazaar", 1]]);
+});
+
+test("unseenDeals / dealKey: a seen deal stays seen until its price changes", () => {
+  const d = { source: "bazaar", itemId: 1, price: 90 };
+  assert.equal(tr.dealKey(d), "bazaar:1:90");
+  assert.equal(tr.unseenDeals([d], ["bazaar:1:90"]).length, 0);
+  assert.equal(tr.unseenDeals([{ ...d, price: 85 }], ["bazaar:1:90"]).length, 1);
+  assert.equal(tr.unseenDeals([d], undefined).length, 1);
+});
+
+test("pickMarketChecks rotates through the buy list", () => {
+  const w = [1, 2, 3, 4, 5].map((itemId) => ({ itemId }));
+  assert.deepEqual(tr.pickMarketChecks(w, 0, 2).map((x) => x.itemId), [1, 2]);
+  assert.deepEqual(tr.pickMarketChecks(w, 1, 2).map((x) => x.itemId), [3, 4]);
+  assert.deepEqual(tr.pickMarketChecks(w, 2, 2).map((x) => x.itemId), [5, 1]);
+  assert.deepEqual(tr.pickMarketChecks(w.slice(0, 2), 7, 4).map((x) => x.itemId), [1, 2]);
+});
+
+test("priceLineIndex counts the cheapest-first rows at or under the price", () => {
+  assert.equal(tr.priceLineIndex([774000, 790500, 801000, 810000], 798000), 2);
+  assert.equal(tr.priceLineIndex([810000], 798000), 0);
+  assert.equal(tr.priceLineIndex([700, 800], 900), 2);
+  assert.equal(tr.priceLineIndex([700], null), -1);
+});
+
+test("minutesAgo reads like a person", () => {
+  const now = Date.parse("2026-11-06T12:00:00Z");
+  assert.equal(tr.minutesAgo("2026-11-06T11:59:40Z", now), "just now");
+  assert.equal(tr.minutesAgo("2026-11-06T11:55:00Z", now), "5 min ago");
+  assert.equal(tr.minutesAgo("nope", now), "");
+});

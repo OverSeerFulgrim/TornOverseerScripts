@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.7.15
-// @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, and after-fee profit on the stock market. Fills boxes only — never presses a Torn button for you.
+// @version      0.8.0
+// @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
@@ -12,6 +12,7 @@
 // @match        https://www.torn.com/page.php?sid=ItemMarket*
 // @match        https://www.torn.com/page.php?sid=stocks*
 // @match        https://www.torn.com/item.php*
+// @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -673,6 +674,90 @@
 
 
   // ---------------------------------------------------------------------------------------
+  // WO-66: deal alerts — pure helpers
+  // ---------------------------------------------------------------------------------------
+
+  /** How often the deal list is asked for (the server also rotates its live checks per 5 min). */
+  const DEALS_POLL_MS = 5 * 60_000;
+  /** Item-market reads per poll, with the player's own key (~1 Torn call a minute). */
+  const MARKET_CHECKS_PER_POLL = 4;
+  /** A non-subscriber is asked again this often (subscribing unlocks without a reinstall). */
+  const LOCKED_RECHECK_MS = 6 * 3600_000;
+
+  /** The pages the trading modules (and Price check) run on — everything else only gets alerts. */
+  function isTradingPage(loc) {
+    const path = String(loc.pathname || "");
+    return routeFor(loc) != null || path === "/item.php";
+  }
+
+  function dealKey(deal) {
+    return `${deal.source || "bazaar"}:${deal.itemId}:${deal.price}`;
+  }
+
+  function unseenDeals(deals, seen) {
+    const set = seen instanceof Set ? seen : new Set(seen || []);
+    return (deals || []).filter((d) => !set.has(dealKey(d)));
+  }
+
+  /** Cheapest item-market listing at/under the buy price, from Torn's itemmarket listings. */
+  function itemMarketDealFor(item, listings) {
+    if (!item || !Number.isFinite(item.buyPrice) || item.buyPrice <= 0) return null;
+    let best = null;
+    let qtyUnder = 0;
+    for (const l of listings || []) {
+      const price = Number(l.price);
+      const qty = Number(l.amount ?? l.quantity) || 1;
+      if (!Number.isFinite(price) || price <= 1 || price > item.buyPrice) continue;
+      qtyUnder += qty;
+      if (!best || price < best) best = price;
+    }
+    if (best == null) return null;
+    return {
+      source: "market", itemId: item.itemId, name: item.name, buyPrice: item.buyPrice, price: best,
+      qtyUnder, sellerId: null, sellerName: null,
+      underPct: Math.round(((item.buyPrice - best) / item.buyPrice) * 1000) / 10,
+    };
+  }
+
+  /** Server bazaar deals + the script's own item-market deals, biggest discount first. */
+  function mergeDeals(bazaarDeals, marketDeals, watched) {
+    const onList = new Set((watched || []).map((w) => w.itemId));
+    const out = [
+      ...(bazaarDeals || []).map((d) => ({ ...d, source: "bazaar" })),
+      ...(marketDeals || []).filter((d) => d && onList.has(d.itemId)),
+    ];
+    return out.sort((a, b) => b.underPct - a.underPct || a.itemId - b.itemId);
+  }
+
+  /** Which watched items get an item-market read this poll (a rotation over the list). */
+  function pickMarketChecks(watched, slot, n) {
+    const list = watched || [];
+    if (list.length <= n) return list.slice();
+    const start = ((Math.floor(slot) * n) % list.length + list.length) % list.length;
+    const out = [];
+    for (let k = 0; k < n; k++) out.push(list[(start + k) % list.length]);
+    return out;
+  }
+
+  function minutesAgo(iso, now) {
+    const t = Date.parse(iso || "");
+    if (!Number.isFinite(t)) return "";
+    const m = Math.max(0, Math.round((now - t) / 60_000));
+    return m < 1 ? "just now" : `${m} min ago`;
+  }
+
+  /** Item-market rows of one item at or under the buy price (the seller list is sorted cheapest first). */
+  function priceLineIndex(prices, buyPrice) {
+    if (!Number.isFinite(buyPrice) || buyPrice <= 0) return -1;
+    let under = 0;
+    for (const p of prices) {
+      if (Number.isFinite(p) && p <= buyPrice) under++;
+      else break;
+    }
+    return under;
+  }
+
+  // ---------------------------------------------------------------------------------------
   // Storage (secrets: GM only — same rule as Chain Watch)
   // ---------------------------------------------------------------------------------------
 
@@ -1055,7 +1140,33 @@
   .totr-stk-trades h4{margin:4px 0 6px;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#66738a}
   .totr-stk-trow{display:grid;grid-template-columns:86px 40px 48px 84px 84px 72px 120px minmax(90px,1fr);gap:8px;padding:5px 0;border-bottom:1px solid #1b2330;font-size:12px;min-width:640px}
   .totr-stk-trow--head{color:#9aa7b8;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
-  .totr-stk-trow--sell{background:#0f1f19}`;
+  .totr-stk-trow--sell{background:#0f1f19}
+  .totr-eye{position:relative;display:inline-flex;align-items:center;justify-content:center;width:100%;height:100%;cursor:pointer;background:transparent;border:0;padding:0}
+  .totr-eye img{width:18px;height:18px;display:block}
+  .totr-eye--live img{border-radius:50%;box-shadow:0 0 0 2px #ff3b45}
+  .totr-badge{position:absolute;right:-7px;top:-6px;min-width:14px;height:14px;padding:0 3px;box-sizing:border-box;border-radius:7px;background:#3ecf8e;color:#06210f;font:700 9px/14px system-ui,sans-serif;text-align:center;border:1px solid #222;pointer-events:none}
+  .totr-fab{position:fixed;left:58px;bottom:76px;z-index:2147483646;width:46px;height:46px;border-radius:23px;border:2px solid #e23b3b;background:#11161f;color:#e6ebf2;font:800 20px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.5)}
+  .totr-fab .totr-badge{right:-4px;top:-4px;min-width:20px;height:20px;font-size:11px;line-height:20px;border-radius:10px;border:2px solid #1a1a1a}
+  .totr-sheet{position:fixed;z-index:2147483647;right:12px;top:80px;width:360px;max-height:calc(100vh - 100px);display:flex;flex-direction:column;background:#0b0e13;border:1px solid #2f3b4d;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.6);color:#e6ebf2;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
+  @media (max-width:600px){.totr-sheet{left:0;right:0;top:auto;bottom:0;width:auto;max-height:70vh;border-radius:16px 16px 0 0}}
+  .totr-sheet-head{display:flex;align-items:center;gap:8px;padding:8px 10px 8px 12px;background:#11161f;border-bottom:1px solid #232c3a}
+  .totr-sheet-head img{width:20px;height:20px}
+  .totr-sheet-title{font-weight:800;letter-spacing:.04em;flex:1}
+  .totr-sheet-x{width:40px;height:36px;border:0;background:transparent;color:#9aa7b8;font:700 16px system-ui,sans-serif;cursor:pointer}
+  .totr-sheet-tabs{display:grid;grid-template-columns:1fr 1fr;margin:10px 12px 0;border:1px solid #2f3b4d;border-radius:9px;overflow:hidden}
+  .totr-sheet-tab{min-height:38px;border:0;background:#11161f;color:#9aa7b8;font:600 13px system-ui,sans-serif;cursor:pointer}
+  .totr-sheet-tab--on{background:#e23b3b;color:#fff}
+  .totr-sheet-body{padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto}
+  .totr-deal-card{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #232c3a;background:#161d28;border-radius:10px}
+  .totr-deal-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+  .totr-deal-pct{font:700 11px system-ui,sans-serif;color:#06210f;background:#3ecf8e;border-radius:4px;padding:0 5px;margin-left:6px}
+  .totr-deal-open{min-height:40px;padding:0 14px;border-radius:8px;background:#e23b3b;color:#fff !important;text-decoration:none;font-weight:700;display:inline-flex;align-items:center}
+  .totr-sheet-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px 12px;border-top:1px solid #232c3a;background:#11161f;color:#9aa7b8;font-size:12px}
+  .totr-sheet-foot a,.totr-sheet-body a.totr-link{color:#8ab8ff;font-weight:600}
+  .totr-lock-list{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px;color:#c9d2de}
+  .totr-lock-why{padding:10px 12px;border:1px solid #232c3a;background:#161d28;border-radius:10px;color:#c9d2de}
+  .totr-priceline{display:flex;align-items:center;gap:8px;margin:2px 0;font:700 11px system-ui,sans-serif;color:#ff8080;letter-spacing:.04em;list-style:none}
+  .totr-priceline::before,.totr-priceline::after{content:"";flex:1;border-top:2px dashed #e23b3b}`;
 
   function injectCss() {
     if (document.getElementById("totr-css")) return;
@@ -2114,6 +2225,36 @@
       if (changed) markGrid(gridTiles());
     }
 
+    // ---- 0.8.0 (WO-66): one dashed "your price" line in Torn's seller list ------------------
+    // Torn already sorts the item's listings cheapest first, so per-row colours added little:
+    // a single line shows where your buy price falls. VERIFY the row selector on live Torn.
+    function sellerRows(a) {
+      const rows = [];
+      for (const row of a.querySelectorAll("[class*='rowWrapper___'], li[class*='row___'], [class*='sellerRow___']")) {
+        if (row.closest(".totr, [data-totr-ui]") || row.parentElement?.closest("[class*='rowWrapper___'], [class*='sellerRow___']")) continue;
+        const m = moneyIn(row);
+        if (m) rows.push({ row, price: m.value });
+      }
+      return rows;
+    }
+    function markSellerList() {
+      const a = anchor();
+      if (!a) return;
+      const buy = current.data && current.data.buyPrice != null ? current.data.buyPrice : null;
+      const old = a.querySelector(".totr-priceline");
+      const rows = buy == null ? [] : sellerRows(a);
+      const at = buy == null || !rows.length ? -1 : priceLineIndex(rows.map((r) => r.price), buy);
+      if (at < 0) { old?.remove(); return; }
+      const label = `YOUR PRICE ${fmtMoney(buy)} · ${at} under`;
+      const before = rows[at] ? rows[at].row : null;
+      if (old && old.textContent === label && old.nextElementSibling === before) return;
+      old?.remove();
+      const tag = before && before.tagName === "LI" ? "li" : "div";
+      const line = el(tag, { class: "totr-priceline", "data-totr-ui": "1", role: "separator" }, label);
+      if (before) before.before(line);
+      else rows[rows.length - 1].row.after(line);
+    }
+
     return {
       onRoute() {
         if (!prefs().tornKey && !prefs().sessionToken) return; // trade panel handles first sign-in
@@ -2123,6 +2264,7 @@
         if (id !== current.itemId) { load(id); return; }
         const strip = document.getElementById("totr-strip");
         if (!strip) render(); else placeSellModeBar(strip);
+        markSellerList();
       },
     };
   })();
@@ -3015,6 +3157,252 @@
     return { onRoute };
   })();
 
+  // --- WO-66: deal alerts on every page ----------------------------------------------------
+  // The Overseer eye joins Torn's Information icons (sidebar) with a green count of new deals;
+  // a round "$" button shows the same count when there are new deals (phones, where the sidebar
+  // is tucked away), stacked above Chain Watch's TO button if that is installed. Either opens a
+  // panel: Deals (bazaars from the server, the item market read here with your own key) and your
+  // Buy list. A non-subscriber gets the eye only, opening a locked panel — nothing else starts.
+  // Deals and the subscription answer are cached in page storage (not secret) so a page load
+  // never re-asks the server inside DEALS_POLL_MS. VERIFY the sidebar selector on live Torn.
+  const EYE_SRC = "data:image/png;base64,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";
+  const ALERTS_STORE = "totr_alerts_v1";
+
+  modules.alerts = (() => {
+    let state = null;
+    let open = false;
+    let tab = "deals";
+    let busy = false;
+
+    function load() {
+      if (state) return state;
+      try { state = JSON.parse(localStorage.getItem(ALERTS_STORE) || "null"); } catch { state = null; }
+      if (!state || typeof state !== "object") state = {};
+      state.seen = Array.isArray(state.seen) ? state.seen.slice(-300) : [];
+      state.market = state.market && typeof state.market === "object" ? state.market : {};
+      return state;
+    }
+    function save() {
+      try { localStorage.setItem(ALERTS_STORE, JSON.stringify(state)); } catch { /* storage off: just re-asks */ }
+    }
+
+    function deals() {
+      const s = load();
+      const market = Object.values(s.market || {}).map((m) => m && m.deal).filter(Boolean);
+      return mergeDeals(s.deals, market, s.watched);
+    }
+    function unseen() { return unseenDeals(deals(), load().seen); }
+
+    async function poll(force) {
+      if (busy || !hasKey()) return;
+      if (typeof document !== "undefined" && document.hidden && !force) return;
+      const s = load();
+      const now = Date.now();
+      if (s.locked && !force && now - (s.at || 0) < LOCKED_RECHECK_MS) return;
+      if (!s.locked && !force && now - (s.at || 0) < DEALS_POLL_MS) return;
+      busy = true;
+      try {
+        const res = await callTrader("deals");
+        s.locked = false;
+        s.watched = Array.isArray(res && res.watched) ? res.watched : [];
+        s.deals = Array.isArray(res && res.deals) ? res.deals : [];
+        s.checkedAt = (res && res.checkedAt) || new Date(now).toISOString();
+        s.error = null;
+        // Item market, with the player's own key: a few watched items per poll, in rotation.
+        const key = prefs().tornKey;
+        if (key) {
+          const pick = pickMarketChecks(s.watched, Math.floor(now / DEALS_POLL_MS), MARKET_CHECKS_PER_POLL);
+          for (const item of pick) {
+            try {
+              const r = await requestJson(`https://api.torn.com/v2/market/${item.itemId}/itemmarket?offset=0&comment=overseer&key=${encodeURIComponent(key)}`);
+              const env = (r && r.itemmarket) || r;
+              if (r && r.error) break; // key problem or rate limit: stop for this poll
+              s.market[item.itemId] = { at: now, deal: itemMarketDealFor(item, env && env.listings) };
+            } catch { break; }
+          }
+          // Forget items that left the list.
+          const ids = new Set(s.watched.map((w) => String(w.itemId)));
+          for (const id of Object.keys(s.market)) if (!ids.has(id)) delete s.market[id];
+        }
+      } catch (err) {
+        if (err && err.status === 402) { s.locked = true; s.deals = []; s.watched = []; s.market = {}; }
+        else s.error = String((err && err.message) || err).replace(/key=[^&\s)]+/gi, "key=…");
+      } finally {
+        s.at = now;
+        busy = false;
+        save();
+        render();
+      }
+    }
+
+    // ---- sidebar eye (VERIFY: Torn's status icon list in the left sidebar) ----------------
+    function iconList() {
+      return document.querySelector("ul[class*='status-icons'], #sidebar ul[class*='status-icons___'], ul[class^='status-icons']");
+    }
+    function ensureEye(count, locked) {
+      const list = iconList();
+      if (!list) return;
+      let li = document.getElementById("totr-eye");
+      if (!li || !li.isConnected) {
+        li = el("li", { id: "totr-eye", "data-totr-ui": "1", style: "position:relative" },
+          el("button", { type: "button", class: "totr-eye", onclick: () => toggle(true) },
+            el("img", { src: EYE_SRC, alt: "" })));
+        list.append(li);
+      }
+      const btn = li.querySelector("button");
+      const label = locked ? "Torn Overseer: Trading is locked" : count > 0 ? `Torn Overseer: ${count} new deal${count === 1 ? "" : "s"} under your price` : "Torn Overseer: no new deals";
+      btn.setAttribute("aria-label", label);
+      btn.title = label;
+      const badge = btn.querySelector(".totr-badge");
+      if (count > 0) {
+        if (badge) badge.textContent = String(count);
+        else btn.append(el("span", { class: "totr-badge" }, String(count)));
+      } else badge?.remove();
+    }
+
+    // ---- floating "$" button: only while there is something new --------------------------
+    function ensureFab(count) {
+      let fab = document.getElementById("totr-fab");
+      if (count <= 0) { fab?.remove(); return; }
+      if (!fab) {
+        fab = el("button", { id: "totr-fab", type: "button", class: "totr-fab", "data-totr-ui": "1", onclick: () => toggle(true) }, "$");
+        document.body.append(fab);
+      }
+      // Stack above Chain Watch's TO launcher when it is on screen.
+      const to = document.getElementById("tocw-launcher");
+      if (to && to.style.display !== "none") {
+        const r = to.getBoundingClientRect();
+        fab.style.left = `${Math.round(r.left)}px`;
+        fab.style.bottom = `${Math.round(window.innerHeight - r.top + 10)}px`;
+      } else {
+        fab.style.left = "";
+        fab.style.bottom = "";
+      }
+      fab.setAttribute("aria-label", `Overseer Trading: ${count} new deal${count === 1 ? "" : "s"}`);
+      let badge = fab.querySelector(".totr-badge");
+      if (!badge) { badge = el("span", { class: "totr-badge" }); fab.append(badge); }
+      badge.textContent = String(count);
+    }
+
+    // ---- the panel ------------------------------------------------------------------------
+    function toggle(want) {
+      open = want == null ? !open : want;
+      if (open) {
+        const s = load();
+        // Opening marks what is listed as seen: the counts clear.
+        s.seen = [...new Set([...(s.seen || []), ...deals().map(dealKey)])].slice(-300);
+        save();
+        poll(false);
+      }
+      render();
+    }
+
+    function dealCard(d) {
+      const href = d.source === "market"
+        ? `https://www.torn.com/page.php?sid=ItemMarket#/market/view=search&itemID=${d.itemId}`
+        : d.sellerId ? `https://www.torn.com/bazaar.php?userId=${d.sellerId}&totr=${d.itemId}-${d.price}#/` : null;
+      return el("div", { class: "totr-deal-card" },
+        el("div", { class: "totr-deal-main" },
+          el("div", null, el("b", null, d.name || `Item ${d.itemId}`), el("span", { class: "totr-deal-pct" }, d.underPct > 0 ? `−${d.underPct}%` : "at price")),
+          el("div", null, el("b", null, fmtMoney(d.price)), el("span", { class: "totr-muted" }, ` · ×${d.qtyUnder || 1} · ${d.source === "market" ? "Item market" : `Bazaar${d.sellerName ? " · " + d.sellerName : ""}`}`)),
+          el("div", { class: "totr-muted" }, `Your price ${fmtMoney(d.buyPrice)}`)),
+        href ? el("a", { class: "totr-deal-open", href }, "Open") : null);
+    }
+
+    function lockedBody() {
+      return [
+        el("div", null, el("b", null, "Buy cheaper and sell smarter, right on Torn's pages.")),
+        el("ul", { class: "totr-lock-list" },
+          el("li", null, el("b", null, "Deal alerts"), " when items on your buy list drop under your price"),
+          el("li", null, el("b", null, "A buy list"), " with no Torn Exchange account needed"),
+          el("li", null, el("b", null, "One-tap bazaar fill"), " from your sell list"),
+          el("li", null, el("b", null, "Real profit per item"), " from your Torn log, after fees"),
+          el("li", null, el("b", null, "Price check"), " on any item")),
+        el("div", { class: "totr-lock-why" },
+          el("b", null, "Why it's separate from your faction: "),
+          "Trading is your own money, not your faction's. It follows you if you switch factions, and your faction doesn't pay for one trader."),
+        el("a", { class: "totr-deal-open", href: `${SITE_URL}/trading`, target: "_blank", rel: "noopener", style: "justify-content:center" }, "Get Trading on tornoverseer.com"),
+      ];
+    }
+
+    function renderSheet() {
+      let sheet = document.getElementById("totr-sheet");
+      if (!open) { sheet?.remove(); return; }
+      if (!sheet) {
+        sheet = el("section", { id: "totr-sheet", class: "totr-sheet", "data-totr-ui": "1", role: "dialog", "aria-label": "Overseer Trading" });
+        document.body.append(sheet);
+      }
+      const s = load();
+      const head = el("div", { class: "totr-sheet-head" },
+        el("img", { src: EYE_SRC, alt: "" }),
+        el("span", { class: "totr-sheet-title" }, "OVERSEER TRADING"),
+        el("button", { type: "button", class: "totr-sheet-x", "aria-label": "Close", onclick: () => toggle(false) }, "✕"));
+      const body = el("div", { class: "totr-sheet-body" });
+      const parts = [head];
+      if (s.locked) {
+        body.append(...lockedBody());
+        parts.push(body);
+      } else {
+        const list = deals();
+        parts.push(el("div", { class: "totr-sheet-tabs", role: "tablist" },
+          el("button", { type: "button", role: "tab", class: "totr-sheet-tab" + (tab === "deals" ? " totr-sheet-tab--on" : ""), onclick: () => { tab = "deals"; render(); } }, `Deals · ${list.length}`),
+          el("button", { type: "button", role: "tab", class: "totr-sheet-tab" + (tab === "list" ? " totr-sheet-tab--on" : ""), onclick: () => { tab = "list"; render(); } }, `Buy list · ${(s.watched || []).length}`)));
+        if (tab === "deals") {
+          if (s.error) body.append(el("div", { class: "totr-error" }, s.error));
+          if (!(s.watched || []).length) {
+            body.append(el("div", { class: "totr-muted" }, "Your buy list is empty. Add the items you buy and the prices you'll pay, and deals show up here."),
+              el("a", { class: "totr-link", href: `${SITE_URL}/trading/buy-list`, target: "_blank", rel: "noopener" }, "Set up your buy list"));
+          } else if (!list.length) {
+            body.append(el("div", { class: "totr-muted" }, "Nothing under your prices right now."));
+          } else body.append(...list.map(dealCard));
+        } else {
+          for (const w of s.watched || []) {
+            body.append(el("div", { class: "totr-deal-card" },
+              el("div", { class: "totr-deal-main" }, el("b", null, w.name || `Item ${w.itemId}`)),
+              el("b", null, fmtMoney(w.buyPrice))));
+          }
+          body.append(el("div", { class: "totr-muted" }, "Weapons and armor aren't on the buy list yet."));
+        }
+        parts.push(body);
+        parts.push(el("div", { class: "totr-sheet-foot" },
+          el("span", null, `${s.checkedAt ? "Checked " + minutesAgo(s.checkedAt, Date.now()) : "Checking…"} · ${(s.watched || []).length} watched`),
+          el("a", { href: `${SITE_URL}/trading/buy-list`, target: "_blank", rel: "noopener" }, "Edit buy list")));
+      }
+      sheet.replaceChildren(...parts);
+    }
+
+    function render() {
+      if (!IS_BROWSER || !hasKey()) return;
+      const s = load();
+      const count = s.locked ? 0 : unseen().length;
+      ensureEye(count, Boolean(s.locked));
+      ensureFab(count);
+      renderSheet();
+    }
+
+    let started = false;
+    return {
+      start() {
+        if (started || !hasKey()) return;
+        started = true;
+        render();
+        poll(false);
+        setInterval(() => poll(false), 60_000);
+        document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(false); });
+      },
+      /** Torn redraws the sidebar: put the eye back (cheap — an id lookup first). */
+      tick() {
+        if (!started) { this.start(); return; }
+        if (!document.getElementById("totr-eye") || (unseen().length > 0 && !document.getElementById("totr-fab"))) render();
+      },
+      /** The item market page's buy price for one item, for the price line. */
+      buyPriceFor(itemId) {
+        const w = (load().watched || []).find((x) => x.itemId === itemId);
+        return w ? w.buyPrice : null;
+      },
+    };
+  })();
+
   // ---------------------------------------------------------------------------------------
   // Boot: route, then re-route on SPA navigation (debounced; ignores our own mutations)
   // ---------------------------------------------------------------------------------------
@@ -3023,17 +3411,23 @@
     injectCss();
     let timer = null;
     const run = () => {
+      // 0.8.0: the script now loads on every Torn page for the deal alerts. The trading
+      // modules and Price check still run only on the pages they always ran on.
+      try { modules.alerts.tick(); } catch (err) { console.warn("[Overseer Trading]", err); }
+      if (!isTradingPage(location)) return;
       const name = routeFor(location);
       if (name && modules[name]) {
         try { modules[name].onRoute(); } catch (err) { console.warn("[Overseer Trading]", err); }
       }
-      // Price check rides along on every page the script runs on (incl. the Items page).
+      // Price check rides along on the trading pages (incl. the Items page).
       try { modules.priceCheck.scan(); } catch (err) { console.warn("[Overseer Trading]", err); }
     };
-    const schedule = () => { clearTimeout(timer); timer = setTimeout(run, 150); };
+    const schedule = () => { clearTimeout(timer); timer = setTimeout(run, isTradingPage(location) ? 150 : 1000); };
     window.addEventListener("hashchange", schedule);
+    // Our own UI and Chain Watch's panel (which redraws every second) never wake a re-scan.
+    const ours = (node) => node && node.closest && node.closest(".totr, [data-totr-ui], #tocw, [id^='tocw-']");
     new MutationObserver((records) => {
-      if (records.every((r) => r.target.closest && r.target.closest(".totr, [data-totr-ui]"))) return;
+      if (records.every((r) => ours(r.target))) return;
       schedule();
     }).observe(document.body, { childList: true, subtree: true });
     run();
@@ -3041,7 +3435,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
