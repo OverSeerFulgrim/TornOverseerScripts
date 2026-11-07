@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.35.0
+// @version      0.35.1
 // @description  Watcher-focused chain HUD, docked as an Overseer bar in Torn's sidebar (pop it out for the full panel): zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -43,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.35.0";
+      : "") || "0.35.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -2790,6 +2790,33 @@
       #tocw-dock .tocw-d-btn { border: 1px solid #555; background: #3a3a3a; color: #eee; }
       #tocw-dock .tocw-d-btn.on { border-color: #6f8f1a; background: #4d6611; color: #fff; }
       #tocw-dock .tocw-d-btn.wide { width: 100%; }
+      #tocw-dock .tocw-d-sec { font-size: 11px; font-weight: 700; color: #9a9a9a; text-transform: uppercase; letter-spacing: .04em; }
+      #tocw-dock .tocw-d-sep { border-top: 1px solid #3b3b3b; }
+      #tocw-dock .tocw-d-small { font-size: 11px; color: #bbb; }
+      #tocw-dock .tocw-d-small.bad, #tocw-dock .tocw-d-alert.bad { color: #ffc6cc; }
+      #tocw-dock .tocw-d-small.warn { color: #ffdca1; }
+      #tocw-dock .tocw-d-input { box-sizing: border-box; width: 100%; border-radius: 4px; border: 1px solid #555; background: #1c1c1c; color: #fff; padding: 5px 6px; font: 12px Arial, sans-serif; resize: none; }
+      #tocw-dock .tocw-d-quick { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+      #tocw-dock .tocw-d-check { display: flex; align-items: center; gap: 6px; color: #ccc; }
+      #tocw-dock .tocw-d-check input { margin: 0; }
+      #tocw-dock .tocw-d-primary { display: flex; align-items: center; justify-content: center; height: 27px; border-radius: 4px; border: 1px solid #6f8f1a; background: #4d6611; color: #fff; font: 700 12px Arial, sans-serif; cursor: pointer; text-decoration: none; box-sizing: border-box; width: 100%; }
+      #tocw-dock .tocw-d-primary[disabled], #tocw-dock .tocw-d-btn[disabled] { opacity: .6; cursor: default; }
+      #tocw-dock .tocw-d-bankers { display: flex; align-items: center; gap: 5px; color: #ccc; }
+      #tocw-dock .tocw-d-req { border-radius: 5px; padding: 7px; display: flex; flex-direction: column; gap: 5px; color: #ccc; }
+      #tocw-dock .tocw-d-req.wait { border: 1px solid #8a5a00; background: #2f2614; }
+      #tocw-dock .tocw-d-req.ok { border: 1px solid #2f6b47; background: #142a1d; }
+      #tocw-dock .tocw-d-amt { color: #fff; font-size: 14px; }
+      #tocw-dock .tocw-d-tag { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 999px; color: #fff; }
+      #tocw-dock .tocw-d-tag.wait { background: #8a5a00; }
+      #tocw-dock .tocw-d-tag.ok { background: #1f6b3d; }
+      #tocw-dock .tocw-d-note { color: #d6e2ee; overflow-wrap: anywhere; }
+      #tocw-dock .tocw-d-qrow { border: 1px solid #3b3b3b; border-radius: 5px; background: #232323; padding: 6px 7px; display: flex; flex-direction: column; gap: 4px; }
+      #tocw-dock .tocw-d-qrow.mine { border-color: #2f6b47; background: #17241b; }
+      #tocw-dock .tocw-d-who { display: flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+      #tocw-dock .tocw-d-who a { color: #7fb3ff; }
+      #tocw-dock .tocw-d-give { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px; }
+      #tocw-dock .tocw-d-give .tocw-d-btn { padding: 0 6px; }
+      #tocw-dock .tocw-d-paid { color: #8fd14f; }
       #tocw-dock .tocw-d-link { border: 0; background: none; color: #7fb3ff; padding: 0; cursor: pointer; font: inherit; text-decoration: underline; }
       #tocw-compose-banner { margin: 8px 0; padding: 9px 12px; border-radius: 6px; background: #0f1724; border: 1px solid #2b3d52; color: #c9d3e3; font: 13px/1.4 system-ui, sans-serif; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
       #tocw-compose-banner.ok { border-color: #2f6b47; }
@@ -3031,7 +3058,7 @@
     // v0.35.0: docked in Torn's sidebar, the bar IS the panel — the floating panel and
     // the TO launcher stay out of the way (and wait while the sidebar is still loading).
     ensureDock();
-    renderDock();
+    renderDock(opts);
     if (dockActive() || dockPending()) {
       box.style.display = "none";
       const l = document.getElementById("tocw-launcher");
@@ -6580,6 +6607,8 @@
     if (!existing) {
       dock.id = "tocw-dock";
       dock.addEventListener("click", onDockClick);
+      dock.addEventListener("input", onDockInput);
+      dock.addEventListener("change", onDockInput);
     }
     const gap = getComputedStyle(anchor).marginBottom;
     dock.style.marginBottom = gap && gap !== "0px" ? gap : "4px";
@@ -6640,6 +6669,8 @@
     const war = warAlert();
     if (war) return { text: "WAR !", cls: "bad" };
     const alert = hasBank() ? bankAlert(state.bank) : null;
+    const mine = hasBank() ? state.bank.status?.open : null;
+    if (mine && mine.status === "open") return { text: "waiting", cls: "warn" };
     if (alert && alert.count > 0) return { text: `${alert.count} bank`, cls: alert.fresh > 0 ? "warn" : "" };
     if (alert && alert.paid) return { text: "paid ✓", cls: "ok" };
     if (warRoomOpen()) return { text: "war", cls: "" };
@@ -6701,17 +6732,127 @@
       <button type="button" class="tocw-d-btn wide" data-d="open-war">Open the War Room ↗</button>`;
   }
 
-  function renderDockBank() {
-    const alert = bankAlert(state.bank);
-    const line = alert.count > 0 ? `${alert.count} request${alert.count === 1 ? "" : "s"} waiting` : "No open requests.";
-    return `<div class="tocw-d-row"><span>${line}</span></div>
-      ${alert.paid ? `<div class="tocw-d-bonus">Your request was paid ✓</div>` : ""}
-      <button type="button" class="tocw-d-btn wide" data-d="open-bank">Open the Bank ↗</button>`;
+  // v0.35.1: the Bank tab lives in the sidebar too — the same request / cancel / claim /
+  // give / unclaim as the full panel, laid out for the bar's width.
+  function dockBankerLine(b) {
+    if (!b) return "";
+    if (Array.isArray(b.online) && b.online.length > 0) {
+      const names = b.online.map((x) => `${escapeHtml(x.name)}${x.idle ? " (idle)" : ""}`).join(", ");
+      return `<div class="tocw-d-bankers"><span class="tocw-d-dot on" aria-hidden="true"></span><span>Bankers on: ${names}${b.moreOnline > 0 ? ` +${b.moreOnline}` : ""}</span></div>`;
+    }
+    if (b.lastOn) {
+      const ago = agoText(new Date(Number(b.lastOn.lastActionTs) * 1000).toISOString());
+      return `<div class="tocw-d-bankers"><span class="tocw-d-dot" aria-hidden="true"></span><span>No banker on · ${escapeHtml(b.lastOn.name)} was ${escapeHtml(ago)}</span></div>`;
+    }
+    return "";
   }
 
-  function renderDock() {
+  function dockBankForm(B) {
+    return `<div class="tocw-d-sec">Request money</div>
+      <label class="tocw-d-muted" for="tocw-d-bank-amount">Amount</label>
+      <input id="tocw-d-bank-amount" class="tocw-d-input" value="${escapeHtml(B.amount)}" placeholder="25m or 25,000,000" autocomplete="off" />
+      <div class="tocw-d-quick">
+        <button type="button" class="tocw-d-btn" data-d="bank-quick:10m">10m</button>
+        <button type="button" class="tocw-d-btn" data-d="bank-quick:50m">50m</button>
+        <button type="button" class="tocw-d-btn" data-d="bank-quick:all">All</button>
+      </div>
+      <label class="tocw-d-check"><input type="checkbox" id="tocw-d-bank-online" ${B.online ? "checked" : ""} /> Only while I'm online</label>
+      <label class="tocw-d-muted" for="tocw-d-bank-note">Note for the bankers</label>
+      <textarea id="tocw-d-bank-note" class="tocw-d-input" rows="2" maxlength="${BANK_NOTE_MAX}" placeholder="Optional — what it's for">${escapeHtml(B.note)}</textarea>
+      <button type="button" class="tocw-d-primary" data-d="bank-request" ${B.busy ? "disabled" : ""}>${B.busy ? "Sending…" : "Request"}</button>`;
+  }
+
+  function renderDockBank() {
+    const B = state.bank;
+    const st = B.status;
+    const msgs = `${B.error ? `<div class="tocw-d-alert bad">${escapeHtml(B.error)}</div>` : ""}${B.notice ? `<div class="tocw-d-alert">${escapeHtml(B.notice)}</div>` : ""}`;
+    if (!st) {
+      if (!B.loading && !B.error && IS_BROWSER) setTimeout(() => void loadBank(false), 0);
+      return `${msgs}<div class="tocw-d-muted">${B.loading ? "Loading…" : "—"}</div>`;
+    }
+    if (!st.enabled) return `${msgs}<div class="tocw-d-muted">Your faction hasn't turned on banking through the Overseer Discord bot yet.</div>`;
+    const q = B.queue && B.queue.canView ? B.queue : null;
+    const parts = [msgs];
+    parts.push(`<div class="tocw-d-row"><span class="tocw-d-muted">Vault balance</span><strong>${st.balance == null ? "—" : money(st.balance)}</strong></div>`);
+    const open = st.open;
+    if (open) {
+      const waiting = open.status === "open";
+      parts.push(`<div class="tocw-d-sec">Your request</div>
+        <div class="tocw-d-req ${waiting ? "wait" : "ok"}">
+          <div class="tocw-d-row"><strong class="tocw-d-amt">${money(open.amount)}</strong><span class="tocw-d-tag ${waiting ? "wait" : "ok"}">${escapeHtml((BANK_STATUS[open.status] || open.status).toUpperCase())}</span></div>
+          <div>${waiting ? `Bankers pinged on Discord · ${escapeHtml(agoText(open.createdAt))}` : `${escapeHtml(open.claimedBy || "A banker")} is sending it — it lands in your Torn events.`}</div>
+          ${open.mustBeOnline ? `<div>Only while you're online</div>` : ""}
+          ${open.note ? `<div class="tocw-d-note"><span class="tocw-d-muted">Note:</span> ${escapeHtml(open.note)}</div>` : ""}
+          ${waiting ? `<button type="button" class="tocw-d-btn" data-d="bank-cancel" ${B.busy ? "disabled" : ""}>Cancel request</button>` : ""}
+        </div>`);
+      parts.push(dockBankerLine(st.bankers));
+    } else {
+      parts.push(dockBankerLine(st.bankers));
+      // Bankers see the queue first; their own request is one button away.
+      if (q && q.banker && !B.dockForm) {
+        parts.push(`<button type="button" class="tocw-d-btn wide" data-d="bank-form">Request money for yourself</button>`);
+      } else {
+        parts.push(dockBankForm(B));
+      }
+    }
+    if (q) {
+      const rows = Array.isArray(q.requests) ? q.requests : [];
+      const list = rows.length === 0
+        ? `<div class="tocw-d-muted">No open requests.</div>`
+        : rows.map((r) => {
+          const short = r.balance_at_request != null && r.balance_at_request < r.owed;
+          const hold = r.must_be_online && r.online === false;
+          const give = r.claimed_by_me && r.give_url;
+          const unclaim = r.claimed_by_me && r.status === "claimed" && q.banker;
+          const action = give
+            ? `<div class="tocw-d-give"><a class="tocw-d-primary" href="${escapeHtml(r.give_url)}">Give ${money(r.owed)} ↗</a>${unclaim ? `<button type="button" class="tocw-d-btn" data-d="bank-unclaim:${r.id}" ${B.busy ? "disabled" : ""}>Unclaim</button>` : ""}</div>`
+            : r.status === "open"
+              ? (q.banker ? `<button type="button" class="tocw-d-primary" data-d="bank-claim:${r.id}" ${B.busy ? "disabled" : ""}>Claim</button>` : "")
+              : `<div class="tocw-d-muted">Claimed by ${escapeHtml(r.claimed_by_name || "a banker")}</div>`;
+          return `<div class="tocw-d-qrow${r.claimed_by_me ? " mine" : ""}">
+            <div class="tocw-d-row"><span class="tocw-d-who"><span class="tocw-d-dot ${r.online ? "on" : ""}" aria-hidden="true"></span>${profileLink(r.player_id, r.player_name)}</span><strong>${money(r.owed)}</strong></div>
+            <div class="tocw-d-small">${r.claimed_by_me ? "you claimed · " : ""}${escapeHtml(agoText(r.created_at))} · ${r.source === "site" ? "Overseer" : "Discord"}${r.must_be_online ? " · only while online" : ""}</div>
+            ${r.note ? `<div class="tocw-d-small tocw-d-note">“${escapeHtml(r.note)}”</div>` : ""}
+            ${short ? `<div class="tocw-d-small bad">Vault had ${money(r.balance_at_request)} when asked — short</div>` : hold ? `<div class="tocw-d-small warn">Offline now — hold off</div>` : ""}
+            ${action}
+          </div>`;
+        }).join("");
+      parts.push(`<div class="tocw-d-sep"></div>
+        <div class="tocw-d-row"><span class="tocw-d-sec">To fill</span>${rows.length ? `<span class="tocw-d-tag wait">${rows.length}</span>` : ""}</div>
+        ${list}
+        ${q.banker ? "" : `<div class="tocw-d-small tocw-d-muted">${q.linked ? "View only — claiming needs the banker role on Discord." : "View only — link your Discord (/verify) to claim."}</div>`}`);
+    }
+    const history = Array.isArray(st.history) ? st.history.filter((h) => !open || h.id !== open.id).slice(0, 2) : [];
+    if (history.length) {
+      parts.push(`<div class="tocw-d-sep"></div><div class="tocw-d-sec">Recent</div>
+        ${history.map((h) => `<div class="tocw-d-row tocw-d-small"><span>${money(h.paid_amount && h.paid_amount > 0 ? h.paid_amount : h.amount)}</span><span class="${h.status === "fulfilled" ? "tocw-d-paid" : "tocw-d-muted"}">${escapeHtml(BANK_STATUS[h.status] || h.status)} · ${escapeHtml(agoText(h.created_at))}</span></div>`).join("")}`);
+    }
+    return parts.join("");
+  }
+
+  // Typing in the bar's bank form: keep the values in state (the bar is rebuilt on
+  // every render, like the panel).
+  function onDockInput(e) {
+    const t = e.target;
+    if (!t || !t.id) return;
+    if (t.id === "tocw-d-bank-amount") state.bank.amount = t.value;
+    else if (t.id === "tocw-d-bank-note") state.bank.note = t.value;
+    else if (t.id === "tocw-d-bank-online") state.bank.online = Boolean(t.checked);
+  }
+
+  function renderDock(opts = {}) {
     const dock = document.getElementById("tocw-dock");
     if (!dock) return;
+    // A poll must not wipe what's being typed in the bar's bank form.
+    const active = document.activeElement;
+    const typing = active && dock.contains(active) && /^(INPUT|TEXTAREA)$/.test(active.tagName) ? active : null;
+    if (typing && opts.background) return;
+    const focusId = typing ? typing.id : null;
+    let selStart = null;
+    let selEnd = null;
+    if (typing) {
+      try { selStart = typing.selectionStart; selEnd = typing.selectionEnd; } catch { /* no caret */ }
+    }
     const docked = state.dock.mode === "sidebar";
     const open = docked && state.dock.open;
     const live = Boolean(state.chain?.active);
@@ -6742,6 +6883,15 @@
         </button>
       </div>
       ${body}`;
+    if (focusId) {
+      const again = document.getElementById(focusId);
+      if (again) {
+        again.focus();
+        if (selStart != null) {
+          try { again.setSelectionRange(selStart, selEnd); } catch { /* no caret */ }
+        }
+      }
+    }
   }
 
   function onDockClick(e) {
@@ -6773,6 +6923,20 @@
       setDockMode("float");
       state.settingsOpen = true;
       render();
+    } else if (act.startsWith("bank-quick:")) {
+      state.bank.amount = act.slice(11);
+      render();
+    } else if (act === "bank-request") {
+      void bankRequest();
+    } else if (act === "bank-cancel") {
+      void bankCancel();
+    } else if (act === "bank-form") {
+      state.bank.dockForm = true;
+      render();
+    } else if (act.startsWith("bank-claim:")) {
+      void bankClaim(Number(act.slice(11)));
+    } else if (act.startsWith("bank-unclaim:")) {
+      void bankUnclaim(Number(act.slice(13)));
     } else if (act === "open-war") {
       popOut("war");
     } else if (act === "open-bank") {

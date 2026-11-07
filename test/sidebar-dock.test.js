@@ -109,3 +109,91 @@ test("no sidebar: not docked, the floating panel shows as before", () => {
   assert.equal(cw.dockActive(), false);
   assert.equal(box().style.display, "");
 });
+
+// ---- v0.35.1: the Bank tab inline in the sidebar ------------------------------------
+
+function bankReset(bank) {
+  if (!document.getElementById("sidebarroot")) {
+    document.body.insertAdjacentHTML("afterbegin", SIDEBAR);
+    dock()?.remove();
+  }
+  reset();
+  cw.state.chain = null;
+  store.tocw_session_token = "sess";
+  store.tocw_panel_mode = "session";
+  cw.state.tab = "bank";
+  cw.state.bank = {
+    status: null, queue: null, loading: false, error: null, notice: null, loadedAt: Date.now(),
+    amount: "", online: false, note: "", busy: false, seen: [], paidSeenAt: "1970-01-01T00:00:00Z",
+    ...bank,
+  };
+}
+
+const status = (extra = {}) => ({
+  enabled: true, balance: 184250000, open: null, lastPaid: null,
+  history: [{ id: 3, amount: 10000000, paid_amount: 10000000, status: "fulfilled", claimed_by_name: "Gliuck", source: "site", created_at: new Date(now - 2 * 86400e3).toISOString() }],
+  bankers: { online: [{ name: "Gliuck", idle: false }, { name: "hyxeria", idle: true }], moreOnline: 0, lastOn: null },
+  ...extra,
+});
+
+test("bank: a member without a request gets the form, balance, bankers on and recent", (t) => {
+  bankReset({ status: status() });
+  if (!cw.availableTabs().includes("bank")) return t.skip("no session in this harness");
+  cw.render();
+  const body = dock().querySelector(".tocw-d-body");
+  assert.ok(body.querySelector("#tocw-d-bank-amount"), "amount box");
+  assert.ok(body.querySelector('[data-d="bank-request"]'), "Request button");
+  const text = body.textContent.replace(/\s+/g, " ");
+  assert.match(text, /Vault balance\s*\$184,250,000/);
+  assert.match(text, /Bankers on: Gliuck, hyxeria \(idle\)/);
+  assert.match(text, /Recent/);
+});
+
+test("bank: quick amount and typing land in state; Request with no amount explains", (t) => {
+  bankReset({ status: status() });
+  if (!cw.availableTabs().includes("bank")) return t.skip("no session in this harness");
+  cw.render();
+  click('[data-d="bank-quick:50m"]');
+  assert.equal(cw.state.bank.amount, "50m");
+  assert.equal(dock().querySelector("#tocw-d-bank-amount").value, "50m");
+  const note = dock().querySelector("#tocw-d-bank-note");
+  note.value = "armor";
+  note.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  assert.equal(cw.state.bank.note, "armor");
+  cw.state.bank.amount = "";
+  cw.render();
+  click('[data-d="bank-request"]');
+  assert.match(dock().textContent, /Enter an amount/);
+});
+
+test("bank: a waiting request shows its amount, note and Cancel, and the chip says waiting", (t) => {
+  bankReset({ status: status({ open: { id: 7, amount: 25000000, status: "open", claimedBy: null, createdAt: new Date(now - 240e3).toISOString(), mustBeOnline: true, note: "new armor" } }) });
+  if (!cw.availableTabs().includes("bank")) return t.skip("no session in this harness");
+  cw.render();
+  const text = dock().querySelector(".tocw-d-body").textContent.replace(/\s+/g, " ");
+  assert.match(text, /\$25,000,000/);
+  assert.match(text, /WAITING/);
+  assert.match(text, /new armor/);
+  assert.ok(dock().querySelector('[data-d="bank-cancel"]'));
+  assert.equal(dock().querySelector("#tocw-d-bank-amount"), null, "no form while a request is open");
+  assert.equal(dock().querySelector("#tocw-d-chip").textContent, "waiting");
+});
+
+test("bank: a banker sees the queue with Claim / Give / Unclaim and their own form behind a button", (t) => {
+  const reqs = [
+    { id: 1, player_id: 5, player_name: "Peachesri", owed: 25000000, status: "claimed", claimed_by_me: true, give_url: "https://www.torn.com/factions.php?step=your#/tab=controls&giveMoneyTo=5&money=25000000", created_at: new Date(now - 360e3).toISOString(), source: "discord", online: true },
+    { id: 2, player_id: 6, player_name: "Talak", owed: 8000000, status: "open", claimed_by_me: false, created_at: new Date(now - 120e3).toISOString(), source: "site", online: true, must_be_online: true },
+    { id: 3, player_id: 7, player_name: "ynax", owed: 120000000, status: "open", claimed_by_me: false, balance_at_request: 90000000, created_at: new Date(now - 660e3).toISOString(), source: "discord", online: true },
+  ];
+  bankReset({ status: status(), queue: { canView: true, banker: true, linked: true, requests: reqs } });
+  if (!cw.availableTabs().includes("bank")) return t.skip("no session in this harness");
+  cw.render();
+  const body = dock().querySelector(".tocw-d-body");
+  assert.ok(body.querySelector('[data-d="bank-unclaim:1"]'));
+  assert.match(body.querySelector("a.tocw-d-primary").textContent, /Give \$25,000,000/);
+  assert.ok(body.querySelector('[data-d="bank-claim:2"]'));
+  assert.match(body.textContent, /short/);
+  assert.equal(body.querySelector("#tocw-d-bank-amount"), null, "own form folded away");
+  click('[data-d="bank-form"]');
+  assert.ok(dock().querySelector("#tocw-d-bank-amount"), "form after the button");
+});
