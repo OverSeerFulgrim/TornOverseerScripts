@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.32.1
+// @version      0.34.0
 // @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -43,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.32.0";
+      : "") || "0.34.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -162,13 +162,9 @@
     celebrate: "tocw_celebrate",
     targetIds: "tocw_target_ids",
     targetIndex: "tocw_target_index",
-    // WO-36: which panel tab is open (chain | leadership). Leadership-only tabs fall
-    // back to chain for anyone the server does not say can_lead.
+    // Which panel tab is open (chain | war | bank). A tab that isn't available falls
+    // back to chain (v0.34.0 removed Leadership; a saved "leadership" lands on chain).
     tab: "tocw_tab",
-    // v0.30 Leadership tab v2: History open/closed (per viewer), and the one-shot
-    // hand-off from "Send <step>" / "Resume" to the compose picker on messages.php.
-    leadHistory: "tocw_lead_history",
-    composeHandoff: "tocw_compose_handoff",
     // v0.32.0 War tab: All / Priority on the board, the war whose NEW tag was seen, and the
     // optional FF Scouter key (a third-party key, so GM-only like the Torn key).
     warView: "tocw_war_view",
@@ -187,27 +183,14 @@
     return typeof GM_getValue === "function" && typeof GM_setValue === "function";
   }
 
-  // v0.30 Leadership tab v2 (docs/chain-watch-leadership-tab-v2-plan.md, L-4).
-  // todo = the server's leadership_todo payload; openMember = the expanded row;
-  // decided = the last not-excused decision, kept on top with its Send button until
-  // used or closed (the member leaves "Needs a message" the moment it is decided).
-  function freshLeadershipState() {
-    return {
-      todo: null, loading: false, error: null, notice: null, loadedAt: 0,
-      openMember: null, note: "", choice: null, choiceError: null, busy: false, decided: null, confirmDismiss: null,
-      historyOpen: readBool(STORE.leadHistory, false),
-    };
-  }
-
   const state = {
-    // WO-36 Leadership tab: "chain" | "leadership", and the warnings it lists.
-    tab: ["leadership", "bank", "war"].includes(readString(STORE.tab, "chain")) ? readString(STORE.tab, "chain") : "chain",
+    // Panel tab: "chain" | "war" | "bank".
+    tab: ["bank", "war"].includes(readString(STORE.tab, "chain")) ? readString(STORE.tab, "chain") : "chain",
     // v0.32.0 War tab (only while a War Room is open).
     war: freshWarState(),
-    leadership: freshLeadershipState(),
-    // WO-36 Bank tab: the member's own vault request + (bankers / leadership) the queue.
+    // WO-36 Bank tab: the member's own vault request + (bankers) the queue.
     bank: {
-      status: null, queue: null, loading: false, error: null, notice: null, loadedAt: 0, amount: "", online: false, busy: false,
+      status: null, queue: null, loading: false, error: null, notice: null, loadedAt: 0, amount: "", online: false, note: "", busy: false,
       seen: readIdList(STORE.bankSeen),
       paidSeenAt: readString(STORE.bankPaidSeen, ""),
     },
@@ -2685,7 +2668,6 @@
       .tocw-pill.ok { background: #103d2b; color: #d6ffe8; }
       .tocw-pill.warn { background: #67420c; color: #ffe1a7; }
       .tocw-pill.bad { background: #651922; color: #ffc6cc; }
-      .tocw-pill.lead { background: #3b1517; color: #ffb3b3; border: 1px solid #e5484d; }
       #tocw-launcher .tocw-l-badge { display: none; position: absolute; top: -9px; right: -10px; min-width: 20px; height: 20px; padding: 0 5px; box-sizing: border-box; border-radius: 10px; border: 2px solid #1a222b; background: #ffb347; color: #201200; font: 800 11px/16px Arial, sans-serif; text-align: center; pointer-events: none; }
       #tocw-launcher .tocw-l-badge.on { display: block; }
       #tocw-launcher .tocw-l-badge.paid { background: #32d47b; color: #06210f; }
@@ -2697,11 +2679,11 @@
       .tocw-tab-count { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 8px; background: #67420c; color: #ffe1a7; font-size: 10px; }
       .tocw-bank-row { border: 1px solid #2b3d52; border-radius: 7px; padding: 8px 9px; display: flex; flex-direction: column; gap: 5px; }
       .tocw-bank-row.mine { border-color: #3f84c4; }
+      .tocw-bank-note { font-size: 12px; color: #d6e2ee; overflow-wrap: anywhere; }
+      #tocw-bank-note { width: 100%; box-sizing: border-box; resize: vertical; min-height: 34px; font: inherit; font-size: 12px; }
       .tocw-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #5f6b7d; margin-right: 6px; }
       .tocw-dot.on { background: #3fa66b; }
       #tocw a.tocw-give { display: inline-flex; align-items: center; padding: 6px 10px; border-radius: 6px; background: #c8353a; border: 1px solid #e5484d; color: #fff; font-weight: 800; text-decoration: none; }
-      #tocw-compose-picker select { font: inherit; padding: 4px 6px; border-radius: 5px; border: 1px solid #3a4a66; background: #172238; color: #fff; }
-      #tocw-compose-picker button.tocw-fill { font: inherit; font-weight: 800; padding: 5px 16px; border-radius: 5px; border: 1px solid #e5484d; background: #c8353a; color: #fff; cursor: pointer; opacity: 1; }
       .tocw-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; background: #0a101c; border: 1px solid #2b3d52; border-radius: 7px; padding: 3px; }
       #tocw .tocw-tabs button { border: 0; background: transparent; color: #9fb2cf; font-weight: 700; }
       #tocw .tocw-tabs button.on { background: #1b2740; color: #fff; }
@@ -2768,34 +2750,6 @@
       #tocw-ab-host .tocw-ab.free { background: #13202f; border: 1px solid #3f84c4; color: #d9ebff; } #tocw-ab-host .tocw-ab.free .tocw-ab-dot { background: #5f6b7d; }
       #tocw-ab-host .tocw-ab.stop { background: #3b1517; border: 2px solid #e5484d; color: #ffd7da; font-size: 14px; }
       #tocw-ab-host .tocw-wr-fine { color: #9aa7b8; font-size: 12px; }
-      .tocw-warn-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; padding: 7px 9px; border: 1px solid #1f2a3e; border-radius: 6px; }
-      .tocw-warn-status { font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 999px; align-self: center; background: #2a3346; color: #c3ccda; }
-      .tocw-warn-status.sent { background: #103d2b; color: #d6ffe8; }
-      .tocw-lead-sec { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; font-size: 12px; font-weight: 800; color: #9eb4ce; margin: 2px 0 6px; text-transform: none; }
-      .tocw-lead-list { display: flex; flex-direction: column; gap: 6px; }
-      .tocw-lead-row { border: 1px solid #1f2a3e; border-radius: 7px; background: #0d141d; }
-      .tocw-lead-row.open { border-color: #3a4a66; }
-      #tocw button.tocw-lead-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; width: 100%; text-align: left; background: transparent; border: 0; padding: 8px 9px; color: inherit; font: inherit; }
-      .tocw-lead-name { font-weight: 800; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .tocw-tier { font-size: 11px; font-weight: 800; padding: 1px 7px; border-radius: 999px; justify-self: end; align-self: center; background: #2a3346; color: #c3ccda; }
-      .tocw-tier.critical { background: #651922; color: #ffc6cc; }
-      .tocw-tier.warning { background: #67420c; color: #ffe1a7; }
-      .tocw-ladder { display: inline-flex; gap: 3px; margin-right: 6px; vertical-align: middle; }
-      .tocw-ladder i { width: 8px; height: 8px; border-radius: 50%; border: 1px solid #5f6b7d; display: inline-block; }
-      .tocw-ladder i.on { background: #ffb347; border-color: #ffb347; }
-      .tocw-decide { padding: 2px 9px 10px; display: grid; gap: 7px; }
-      .tocw-decide-q { font-weight: 800; }
-      .tocw-decide-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-      #tocw button.tocw-notexcused { border-color: #e5484d; color: #ffc6cc; }
-      #tocw .tocw-decide-btns button.on { background: #1d344f; border-color: #6fb0ff; color: #fff; }
-      #tocw .tocw-decide-btns button.tocw-notexcused.on { background: #651922; border-color: #ff6b72; color: #fff; }
-      .tocw-decide-err { color: #ffc6cc; font-size: 12px; }
-      #tocw .tocw-decide input { width: 100%; box-sizing: border-box; font: inherit; font-size: 12px; padding: 6px 8px; border-radius: 6px; border: 1px solid #3a4a66; background: #172238; color: #fff; }
-      .tocw-ready { border: 1px solid #e5484d; border-radius: 7px; padding: 8px 9px; display: grid; gap: 6px; background: #1a0f13; }
-      .tocw-draft { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: center; padding: 7px 9px; border: 1px dashed #3a4a66; border-radius: 7px; }
-      .tocw-draft-actions { display: flex; gap: 5px; align-items: center; }
-      #tocw a.tocw-give.small { padding: 4px 8px; font-size: 11px; }
-      #tocw button.tocw-hist-toggle { width: 100%; text-align: left; background: transparent; border: 0; border-top: 1px solid #1f2a3e; border-radius: 0; padding: 8px 0 2px; color: #9eb4ce; font-weight: 800; font-size: 12px; }
       #tocw-compose-banner { margin: 8px 0; padding: 9px 12px; border-radius: 6px; background: #0f1724; border: 1px solid #2b3d52; color: #c9d3e3; font: 13px/1.4 system-ui, sans-serif; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
       #tocw-compose-banner.ok { border-color: #2f6b47; }
       #tocw-compose-banner.bad { border-color: #651922; color: #ffc6cc; }
@@ -3139,7 +3093,6 @@
                 : state.liveSource === "cache"
                   ? `<span class="tocw-pill warn" title="Your own Torn read failed, so this is the Overseer cache — it lags and can't resolve names. A fallback, not a mode.">CACHED</span>`
                   : `<span class="tocw-pill" title="Waiting on the first successful read">SITE SYNC</span>`}
-          ${canLead() ? `<span class="tocw-pill lead" title="You have Command access on Overseer">LEADERSHIP</span>` : ""}
         </div>
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
           <div style="min-width:0;">
@@ -3177,14 +3130,6 @@
         ${renderBankTab()}
         <div class="tocw-actions">
           <button id="tocw-bank-refresh" class="primary" ${state.bank.loading ? "disabled" : ""}>${state.bank.loading ? "Loading" : "Refresh"}</button>
-          <button id="tocw-settings">Settings</button>
-        </div>
-        ` : activeTab() === "leadership" ? `
-        ${versionAlert}
-        ${renderTabs()}
-        ${renderLeadershipTab()}
-        <div class="tocw-actions">
-          <button id="tocw-lead-refresh" class="primary" ${state.leadership.loading ? "disabled" : ""}>${state.leadership.loading ? "Loading" : "Refresh"}</button>
           <button id="tocw-settings">Settings</button>
         </div>
         ` : `
@@ -3315,13 +3260,12 @@
     for (const tabBtn of box.querySelectorAll("[data-tocw-tab]")) {
       tabBtn.addEventListener("click", () => setTab(tabBtn.getAttribute("data-tocw-tab")));
     }
-    document.getElementById("tocw-lead-refresh")?.addEventListener("click", () => { state.leadership.notice = null; void loadLeadership(true); });
-    wireLeadership(box);
     wireWar(box);
     document.getElementById("tocw-war-pill")?.addEventListener("click", () => setTab("war"));
     document.getElementById("tocw-bank-refresh")?.addEventListener("click", () => void loadBank(true));
     document.getElementById("tocw-bank-amount")?.addEventListener("input", (e) => { state.bank.amount = e.target.value; });
     document.getElementById("tocw-bank-online")?.addEventListener("change", (e) => { state.bank.online = Boolean(e.target.checked); });
+    document.getElementById("tocw-bank-note")?.addEventListener("input", (e) => { state.bank.note = e.target.value; });
     for (const q of box.querySelectorAll("[data-tocw-bank-quick]")) {
       q.addEventListener("click", () => { state.bank.amount = q.getAttribute("data-tocw-bank-quick"); render(); });
     }
@@ -3626,14 +3570,9 @@
   // A key that EXISTS but can't read the faction is the realistic failure now that a key is
   // required — it's the difference between "you're not set up" and "you're set up wrong".
 
-  // ---- WO-36: Leadership tab ---------------------------------------------------------
-  // Shown only when the server says can_lead (Command access on Overseer: leader,
-  // co-leader, admin, or whitelisted for Leadership). Never decided client-side.
-  function canLead() {
-    return Boolean(state.watch?.viewer?.can_lead);
-  }
-
-  // Bank needs a site session (every member with one); Leadership needs can_lead.
+  // ---- Panel tabs ---------------------------------------------------------------------
+  // v0.34.0 removed the Leadership tab: flags and warnings live on the site
+  // (Members → Flags). Bank needs a site session (every member with one).
   function hasBank() {
     return Boolean(settings().sessionToken) && panelMode() === "session";
   }
@@ -3641,7 +3580,6 @@
   function availableTabs() {
     const tabs = ["chain"];
     if (warRoomOpen()) tabs.push("war");
-    if (canLead()) tabs.push("leadership");
     if (hasBank()) tabs.push("bank");
     return tabs;
   }
@@ -3651,32 +3589,24 @@
   }
 
   function setTab(tab) {
-    state.tab = ["leadership", "bank", "war"].includes(tab) ? tab : "chain";
+    state.tab = ["bank", "war"].includes(tab) ? tab : "chain";
     gmSet(STORE.tab, state.tab);
     if (state.tab === "war") {
       state.war.loadedAt = 0; // poll now, not in up to 8s
       state.war.scoreAt = 0;
     }
-    if (state.tab === "leadership") void loadLeadership(false);
     if (state.tab === "bank") void loadBank(false);
     render();
   }
 
-  const TAB_LABELS = { chain: "Chain", war: "War", leadership: "Leadership", bank: "Bank" };
+  const TAB_LABELS = { chain: "Chain", war: "War", bank: "Bank" };
 
   function renderTabs() {
     const tabs = availableTabs();
     if (tabs.length < 2) return "";
     const tab = activeTab();
     const openCount = bankOpenRequests(state.bank).length;
-    // v0.30: the Leadership count (unsent drafts + members needing a message) is
-    // fetched once per page so the badge shows before the tab is opened.
-    const L = state.leadership;
-    if (tabs.includes("leadership") && L.todo == null && !L.loading && !L.error && IS_BROWSER) {
-      setTimeout(() => void loadLeadership(false), 0);
-    }
-    const leadCount = Number(L.todo?.count) || 0;
-    const count = (t) => (t === "bank" ? openCount : t === "leadership" ? leadCount : 0);
+    const count = (t) => (t === "bank" ? openCount : 0);
     return `<div class="tocw-tabs" role="tablist" aria-label="Chain Watch sections" style="grid-template-columns:repeat(${tabs.length},minmax(0,1fr));">
       ${tabs.map((t) => `<button class="small ${tab === t ? "on" : ""}" role="tab" aria-selected="${tab === t}" data-tocw-tab="${t}">${TAB_LABELS[t]}${t === "war" && warIsNew() ? ` <span class="tocw-tab-count war">NEW</span>` : count(t) > 0 ? ` <span class="tocw-tab-count">${count(t)}</span>` : ""}</button>`).join("")}
     </div>`;
@@ -3693,302 +3623,6 @@
     const hrs = Math.floor(mins / 60);
     if (hrs < 24) return `${hrs}h ago`;
     return `${Math.floor(hrs / 24)}d ago`;
-  }
-
-  const TIER_LABELS = { critical: "Critical", warning: "Warning", minor: "Minor" };
-  const LADDER = ["checkin", "formal", "final"];
-  /** How long a "Send <step>" / "Resume" hand-off stays good for the compose picker. */
-  const HANDOFF_MS = 10 * 60 * 1000;
-
-  function composeUrl(memberId) {
-    return `https://www.torn.com/messages.php#/p=compose&XID=${encodeURIComponent(String(memberId))}`;
-  }
-
-  function overseerMemberUrl(memberId) {
-    return `https://${OVERSEER_HOST}/faction/members/${encodeURIComponent(String(memberId))}`;
-  }
-
-  /** Dots filled up to the last SENT step: ●●○ = a formal warning went out last. */
-  function ladderDots(lastSentTemplate) {
-    const filled = lastSentTemplate ? LADDER.indexOf(lastSentTemplate) + 1 : 0;
-    return `<span class="tocw-ladder" aria-hidden="true">${LADDER.map((_, i) => `<i class="${i < filled ? "on" : ""}"></i>`).join("")}</span>`;
-  }
-
-  function lastWarningText(m, nowMs = Date.now()) {
-    const w = m.last_warning;
-    if (!w) return "never messaged";
-    const label = WARNING_LABELS[w.template] || "Warning";
-    return `${label} ${agoText(w.at, nowMs)}${w.status === "prepared" ? " (not sent)" : ""}`;
-  }
-
-  function renderLeadershipTab() {
-    const L = state.leadership;
-    const t = L.todo;
-    // First open (or a remembered tab on page load): fetch once, after this render.
-    if (t == null && !L.loading && !L.error && IS_BROWSER) setTimeout(() => void loadLeadership(false), 0);
-    const alerts = `
-      ${L.error ? `<div class="tocw-alert bad">${escapeHtml(L.error)}</div>` : ""}
-      ${L.notice ? `<div class="tocw-alert">${escapeHtml(L.notice)}</div>` : ""}`;
-    const footer = `<div class="tocw-muted"><a href="https://${OVERSEER_HOST}/faction/members" target="_blank" rel="noreferrer noopener">Members → Flags on Overseer ↗</a> · <a href="https://${OVERSEER_HOST}/faction/command" target="_blank" rel="noreferrer noopener">Command ↗</a></div>`;
-    if (t == null) {
-      return `${alerts}<div class="tocw-card"><div class="tocw-muted">${L.loading ? "Loading…" : "—"}</div></div>${footer}`;
-    }
-    const drafts = Array.isArray(t.drafts) ? t.drafts : [];
-    const members = Array.isArray(t.members) ? t.members : [];
-    const history = Array.isArray(t.history) ? t.history : [];
-    return `
-      ${alerts}
-      ${renderReady()}
-      ${drafts.length ? `<div class="tocw-card">
-        <div class="tocw-lead-sec"><span>Not sent yet</span></div>
-        <div class="tocw-lead-list">${drafts.map(renderDraftRow).join("")}</div>
-      </div>` : ""}
-      <div class="tocw-card">
-        <div class="tocw-lead-sec"><span>Needs a message</span>${t.flags_as_of ? `<span class="tocw-muted">flags as of ${escapeHtml(agoText(t.flags_as_of))}</span>` : ""}</div>
-        ${members.length
-          ? `<div class="tocw-lead-list">${members.map(renderMemberRow).join("")}</div>`
-          : `<div class="tocw-muted">Nobody needs a message right now. Flags show up here once a leader's Overseer scoreboard has synced them.</div>`}
-        ${renderHistory(history)}
-      </div>
-      ${footer}`;
-  }
-
-  function renderReady() {
-    const d = state.leadership.decided;
-    if (!d) return "";
-    const label = WARNING_LABELS[d.next_template] || "warning";
-    return `<div class="tocw-ready">
-      <div><strong>${escapeHtml(d.member_name)}</strong> <span class="tocw-muted">· marked not excused</span></div>
-      <div class="tocw-draft-actions">
-        <a class="tocw-give" href="${escapeHtml(composeUrl(d.member_id))}" data-tocw-lead-send="${escapeHtml(String(d.member_id))}">Send ${escapeHtml(label)} on Torn</a>
-        <button class="small" data-tocw-lead-ready-close="1" aria-label="Close">Not now</button>
-      </div>
-      <div class="tocw-muted">Opens Torn's message page with ${escapeHtml(label.toLowerCase())} filled in. You press Send — Overseer logs it with this decision.</div>
-    </div>`;
-  }
-
-  function renderDraftRow(d) {
-    const L = state.leadership;
-    const label = WARNING_LABELS[d.template] || "Warning";
-    const confirming = L.confirmDismiss === d.id;
-    return `<div class="tocw-draft">
-      <div style="min-width:0;"><div class="tocw-lead-name">${escapeHtml(d.member_name || `ID ${d.member_id}`)}</div>
-        <div class="tocw-muted">${escapeHtml(label)} · ${escapeHtml(agoText(d.created_at))}${d.created_by_name ? ` · by ${escapeHtml(d.created_by_name)}` : ""}</div></div>
-      <div class="tocw-draft-actions">${confirming
-        ? `<button class="small primary" data-tocw-lead-dismiss="${escapeHtml(String(d.id))}" ${L.busy ? "disabled" : ""}>Discard</button><button class="small" data-tocw-lead-keep="1">Keep</button>`
-        : `<a class="tocw-give small" href="${escapeHtml(composeUrl(d.member_id))}" data-tocw-lead-resume="${escapeHtml(String(d.id))}">Resume</a><button class="small" data-tocw-lead-ask-dismiss="${escapeHtml(String(d.id))}" aria-label="Discard this draft">✕</button>`}
-      </div>
-    </div>`;
-  }
-
-  function renderMemberRow(m) {
-    const L = state.leadership;
-    const open = L.openMember === m.member_id;
-    const tier = TIER_LABELS[m.tier] ? m.tier : "minor";
-    const next = WARNING_LABELS[m.next_template] || "Check-in";
-    return `<div class="tocw-lead-row ${open ? "open" : ""}">
-      <button class="tocw-lead-head" data-tocw-lead-open="${escapeHtml(String(m.member_id))}" aria-expanded="${open}">
-        <span class="tocw-lead-name">${escapeHtml(m.member_name)}</span>
-        <span class="tocw-tier ${tier}">${TIER_LABELS[tier]} · ${escapeHtml(String(m.flag_count))}</span>
-        <span class="tocw-muted" style="grid-column:1 / -1;">${ladderDots(m.last_sent?.template)}${escapeHtml(lastWarningText(m))} · next: ${escapeHtml(next)}</span>
-      </button>
-      ${open ? renderDecide(m) : ""}
-    </div>`;
-  }
-
-  function renderDecide(m) {
-    const L = state.leadership;
-    const flags = Array.isArray(m.flags) ? m.flags : [];
-    const next = (WARNING_LABELS[m.next_template] || "next warning").toLowerCase();
-    const pick = (value, label, cls = "") =>
-      `<button class="small ${cls} ${L.choice === value ? "on" : ""}" data-tocw-lead-choose="${value}" aria-pressed="${L.choice === value}" ${L.busy ? "disabled" : ""}>${L.choice === value ? "✓ " : ""}${label}</button>`;
-    const submitLabel = L.busy ? "Saving…" : L.choice === "excused" ? "Submit — excused" : L.choice === "not_excused" ? "Submit — not excused" : "Submit";
-    return `<div class="tocw-decide">
-      ${flags.length ? `<div class="tocw-muted">${flags.map(escapeHtml).join(" · ")}</div>` : ""}
-      <div class="tocw-decide-q">Are these flags excused?</div>
-      <div class="tocw-decide-btns">
-        ${pick("excused", "Excused")}
-        ${pick("not_excused", "Not excused", "tocw-notexcused")}
-      </div>
-      <input id="tocw-lead-note" maxlength="500" placeholder="Note (optional) — traveling, sick, new job" value="${escapeHtml(L.note)}" aria-label="Note for this decision">
-      ${L.choiceError ? `<div class="tocw-decide-err" role="alert">${escapeHtml(L.choiceError)}</div>` : ""}
-      <button class="primary" data-tocw-lead-submit="1" ${L.busy ? "disabled" : ""}>${submitLabel}</button>
-      <div class="tocw-muted">Nothing is saved until you press Submit. ${L.choice === "not_excused" ? `After it's saved you can send the ${escapeHtml(next)}.` : L.choice === "excused" ? "No message is sent." : ""} <a href="${escapeHtml(overseerMemberUrl(m.member_id))}" target="_blank" rel="noreferrer noopener">Profile ↗</a></div>
-    </div>`;
-  }
-
-  function renderHistory(history) {
-    const L = state.leadership;
-    const total = history.reduce((n, h) => n + (Array.isArray(h.steps) ? h.steps.length : 0), 0);
-    if (total === 0) return "";
-    const head = `<button class="tocw-hist-toggle" data-tocw-lead-history="1" aria-expanded="${L.historyOpen}">${L.historyOpen ? "▾" : "▸"} History · ${total} message${total === 1 ? "" : "s"}, ${history.length} member${history.length === 1 ? "" : "s"} · 7 days</button>`;
-    if (!L.historyOpen) return head;
-    return `${head}<div class="tocw-lead-list" style="margin-top:6px;">${history.map((h) => {
-      const steps = Array.isArray(h.steps) ? h.steps : [];
-      const latest = steps[0];
-      const lastSent = steps.find((st) => st.status === "sent");
-      return `<div class="tocw-warn-row">
-        <div style="font-weight:700;">${escapeHtml(h.member_name || `ID ${h.member_id}`)}</div>
-        <span class="tocw-warn-status ${latest?.status === "sent" ? "sent" : ""}">${latest?.status === "sent" ? "Sent" : "Not sent"}</span>
-        <div class="tocw-muted">${ladderDots(lastSent?.template)}${steps.map((st) => escapeHtml(WARNING_LABELS[st.template] || "Warning")).join(" ← ")}</div>
-        <div class="tocw-muted" style="text-align:right;">${escapeHtml(latest ? agoText(latest.at) : "")}</div>
-      </div>`;
-    }).join("")}</div>`;
-  }
-
-  async function loadLeadership(force) {
-    const L = state.leadership;
-    if (!canLead() || L.loading) return;
-    if (!force && L.todo && Date.now() - L.loadedAt < 60000) return;
-    L.loading = true;
-    L.error = null;
-    render();
-    try {
-      const res = await callFunction("chain-watch", { action: "leadership_todo" });
-      L.todo = res?.todo && typeof res.todo === "object" ? res.todo : { drafts: [], members: [], history: [], count: 0 };
-      L.loadedAt = Date.now();
-    } catch (error) {
-      L.error = error?.message || "Could not load the Leadership list.";
-    } finally {
-      L.loading = false;
-      render();
-    }
-  }
-
-  async function leadDecide(disposition) {
-    const L = state.leadership;
-    const memberId = L.openMember;
-    if (!memberId || L.busy) return;
-    L.busy = true;
-    L.error = null;
-    L.notice = null;
-    render();
-    try {
-      const res = await callFunction("chain-watch", { action: "flags_decide", member_id: memberId, disposition, note: L.note.trim() || undefined });
-      if (res?.todo) { L.todo = res.todo; L.loadedAt = Date.now(); }
-      L.openMember = null;
-      L.note = "";
-      L.choice = null;
-      L.choiceError = null;
-      if (disposition === "not_excused" && res?.next_template) {
-        L.decided = { member_id: res.member_id, member_name: res.member_name, batch_id: res.batch_id, next_template: res.next_template };
-      } else {
-        L.decided = null;
-        L.notice = `${res?.member_name || "Their"} flags are marked excused. It's logged in Command.`;
-      }
-    } catch (error) {
-      L.error = error?.message || "That didn't go through. Try again.";
-      if (error?.status === 409) void loadLeadership(true);
-    } finally {
-      L.busy = false;
-      render();
-    }
-  }
-
-  async function leadDismiss(id) {
-    const L = state.leadership;
-    if (!id || L.busy) return;
-    L.busy = true;
-    L.error = null;
-    render();
-    try {
-      await callFunction("chain-watch", { action: "warning_dismiss", id });
-      L.notice = "Draft discarded. It's logged in Command.";
-    } catch (error) {
-      L.error = error?.message || "Couldn't discard that draft.";
-    } finally {
-      L.busy = false;
-      L.confirmDismiss = null;
-      render();
-      void loadLeadership(true);
-    }
-  }
-
-  /**
-   * "Send <step>" and "Resume" are plain links to Torn's compose page; just before
-   * the browser follows one, park what the picker should preselect (and the decision
-   * to log it against). The picker only honours it for the same member, once, and
-   * within HANDOFF_MS.
-   */
-  function stashComposeHandoff(handoff) {
-    gmSet(STORE.composeHandoff, { ...handoff, at: Date.now() });
-  }
-
-  function takeComposeHandoff(memberId, nowMs = Date.now()) {
-    const h = gmGet(STORE.composeHandoff, null);
-    if (!h || typeof h !== "object") return null;
-    if (Number(h.member_id) !== Number(memberId)) return null;
-    if (!(nowMs - Number(h.at) < HANDOFF_MS)) {
-      gmSet(STORE.composeHandoff, null);
-      return null;
-    }
-    gmSet(STORE.composeHandoff, null);
-    return {
-      member_id: Number(h.member_id),
-      template: LADDER.includes(h.template) ? h.template : null,
-      batch_id: typeof h.batch_id === "string" ? h.batch_id : null,
-    };
-  }
-
-  function wireLeadership(box) {
-    const L = state.leadership;
-    for (const btn of box.querySelectorAll("[data-tocw-lead-open]")) {
-      btn.addEventListener("click", () => {
-        const id = Number(btn.getAttribute("data-tocw-lead-open"));
-        L.openMember = L.openMember === id ? null : id;
-        L.note = "";
-        L.choice = null;
-        L.choiceError = null;
-        render();
-      });
-    }
-    document.getElementById("tocw-lead-note")?.addEventListener("input", (e) => { L.note = e.target.value; });
-    // Picking Excused / Not excused only selects; Submit saves (nothing auto-saves).
-    for (const btn of box.querySelectorAll("[data-tocw-lead-choose]")) {
-      btn.addEventListener("click", () => {
-        L.choice = btn.getAttribute("data-tocw-lead-choose");
-        L.choiceError = null;
-        render();
-      });
-    }
-    box.querySelector("[data-tocw-lead-submit]")?.addEventListener("click", () => {
-      if (L.choice !== "excused" && L.choice !== "not_excused") {
-        L.choiceError = "Pick Excused or Not excused first.";
-        render();
-        return;
-      }
-      void leadDecide(L.choice);
-    });
-    for (const a of box.querySelectorAll("[data-tocw-lead-send]")) {
-      a.addEventListener("click", () => {
-        const d = L.decided;
-        if (d) stashComposeHandoff({ member_id: d.member_id, template: d.next_template, batch_id: d.batch_id });
-        L.decided = null;
-        // After the click's own navigation has started (same-page hash change on
-        // messages.php keeps this panel alive, so redraw it then).
-        setTimeout(() => render(), 0);
-      });
-    }
-    box.querySelector("[data-tocw-lead-ready-close]")?.addEventListener("click", () => { L.decided = null; render(); });
-    for (const a of box.querySelectorAll("[data-tocw-lead-resume]")) {
-      a.addEventListener("click", () => {
-        const id = Number(a.getAttribute("data-tocw-lead-resume"));
-        const d = (L.todo?.drafts || []).find((x) => x.id === id);
-        if (d) stashComposeHandoff({ member_id: d.member_id, template: d.template, batch_id: null });
-      });
-    }
-    for (const btn of box.querySelectorAll("[data-tocw-lead-ask-dismiss]")) {
-      btn.addEventListener("click", () => { L.confirmDismiss = Number(btn.getAttribute("data-tocw-lead-ask-dismiss")); render(); });
-    }
-    box.querySelector("[data-tocw-lead-keep]")?.addEventListener("click", () => { L.confirmDismiss = null; render(); });
-    for (const btn of box.querySelectorAll("[data-tocw-lead-dismiss]")) {
-      btn.addEventListener("click", () => void leadDismiss(Number(btn.getAttribute("data-tocw-lead-dismiss"))));
-    }
-    box.querySelector("[data-tocw-lead-history]")?.addEventListener("click", () => {
-      L.historyOpen = !L.historyOpen;
-      gmSet(STORE.leadHistory, L.historyOpen);
-      render();
-    });
   }
 
   // ---- WO-36: fill Torn's compose page from an Overseer warning draft ---------------
@@ -4191,6 +3825,9 @@
   // through the linked Discord account) and leadership also see the queue; only
   // bankers can Claim, and a claim edits the banker card in Discord.
 
+  // v0.33.0: the optional note's cap — the server's 200 (migration 0259).
+  const BANK_NOTE_MAX = 200;
+
   const BANK_STATUS = { open: "Waiting", claimed: "Claimed", partial: "Part paid", fulfilled: "Paid", cancelled: "Cancelled", expired: "Expired" };
 
   function money(n) {
@@ -4214,7 +3851,8 @@
     const mine = open
       ? `<div class="tocw-bank-row mine">
           <div style="display:flex;justify-content:space-between;gap:8px;"><strong>${money(open.amount)}</strong><span class="tocw-pill ${open.status === "open" ? "warn" : "ok"}">${escapeHtml(BANK_STATUS[open.status] || open.status)}</span></div>
-          <div class="tocw-muted">${open.status === "open" ? "Bankers pinged on Discord." : `Claimed by ${escapeHtml(open.claimedByName || "a banker")} — it lands in your Torn events.`}${open.mustBeOnline ? " · only while you're online" : ""}</div>
+          <div class="tocw-muted">${open.status === "open" ? "Bankers pinged on Discord." : `Claimed by ${escapeHtml(open.claimedBy || open.claimedByName || "a banker")} — it lands in your Torn events.`}${open.mustBeOnline ? " · only while you're online" : ""}</div>
+          ${open.note ? `<div class="tocw-bank-note"><span class="tocw-muted">Your note:</span> ${escapeHtml(open.note)}</div>` : ""}
           ${open.status === "open" ? `<div><button id="tocw-bank-cancel" class="small" ${B.busy ? "disabled" : ""}>Cancel request</button></div>` : ""}
         </div>`
       : `<label class="tocw-muted" for="tocw-bank-amount">Amount</label>
@@ -4225,6 +3863,8 @@
           <button class="small" data-tocw-bank-quick="all">All</button>
         </div>
         <label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="tocw-bank-online" ${B.online ? "checked" : ""}/> Only send while I'm online</label>
+        <label class="tocw-muted" for="tocw-bank-note">Note for the bankers (optional)</label>
+        <textarea id="tocw-bank-note" rows="2" maxlength="${BANK_NOTE_MAX}" placeholder="e.g. what it's for, or when you need it">${escapeHtml(B.note)}</textarea>
         <button id="tocw-bank-request" class="primary" ${B.busy ? "disabled" : ""}>Request</button>
         <div class="tocw-muted">Pings your faction's bankers on Discord. One request at a time.</div>`;
     const history = Array.isArray(st.history) && st.history.length > 0
@@ -4269,6 +3909,7 @@
             <strong>${money(r.owed)}</strong>
           </div>
           <div class="tocw-muted">${escapeHtml(agoText(r.created_at))} · via ${escapeHtml(r.source === "site" ? "Overseer" : "Discord")}${r.must_be_online ? " · only while online" : ""}</div>
+          ${r.note ? `<div class="tocw-bank-note">“${escapeHtml(r.note)}”</div>` : ""}
           ${short ? `<div style="color:#ffc6cc;">Vault balance ${money(r.balance_at_request)} when asked — short</div>` : hold ? `<div style="color:#ffdca1;">Offline now — hold off; you'll be pinged when they come online</div>` : ""}
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">${action}</div>
         </div>`;
@@ -4333,9 +3974,16 @@
       render();
       return;
     }
-    return bankAct({ action: "request", amount, online: state.bank.online }, (res) => {
+    // v0.33.0: the optional note, only when there is one (an older server ignores it anyway).
+    const note = String(state.bank.note || "").trim().slice(0, BANK_NOTE_MAX);
+    const body = { action: "request", amount, online: state.bank.online };
+    if (note) body.note = note;
+    return bankAct(body, (res) => {
       if (res?.status) state.bank.status = res.status;
-      if (res?.ok) state.bank.amount = "";
+      if (res?.ok) {
+        state.bank.amount = "";
+        state.bank.note = "";
+      }
       if (res?.message) state.bank[res.ok ? "notice" : "error"] = res.message;
     });
   }
@@ -5773,179 +5421,9 @@
     setInterval(tick, BANK_POLL_MS);
   }
 
-  // ---- WO-36: pick a template on Torn's compose page (leaders) ---------------------
-  // Shows on messages.php compose once the To box holds a faction member. The server
-  // renders the template from the member's synced flags + the faction's rules;
-  // what is logged is what you actually SEND (your edits included).
-
-  function recipientId(value) {
-    const m = /\[(\d{1,10})\]\s*$/.exec(String(value || "").trim());
-    return m ? Number(m[1]) : null;
-  }
-
-  let pickerState = { memberId: null, data: null, filled: null, batchId: null };
-
-  async function runComposePicker() {
-    if (parseOvwToken(location.hash)) return;
-    const form = await waitFor(() => document.getElementById("editor-form"));
-    if (!form || form.dataset.tocwPicker) return;
-    const led = await waitFor(() => (state.watch ? (canLead() ? "yes" : "no") : null), 20000, 500);
-    if (led !== "yes") return;
-    form.dataset.tocwPicker = "1";
-    const to = form.querySelector('input[name="sendto"]');
-    const subject = form.querySelector('input[name="subject"]');
-    const editor = form.querySelector('[contenteditable="true"]');
-    if (!to || !subject || !editor) return;
-    const strip = document.createElement("div");
-    strip.id = "tocw-compose-picker";
-    form.parentNode.insertBefore(strip, form);
-    const check = () => {
-      const id = recipientId(to.value);
-      if (id === pickerState.memberId) return;
-      pickerState = { memberId: id, data: null, filled: null, batchId: null };
-      void drawPicker(strip, form, subject, editor, to);
-    };
-    to.addEventListener("input", check);
-    to.addEventListener("change", check);
-    setInterval(check, 1500);
-    check();
-  }
-
-  async function drawPicker(strip, form, subject, editor, to) {
-    const id = pickerState.memberId;
-    strip.textContent = "";
-    if (!id) return;
-    composeBanner(form, "", "Overseer: loading this member's flags…");
-    let data;
-    try {
-      data = await callFunction("chain-watch", { action: "warning_compose", member_id: id });
-    } catch (error) {
-      // Not a faction member, or no access: say nothing on the page beyond the banner.
-      composeBanner(form, error?.status === 404 ? "" : "warn", error?.status === 404 ? "Overseer messages are for members of your faction." : (error?.message || "Overseer couldn't load this member."));
-      return;
-    }
-    if (pickerState.memberId !== id) return;
-    pickerState.data = data;
-    // v0.30: arrived from "Send <step>" / "Resume" in the Leadership tab → preselect
-    // that template, remember the decision it follows, and fill an EMPTY box.
-    const handoff = takeComposeHandoff(id);
-    pickerState.batchId = handoff?.batch_id || null;
-    const asOf = data.flags_as_of ? ` · as of ${agoText(data.flags_as_of)}` : "";
-    const label = document.createElement("span");
-    label.textContent = `Overseer message for ${data.member_name} · ${data.flag_count} flag${data.flag_count === 1 ? "" : "s"}${asOf}`;
-    label.style.flex = "1 1 240px";
-    const select = document.createElement("select");
-    select.setAttribute("aria-label", "Message template");
-    for (const [value, text] of Object.entries(WARNING_LABELS)) {
-      const opt = document.createElement("option");
-      opt.value = value;
-      opt.textContent = text + (value === data.suggested ? " (suggested)" : "");
-      select.appendChild(opt);
-    }
-    select.value = handoff?.template || data.suggested;
-    const fill = document.createElement("button");
-    fill.type = "button";
-    fill.textContent = "Fill";
-    fill.className = "primary tocw-fill";
-    // v0.30.1: Torn's own button styles made this nearly invisible on the compose page,
-    // so it carries its look inline as well as in the stylesheet.
-    fill.style.cssText = "font:inherit;font-weight:800;padding:5px 16px;border-radius:5px;border:1px solid #e5484d;background:#c8353a;color:#fff;cursor:pointer;opacity:1;";
-    fill.addEventListener("click", () => void pickerFill(form, subject, editor, to, select.value));
-    strip.className = "";
-    strip.style.cssText = "margin:8px 0;padding:9px 12px;border-radius:6px;background:#0f1724;border:1px solid #2b3d52;color:#c9d3e3;font:13px/1.4 system-ui,sans-serif;display:flex;flex-wrap:wrap;gap:8px;align-items:center;";
-    strip.append(label, select, fill);
-    composeBanner(form, "", "Pick a template and press Fill. You press Send — Overseer logs what you send.");
-    if (handoff?.template && editor.textContent.trim().length === 0) void pickerFill(form, subject, editor, to, select.value);
-  }
-
-  async function pickerFill(form, subject, editor, to, template) {
-    const id = pickerState.memberId;
-    if (!id) return;
-    let data;
-    try {
-      data = await callFunction("chain-watch", { action: "warning_compose", member_id: id, template });
-    } catch (error) {
-      composeBanner(form, "bad", error?.message || "Couldn't load that template.");
-      return;
-    }
-    if (!recipientMatches(to.value, data.member_id)) {
-      composeBanner(form, "bad", `The To box changed — this message is for ${data.member_name}. Nothing was filled.`);
-      return;
-    }
-    const prevSubject = subject.value;
-    const prevBody = editor.innerHTML;
-    const doFill = () => {
-      setNativeValue(subject, String(data.subject || "").slice(0, 50));
-      fillEditor(editor, String(data.body || ""));
-      pickerState.filled = data;
-      composeBanner(form, "ok", `Filled · ${WARNING_LABELS[data.template]}. Edit it if you like, then press Send — Overseer logs what you send.`, [
-        { label: "Undo fill", onClick: () => {
-          setNativeValue(subject, prevSubject);
-          editor.innerHTML = prevBody;
-          fire(editor, "input");
-          pickerState.filled = null;
-          composeBanner(form, "", "Fill undone. Your earlier text is back.");
-        } },
-      ]);
-      watchPickerSend(form, subject, editor);
-    };
-    if (editor.textContent.trim().length > 0 && !pickerState.filled) {
-      composeBanner(form, "warn", "The message box already has text in it. Replace it with the Overseer message?", [
-        { label: "Replace", primary: true, onClick: doFill },
-        { label: "Keep mine", onClick: () => composeBanner(form, "", "Kept your text.") },
-      ]);
-    } else {
-      doFill();
-    }
-  }
-
-  function editorText(editor) {
-    const blocks = [...editor.querySelectorAll("p, div, h1, h2, h3, h4, li")];
-    if (blocks.length === 0) return editor.textContent || "";
-    return blocks.map((b) => b.textContent || "").join("\n");
-  }
-
-  let pickerSendHooked = false;
-
-  function watchPickerSend(form, subject, editor) {
-    if (pickerSendHooked) return;
-    const send = [...form.querySelectorAll("button")].find((b) => b.textContent.trim().toLowerCase() === "send");
-    if (!send) return;
-    pickerSendHooked = true;
-    send.addEventListener("click", async () => {
-      const data = pickerState.filled;
-      if (!data) return;
-      const body = editorText(editor).replace(/\n{3,}/g, "\n\n").trim().slice(0, 4000);
-      const subj = String(subject.value || "").trim().slice(0, 50);
-      if (!body || !subj) return;
-      pickerState.filled = null;
-      // One decision, one message: a second send to the same member isn't tied to it.
-      const batchId = pickerState.batchId;
-      pickerState.batchId = null;
-      try {
-        await callFunction("chain-watch", {
-          action: "warning_log_sent",
-          member_id: data.member_id,
-          member_name: data.member_name,
-          template: data.template,
-          subject: subj,
-          body,
-          issues: data.issues || [],
-          ...(batchId ? { archive_batch_id: batchId } : {}),
-        });
-        // A leadership_todo refresh shows it as sent the next time the tab opens.
-        state.leadership.loadedAt = 0;
-        composeBanner(form, "ok", `Logged on Overseer: ${WARNING_LABELS[data.template]} sent to ${data.member_name}.`);
-      } catch (error) {
-        composeBanner(form, "warn", `Sent on Torn, but Overseer couldn't log it: ${error?.message || "try again later"}.`);
-      }
-    });
-  }
-
   function maybeRunCompose() {
     if (!/\/messages\.php$/.test(location.pathname)) return;
     if (parseOvwToken(location.hash)) void runComposeFill();
-    else if (/p=compose/.test(location.hash)) void runComposePicker();
   }
 
   function renderAccessHint() {
@@ -7230,6 +6708,7 @@
         coversAt,
         render,
         renderBankQueue,
+        renderBankTab,
         renderSlot,
         renderSignupShifts,
         renderKeyGate,
@@ -7258,17 +6737,8 @@
         noteChainHits,
         noteChainTimer,
         clearChainEstimate,
-        canLead,
         activeTab,
         renderTabs,
-        renderLeadershipTab,
-        loadLeadership,
-        freshLeadershipState,
-        ladderDots,
-        lastWarningText,
-        composeUrl,
-        stashComposeHandoff,
-        takeComposeHandoff,
         agoText,
         parseOvwToken,
         stripOvw,
@@ -7279,14 +6749,13 @@
         availableTabs,
         renderBankTab,
         renderBankQueue,
+        renderBankTab,
         bankOpenRequests,
         bankAlert,
         noteBankStatus,
         markBankSeen,
         updateLauncher,
         createLauncher,
-        recipientId,
-        editorText,
         money,
         warFormatCountdown,
         warFormatSpan,
