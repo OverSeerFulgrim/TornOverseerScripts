@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.35.1
+// @version      0.35.2
 // @description  Watcher-focused chain HUD, docked as an Overseer bar in Torn's sidebar (pop it out for the full panel): zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -43,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.35.1";
+      : "") || "0.35.2";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -2756,19 +2756,20 @@
       #tocw-ab-host .tocw-wr-fine { color: #9aa7b8; font-size: 12px; }
       /* v0.35.0 — the Overseer bar in Torn's sidebar */
       #tocw-dock { font: 12px Arial, Helvetica, sans-serif; color: #ddd; }
-      #tocw-dock .tocw-d-bar { display: flex; height: 24px; border-radius: 5px; overflow: hidden; background: repeating-linear-gradient(135deg, #6f8f1a 0px, #6f8f1a 3px, #678615 3px, #678615 6px); box-shadow: inset 0 1px 0 rgba(255,255,255,.18); }
-      #tocw-dock .tocw-d-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 10px; border: 0; background: transparent; color: #fff; font: 700 13px Arial, Helvetica, sans-serif; cursor: pointer; text-align: left; text-shadow: 0 1px 0 rgba(0,0,0,.45); }
+      #tocw-dock .tocw-d-bar { display: flex; height: 24px; border-radius: 5px; overflow: hidden; background: repeating-linear-gradient(135deg, #c42e34 0px, #c42e34 3px, #b5272d 3px, #b5272d 6px); box-shadow: inset 0 1px 0 rgba(255,255,255,.18); }
+      #tocw-dock .tocw-d-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 7px; border: 0; background: transparent; color: #fff; font: 700 13px Arial, Helvetica, sans-serif; cursor: pointer; text-align: left; text-shadow: 0 1px 0 rgba(0,0,0,.45); }
+      #tocw-dock .tocw-d-logo { width: 14px; height: 18px; flex-shrink: 0; display: block; filter: drop-shadow(0 0 1px rgba(255,255,255,.55)); }
       #tocw-dock .tocw-d-name { white-space: nowrap; }
-      #tocw-dock .tocw-d-chip { margin-left: auto; font-size: 11px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: rgba(0,0,0,.35); color: #e8ffd0; font-variant-numeric: tabular-nums; white-space: nowrap; text-shadow: none; }
+      #tocw-dock .tocw-d-chip { margin-left: auto; font-size: 11px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: rgba(0,0,0,.4); color: #fff; font-variant-numeric: tabular-nums; white-space: nowrap; text-shadow: none; }
       #tocw-dock .tocw-d-chip.warn { background: #8a5a00; color: #fff; }
-      #tocw-dock .tocw-d-chip.bad { background: #b3262c; color: #fff; }
+      #tocw-dock .tocw-d-chip.bad { background: #fff; color: #b3262c; }
       #tocw-dock .tocw-d-chip.ok { background: #1f6b3d; color: #fff; }
       #tocw-dock .tocw-d-arrow { font-size: 10px; width: 10px; text-align: center; }
       #tocw-dock .tocw-d-pop { width: 26px; border: 0; border-left: 1px solid rgba(0,0,0,.3); background: rgba(0,0,0,.18); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
       #tocw-dock .tocw-d-body { margin-top: 3px; background: #2b2b2b; border: 1px solid #3b3b3b; border-radius: 5px; padding: 7px; display: flex; flex-direction: column; gap: 6px; }
       #tocw-dock .tocw-d-tabs { display: grid; gap: 2px; background: #1c1c1c; border-radius: 4px; padding: 2px; }
       #tocw-dock .tocw-d-tabs button { height: 22px; border: 0; border-radius: 3px; background: transparent; color: #aaa; font: 700 11px Arial, sans-serif; cursor: pointer; }
-      #tocw-dock .tocw-d-tabs button.on { background: #4d6611; color: #fff; }
+      #tocw-dock .tocw-d-tabs button.on { background: #b5272d; color: #fff; }
       #tocw-dock .tocw-d-row { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; color: #ccc; }
       #tocw-dock .tocw-d-row strong { color: #fff; }
       #tocw-dock .tocw-d-muted { color: #999; }
@@ -2788,7 +2789,7 @@
       #tocw-dock .tocw-d-hit { border: 1px solid #e5484d; background: #8f1f24; color: #fff; }
       #tocw-dock .tocw-d-hit.urgent { background: #ff3b45; }
       #tocw-dock .tocw-d-btn { border: 1px solid #555; background: #3a3a3a; color: #eee; }
-      #tocw-dock .tocw-d-btn.on { border-color: #6f8f1a; background: #4d6611; color: #fff; }
+      #tocw-dock .tocw-d-btn.on { border-color: #e23b3b; background: #8f1f24; color: #fff; }
       #tocw-dock .tocw-d-btn.wide { width: 100%; }
       #tocw-dock .tocw-d-sec { font-size: 11px; font-weight: 700; color: #9a9a9a; text-transform: uppercase; letter-spacing: .04em; }
       #tocw-dock .tocw-d-sep { border-top: 1px solid #3b3b3b; }
@@ -2799,7 +2800,7 @@
       #tocw-dock .tocw-d-quick { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
       #tocw-dock .tocw-d-check { display: flex; align-items: center; gap: 6px; color: #ccc; }
       #tocw-dock .tocw-d-check input { margin: 0; }
-      #tocw-dock .tocw-d-primary { display: flex; align-items: center; justify-content: center; height: 27px; border-radius: 4px; border: 1px solid #6f8f1a; background: #4d6611; color: #fff; font: 700 12px Arial, sans-serif; cursor: pointer; text-decoration: none; box-sizing: border-box; width: 100%; }
+      #tocw-dock .tocw-d-primary { display: flex; align-items: center; justify-content: center; height: 27px; border-radius: 4px; border: 1px solid #f25151; background: #e23b3b; color: #fff; font: 700 12px Arial, sans-serif; cursor: pointer; text-decoration: none; box-sizing: border-box; width: 100%; }
       #tocw-dock .tocw-d-primary[disabled], #tocw-dock .tocw-d-btn[disabled] { opacity: .6; cursor: default; }
       #tocw-dock .tocw-d-bankers { display: flex; align-items: center; gap: 5px; color: #ccc; }
       #tocw-dock .tocw-d-req { border-radius: 5px; padding: 7px; display: flex; flex-direction: column; gap: 5px; color: #ccc; }
@@ -6553,6 +6554,9 @@
   // PDA, narrow windows, pages without one) nothing changes: the floating panel and the
   // TO launcher work exactly as before.
 
+  // v0.35.2: the Overseer eye on the bar, embedded (Torn's page may refuse images from
+  // other sites). 31×40 PNG, shown at 14×18.
+  const DOCK_LOGO = "data:image/png;base64,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";
   const DOCK_BOOT_WAIT_MS = 4000; // how long to wait for Torn's React sidebar before floating
   const dockBootAt = Date.now();
   let dockLastMountTry = 0;
@@ -6872,6 +6876,7 @@
     dock.innerHTML = `
       <div class="tocw-d-bar">
         <button type="button" class="tocw-d-toggle" data-d="toggle" aria-expanded="${open}" title="${docked ? (open ? "Collapse Overseer" : "Expand Overseer") : "Dock Overseer back here"}">
+          <img class="tocw-d-logo" src="${DOCK_LOGO}" alt="" width="14" height="18" />
           <span class="tocw-d-name">Overseer</span>
           ${chip ? `<span id="tocw-d-chip" class="tocw-d-chip ${chip.cls}">${escapeHtml(chip.text)}</span>` : `<span id="tocw-d-chip" class="tocw-d-chip" hidden></span>`}
           <span class="tocw-d-arrow" aria-hidden="true">${docked ? (open ? "▾" : "▸") : "↗"}</span>
