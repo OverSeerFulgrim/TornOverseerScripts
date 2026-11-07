@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.0
+// @version      0.8.1
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -3236,8 +3236,29 @@
     }
 
     // ---- sidebar eye (VERIFY: Torn's status icon list in the left sidebar) ----------------
+    // 0.8.1: the class guess missed on live Torn (2026-11-07), so the eye never showed. Try the
+    // known class shapes first, then fall back to the sidebar block headed "Information" and
+    // its first list of icons. Remembered while it stays on the page.
+    let iconListCache = null;
     function iconList() {
-      return document.querySelector("ul[class*='status-icons'], #sidebar ul[class*='status-icons___'], ul[class^='status-icons']");
+      if (iconListCache && iconListCache.isConnected) return iconListCache;
+      iconListCache = document.querySelector("ul[class*='status-icons'], ul[class*='statusIcons'], ul[class*='status_icons']")
+        || iconListUnderHeading();
+      return iconListCache;
+    }
+    function iconListUnderHeading() {
+      const root = document.getElementById("sidebarroot") || document.getElementById("sidebar") || document.body;
+      if (!root) return null;
+      for (const h of root.querySelectorAll("h2, h3, h4, h5, div, span, p")) {
+        if (h.children.length || h.textContent.trim() !== "Information") continue;
+        let box = h.parentElement;
+        for (let i = 0; i < 4 && box; i++, box = box.parentElement) {
+          const ul = [...box.querySelectorAll("ul")].find((u) => u.id !== "totr-eye" && u.children.length >= 3
+            && [...u.children].every((li) => li.tagName === "LI") && u.querySelector("li a, li svg, li img, li [class*='icon']"));
+          if (ul) return ul;
+        }
+      }
+      return null;
     }
     function ensureEye(count, locked) {
       const list = iconList();

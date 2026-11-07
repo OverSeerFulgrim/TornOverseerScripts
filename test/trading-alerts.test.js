@@ -129,3 +129,22 @@ test("no Torn key: nothing is drawn and nothing is asked", async () => {
   assert.equal(w.document.getElementById("totr-eye"), null);
   assert.equal(calls.length, 0);
 });
+
+test("0.8.1: finds the Information icons by their heading when the class name differs", async () => {
+  const dom = new JSDOM(
+    "<!doctype html><html><head></head><body><div id='sidebarroot'><div class='block___x'><h2 class='header___y'>Information</h2>"
+    + "<div class='content___z'><ul class='icons___q'><li class='icon1___a'><a href='#'></a></li><li class='icon2___a'><a href='#'></a></li><li class='icon3___a'><a href='#'></a></li></ul>"
+    + "<ul class='other'><li>Name: x</li></ul></div></div></div></body></html>",
+    { url: "https://www.torn.com/profiles.php?XID=1", runScripts: "outside-only", pretendToBeVisual: true },
+  );
+  const w = dom.window;
+  windows.push(w);
+  w.GM_getValue = (k, d) => (k === "totr_torn_key" ? "KEYAAAAAAAAAAAAA" : k === "totr_session_token" ? "sess" : d);
+  w.GM_setValue = () => {};
+  w.GM_xmlhttpRequest = (opts) => setTimeout(() => opts.onload({ status: 200, responseText: JSON.stringify({ watched: [], deals: [] }) }), 0);
+  w.eval(SOURCE);
+  await tick();
+  const eye = w.document.getElementById("totr-eye");
+  assert.ok(eye, "eye added");
+  assert.equal(eye.parentElement.className, "icons___q");
+});
