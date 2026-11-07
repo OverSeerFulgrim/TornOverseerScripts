@@ -17,7 +17,11 @@ warnings, opt-in watcher alarms, and a hit leaderboard. Read-only — it never a
    Firefox, Safari) or [Violentmonkey](https://violentmonkey.github.io/).
 2. Click **[install the script](https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js)**
    (the raw `.user.js`). Your manager will open its install prompt — confirm it.
-3. Open [torn.com](https://www.torn.com) — the Chain Watch launcher appears.
+3. Open [torn.com](https://www.torn.com) — a green **Overseer** bar appears in the sidebar,
+   above *Information*. Click it to expand the compact view; the square-arrow button pops out
+   the full panel (its **Dock** button or ✕ put it back). Where Torn shows no sidebar (Torn
+   PDA, narrow windows, the attack page) the floating panel and its **TO** launcher appear
+   instead.
 
 Auto-updates are enabled (`@updateURL`/`@downloadURL` point at `main`), so your manager will
 offer new versions automatically.

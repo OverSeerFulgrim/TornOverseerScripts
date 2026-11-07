@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.34.0
-// @description  Watcher-focused chain HUD: zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
+// @version      0.35.0
+// @description  Watcher-focused chain HUD, docked as an Overseer bar in Torn's sidebar (pop it out for the full panel): zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
 // @icon         https://tornoverseer.com/favicon-32.png
@@ -43,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.34.0";
+      : "") || "0.35.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -138,6 +138,9 @@
     signupIdentity: "tocw_signup_identity",
     collapsed: "tocw_collapsed",
     hidden: "tocw_hidden",
+    // v0.35.0: the Overseer bar in Torn's sidebar — "sidebar" (docked) or "float" (popped out).
+    dockMode: "tocw_dock_mode",
+    dockOpen: "tocw_dock_open",
     position: "tocw_position",
     size: "tocw_size",
     launcherPos: "tocw_launcher_pos",
@@ -210,6 +213,7 @@
     // Fully hidden: only the "TO" launcher shows. Distinct from collapsed (which
     // keeps a compact header). Needed on mobile PDA where the panel fills the screen.
     hidden: readBool(STORE.hidden, false),
+    dock: { mode: readString(STORE.dockMode, "sidebar") === "float" ? "float" : "sidebar", open: readBool(STORE.dockOpen, true) },
     // Watcher alarms (opt-in). Each output channel is independently toggleable.
     alarm: readBool(STORE.alarm, false),
     alarmSound: readBool(STORE.alarmSound, true),
@@ -2750,6 +2754,43 @@
       #tocw-ab-host .tocw-ab.free { background: #13202f; border: 1px solid #3f84c4; color: #d9ebff; } #tocw-ab-host .tocw-ab.free .tocw-ab-dot { background: #5f6b7d; }
       #tocw-ab-host .tocw-ab.stop { background: #3b1517; border: 2px solid #e5484d; color: #ffd7da; font-size: 14px; }
       #tocw-ab-host .tocw-wr-fine { color: #9aa7b8; font-size: 12px; }
+      /* v0.35.0 — the Overseer bar in Torn's sidebar */
+      #tocw-dock { font: 12px Arial, Helvetica, sans-serif; color: #ddd; }
+      #tocw-dock .tocw-d-bar { display: flex; height: 24px; border-radius: 5px; overflow: hidden; background: repeating-linear-gradient(135deg, #6f8f1a 0px, #6f8f1a 3px, #678615 3px, #678615 6px); box-shadow: inset 0 1px 0 rgba(255,255,255,.18); }
+      #tocw-dock .tocw-d-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 10px; border: 0; background: transparent; color: #fff; font: 700 13px Arial, Helvetica, sans-serif; cursor: pointer; text-align: left; text-shadow: 0 1px 0 rgba(0,0,0,.45); }
+      #tocw-dock .tocw-d-name { white-space: nowrap; }
+      #tocw-dock .tocw-d-chip { margin-left: auto; font-size: 11px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: rgba(0,0,0,.35); color: #e8ffd0; font-variant-numeric: tabular-nums; white-space: nowrap; text-shadow: none; }
+      #tocw-dock .tocw-d-chip.warn { background: #8a5a00; color: #fff; }
+      #tocw-dock .tocw-d-chip.bad { background: #b3262c; color: #fff; }
+      #tocw-dock .tocw-d-chip.ok { background: #1f6b3d; color: #fff; }
+      #tocw-dock .tocw-d-arrow { font-size: 10px; width: 10px; text-align: center; }
+      #tocw-dock .tocw-d-pop { width: 26px; border: 0; border-left: 1px solid rgba(0,0,0,.3); background: rgba(0,0,0,.18); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
+      #tocw-dock .tocw-d-body { margin-top: 3px; background: #2b2b2b; border: 1px solid #3b3b3b; border-radius: 5px; padding: 7px; display: flex; flex-direction: column; gap: 6px; }
+      #tocw-dock .tocw-d-tabs { display: grid; gap: 2px; background: #1c1c1c; border-radius: 4px; padding: 2px; }
+      #tocw-dock .tocw-d-tabs button { height: 22px; border: 0; border-radius: 3px; background: transparent; color: #aaa; font: 700 11px Arial, sans-serif; cursor: pointer; }
+      #tocw-dock .tocw-d-tabs button.on { background: #4d6611; color: #fff; }
+      #tocw-dock .tocw-d-row { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; color: #ccc; }
+      #tocw-dock .tocw-d-row strong { color: #fff; }
+      #tocw-dock .tocw-d-muted { color: #999; }
+      #tocw-dock .tocw-d-timer { font-size: 20px; font-weight: 700; color: #9be05a; font-variant-numeric: tabular-nums; }
+      #tocw-dock .tocw-d-timer.u-warn { color: #ffcf6b; }
+      #tocw-dock .tocw-d-timer.u-bad { color: #ff6d76; }
+      #tocw-dock .tocw-d-bar-track { height: 7px; border-radius: 4px; background: #1c1c1c; border: 1px solid #444; overflow: hidden; }
+      #tocw-dock .tocw-d-bar-track div { height: 100%; background: #4f8de0; }
+      #tocw-dock .tocw-d-bonus { color: #f2c46d; }
+      #tocw-dock .tocw-d-alert { color: #ffdca1; }
+      #tocw-dock .tocw-d-watch { border-top: 1px solid #3b3b3b; padding-top: 6px; display: flex; flex-direction: column; gap: 3px; color: #ccc; }
+      #tocw-dock .tocw-d-watch a { color: #7fb3ff; }
+      #tocw-dock .tocw-d-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #777; }
+      #tocw-dock .tocw-d-dot.on { background: #3fa66b; }
+      #tocw-dock .tocw-d-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+      #tocw-dock .tocw-d-hit, #tocw-dock .tocw-d-btn { display: flex; align-items: center; justify-content: center; height: 26px; border-radius: 4px; font: 700 12px Arial, sans-serif; cursor: pointer; text-decoration: none; box-sizing: border-box; }
+      #tocw-dock .tocw-d-hit { border: 1px solid #e5484d; background: #8f1f24; color: #fff; }
+      #tocw-dock .tocw-d-hit.urgent { background: #ff3b45; }
+      #tocw-dock .tocw-d-btn { border: 1px solid #555; background: #3a3a3a; color: #eee; }
+      #tocw-dock .tocw-d-btn.on { border-color: #6f8f1a; background: #4d6611; color: #fff; }
+      #tocw-dock .tocw-d-btn.wide { width: 100%; }
+      #tocw-dock .tocw-d-link { border: 0; background: none; color: #7fb3ff; padding: 0; cursor: pointer; font: inherit; text-decoration: underline; }
       #tocw-compose-banner { margin: 8px 0; padding: 9px 12px; border-radius: 6px; background: #0f1724; border: 1px solid #2b3d52; color: #c9d3e3; font: 13px/1.4 system-ui, sans-serif; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
       #tocw-compose-banner.ok { border-color: #2f6b47; }
       #tocw-compose-banner.bad { border-color: #651922; color: #ffc6cc; }
@@ -2987,6 +3028,17 @@
     createShell();
     const box = document.getElementById("tocw");
     if (!box) return;
+    // v0.35.0: docked in Torn's sidebar, the bar IS the panel — the floating panel and
+    // the TO launcher stay out of the way (and wait while the sidebar is still loading).
+    ensureDock();
+    renderDock();
+    if (dockActive() || dockPending()) {
+      box.style.display = "none";
+      const l = document.getElementById("tocw-launcher");
+      if (l) l.style.display = "none";
+      if (dockActive() && state.dock.open && activeTab() === "bank") markBankSeen(state.bank);
+      return;
+    }
     // Settings is a FORM, and a poll rebuilding it mid-edit wipes whatever is half-typed,
     // snaps <details> shut and drops the caret — every few seconds. Preserving focus (as a
     // previous pass did) wasn't enough, because each input re-renders its value from
@@ -3108,7 +3160,8 @@
             <button id="tocw-focus" class="small ${state.focus ? "on" : ""}" title="${state.focus ? "Exit focus (full panel)" : "Focus mode — giant timer only"}" aria-label="Toggle focus mode">⛶</button>
             <button id="tocw-alarm" class="small ${state.alarm ? "on" : ""}" title="${state.alarm ? "Watcher alarms ON — click to mute" : "Turn on watcher alarms (drop timer + your shift)"}" aria-label="Toggle alarms">${state.alarm ? "🔔" : "🔕"}</button>
             <button id="tocw-collapse" class="small" title="${state.collapsed ? "Expand the panel" : "Minimize to the header"}">${state.collapsed ? "Open" : "Min"}</button>
-            <button id="tocw-hide" class="small" title="Hide — reopen with the TO button" aria-label="Hide panel">✕</button>
+            ${dockMounted() ? `<button id="tocw-dock-btn" class="small" title="Dock in Torn's sidebar" aria-label="Dock in Torn's sidebar">Dock</button>` : ""}
+            <button id="tocw-hide" class="small" title="${dockMounted() ? "Close — back to the sidebar bar" : "Hide — reopen with the TO button"}" aria-label="Hide panel">✕</button>
           </div>
         </div>
       </div>
@@ -3207,7 +3260,10 @@
       gmSet(STORE.collapsed, state.collapsed);
       render();
     });
+    document.getElementById("tocw-dock-btn")?.addEventListener("click", () => dockBack(true));
     document.getElementById("tocw-hide")?.addEventListener("click", () => {
+      // With the sidebar bar there, closing the panel docks it (collapsed) instead.
+      if (dockMounted()) return dockBack(false);
       state.hidden = true;
       gmSet(STORE.hidden, true);
       render();
@@ -4801,6 +4857,7 @@
   }
 
   function warTabOnScreen() {
+    if (dockActive()) return state.dock.open && activeTab() === "war";
     return !state.hidden && !state.collapsed && !state.settingsOpen && !state.focus && activeTab() === "war";
   }
 
@@ -6461,6 +6518,301 @@
     return el && "value" in el ? String(el.value).trim() : "";
   }
 
+  // ---- v0.35.0: the Overseer bar in Torn's sidebar (WO-75) -----------------------------
+  // On desktop Torn the panel lives as a green bar ABOVE the sidebar's Information block,
+  // styled like Torn's own Reminders / Notes bars. Click it to expand a compact Chain /
+  // War / Bank view in the sidebar; the pop-out button opens the full floating panel,
+  // whose Dock button (and ✕) put it back. Where there is no sidebar to dock into (Torn
+  // PDA, narrow windows, pages without one) nothing changes: the floating panel and the
+  // TO launcher work exactly as before.
+
+  const DOCK_BOOT_WAIT_MS = 4000; // how long to wait for Torn's React sidebar before floating
+  const dockBootAt = Date.now();
+  let dockLastMountTry = 0;
+  let dockFloatShown = false;
+
+  function dockTextOf(el) {
+    return (el?.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  // The sidebar block that holds "Information" — found by its heading text and by its
+  // sibling sections (Areas / Notes / Reminders …), never by Torn's hashed class names.
+  // The block is the child of the lowest ancestor that holds both headings.
+  function findSidebarAnchor() {
+    try {
+      const root = document.getElementById("sidebarroot") || document.getElementById("sidebar");
+      if (!root) return null;
+      const heads = Array.from(root.querySelectorAll("h2, h3, a, span, div, p"))
+        .filter((el) => el.childElementCount <= 3 && dockTextOf(el).length <= 20);
+      const info = heads.find((el) => dockTextOf(el) === "Information");
+      if (!info) return null;
+      const other = heads.find((el) => /^(Areas|Notes|Reminders|Lists|NPCs)\b/.test(dockTextOf(el)) && !el.contains(info) && !info.contains(el));
+      if (!other) return null;
+      let block = info;
+      while (block.parentElement && !block.parentElement.contains(other)) block = block.parentElement;
+      if (!block.parentElement || block === root || !root.contains(block)) return null;
+      const rect = block.getBoundingClientRect();
+      const css = getComputedStyle(block);
+      if (css.display === "none" || css.visibility === "hidden") return null;
+      if (rect.width < 140 || rect.width > 320 || rect.left < 0) return null;
+      return block;
+    } catch {
+      return null;
+    }
+  }
+
+  function dockMounted() {
+    const dock = document.getElementById("tocw-dock");
+    return Boolean(dock && dock.isConnected);
+  }
+
+  // Put the bar above Information (again, if Torn's React re-render dropped it).
+  function ensureDock() {
+    if (typeof document === "undefined") return false;
+    const existing = document.getElementById("tocw-dock");
+    if (existing && existing.isConnected && existing.nextElementSibling && dockTextOf(existing.nextElementSibling).startsWith("Information")) return true;
+    const anchor = findSidebarAnchor();
+    if (!anchor) {
+      if (existing && !existing.isConnected) existing.remove();
+      return Boolean(existing && existing.isConnected);
+    }
+    const dock = existing || document.createElement("div");
+    if (!existing) {
+      dock.id = "tocw-dock";
+      dock.addEventListener("click", onDockClick);
+    }
+    const gap = getComputedStyle(anchor).marginBottom;
+    dock.style.marginBottom = gap && gap !== "0px" ? gap : "4px";
+    anchor.parentElement.insertBefore(dock, anchor);
+    return true;
+  }
+
+  // Docked = the full panel is put away and the sidebar bar is the panel.
+  function dockActive() {
+    return state.dock.mode === "sidebar" && dockMounted();
+  }
+
+  // While Torn's sidebar is still rendering, don't flash the floating panel at someone
+  // whose panel lives in the sidebar.
+  function dockPending() {
+    // Only where Torn has a sidebar container to render into — pages without one (the
+    // attack page, PDA) show the floating panel straight away.
+    return state.dock.mode === "sidebar" && !dockMounted() && Date.now() - dockBootAt < DOCK_BOOT_WAIT_MS
+      && typeof document !== "undefined" && Boolean(document.getElementById("sidebarroot"))
+      && (typeof window === "undefined" || window.innerWidth > 1000);
+  }
+
+  function setDockMode(mode, extra = {}) {
+    state.dock.mode = mode === "float" ? "float" : "sidebar";
+    gmSet(STORE.dockMode, state.dock.mode);
+    if (typeof extra.open === "boolean") {
+      state.dock.open = extra.open;
+      gmSet(STORE.dockOpen, extra.open);
+    }
+    if (state.dock.mode === "float") {
+      state.hidden = false;
+      state.collapsed = false;
+      gmSet(STORE.hidden, false);
+      gmSet(STORE.collapsed, false);
+    }
+  }
+
+  function popOut(tab) {
+    setDockMode("float");
+    if (tab) {
+      state.settingsOpen = false;
+      state.focus = false;
+      setTab(tab); // renders
+      return;
+    }
+    render();
+  }
+
+  function dockBack(open = true) {
+    state.settingsOpen = false;
+    setDockMode("sidebar", { open });
+    render();
+  }
+
+  function dockChip(remaining) {
+    const chain = state.chain;
+    if (chain?.active) return { text: `${chain.current} · ${duration(remaining)}`, cls: remaining <= 60 ? "bad" : remaining <= 120 ? "warn" : "" };
+    const war = warAlert();
+    if (war) return { text: "WAR !", cls: "bad" };
+    const alert = hasBank() ? bankAlert(state.bank) : null;
+    if (alert && alert.count > 0) return { text: `${alert.count} bank`, cls: alert.fresh > 0 ? "warn" : "" };
+    if (alert && alert.paid) return { text: "paid ✓", cls: "ok" };
+    if (warRoomOpen()) return { text: "war", cls: "" };
+    return null;
+  }
+
+  function dockHitButton(remaining) {
+    const urgent = Boolean(state.chain?.active) && remaining > 0 && remaining <= 60;
+    const cls = `tocw-d-hit${urgent ? " urgent" : ""}`;
+    if (state.targetIds.length > 0) return `<button type="button" class="${cls}" data-d="hit-next">${urgent ? "HIT NOW" : "Hit next"}</button>`;
+    const url = effHitUrl();
+    if (url) return `<a class="${cls}" href="${escapeHtml(url)}" target="_self" rel="noreferrer noopener">${urgent ? "HIT NOW" : "Go hit"}</a>`;
+    return `<button type="button" class="tocw-d-btn" data-d="settings">Set targets</button>`;
+  }
+
+  function renderDockChain(remaining) {
+    const chain = state.chain;
+    const live = Boolean(chain?.active);
+    const event = state.watch?.event || state.signup?.event || null;
+    const rows = [];
+    if (live) {
+      const nb = nextBonus(chain.current);
+      const pct = nb ? Math.max(0, Math.min(100, (chain.current / nb.target) * 100)) : 100;
+      rows.push(`<div class="tocw-d-row"><span class="tocw-d-muted">Drop timer</span><span id="tocw-d-timer" class="tocw-d-timer ${timerUrgencyClass(remaining)}">${duration(remaining)}</span></div>`);
+      rows.push(`<div class="tocw-d-row"><span>Hits</span><strong>${chain.current}${nb ? ` / ${nb.target}` : ""}</strong></div>`);
+      rows.push(`<div class="tocw-d-bar-track"><div style="width:${pct.toFixed(1)}%"></div></div>`);
+      if (nb) rows.push(`<div class="tocw-d-bonus">Bonus in ${nb.toGo} hit${nb.toGo === 1 ? "" : "s"}</div>`);
+    } else if (event) {
+      rows.push(`<div class="tocw-d-row"><span class="tocw-d-muted">${escapeHtml(event.title || "Chain")}</span></div>`);
+      rows.push(`<div class="tocw-d-row"><span>Starts in</span><strong>${duration(countdownTo(event.starts_at))}</strong></div>`);
+    } else {
+      rows.push(`<div class="tocw-d-muted">No chain running or scheduled.</div>`);
+    }
+    const { current } = currentAndNextShift();
+    const me = viewerId();
+    const now = Date.now();
+    const mine = me == null ? null : allShifts().find((s) => Number(s.main?.id) === me && new Date(s.end).getTime() > now);
+    const watch = [];
+    if (current && current.watcher_name) {
+      const on = statusIsOffline(current.watcher_online_status) ? "off" : "on";
+      watch.push(`<div><span class="tocw-d-muted">On watch:</span> ${profileLink(current.watcher_id, current.watcher_name)} <span class="tocw-d-dot ${on}" aria-hidden="true"></span></div>`);
+    }
+    if (mine) watch.push(`<div><span class="tocw-d-muted">Your shift:</span> ${escapeHtml(localTime(mine.start))}–${escapeHtml(localTime(mine.end))}</div>`);
+    return `${rows.join("")}
+      ${watch.length ? `<div class="tocw-d-watch">${watch.join("")}</div>` : ""}
+      <div class="tocw-d-actions">
+        ${dockHitButton(remaining)}
+        <button type="button" class="tocw-d-btn${state.alarm ? " on" : ""}" data-d="alarm" aria-pressed="${state.alarm}" title="${state.alarm ? "Watcher alarms on — click to mute" : "Turn on watcher alarms"}">${state.alarm ? "Alarm on" : "Alarm off"}</button>
+      </div>`;
+  }
+
+  function renderDockWar() {
+    const sc = state.war.score;
+    const war = warAlert();
+    let line = "The War Room is open.";
+    if (sc && sc.us && sc.them) line = `${escapeHtml(warFormatPoints(sc.us.score))} – ${escapeHtml(warFormatPoints(sc.them.score))} vs ${escapeHtml(sc.them.name || "them")}`;
+    return `<div class="tocw-d-row"><span>${line}</span></div>
+      ${war ? `<div class="tocw-d-alert">${escapeHtml(war)}</div>` : ""}
+      <button type="button" class="tocw-d-btn wide" data-d="open-war">Open the War Room ↗</button>`;
+  }
+
+  function renderDockBank() {
+    const alert = bankAlert(state.bank);
+    const line = alert.count > 0 ? `${alert.count} request${alert.count === 1 ? "" : "s"} waiting` : "No open requests.";
+    return `<div class="tocw-d-row"><span>${line}</span></div>
+      ${alert.paid ? `<div class="tocw-d-bonus">Your request was paid ✓</div>` : ""}
+      <button type="button" class="tocw-d-btn wide" data-d="open-bank">Open the Bank ↗</button>`;
+  }
+
+  function renderDock() {
+    const dock = document.getElementById("tocw-dock");
+    if (!dock) return;
+    const docked = state.dock.mode === "sidebar";
+    const open = docked && state.dock.open;
+    const live = Boolean(state.chain?.active);
+    const remaining = live ? chainRemaining() : 0;
+    const chip = docked ? dockChip(remaining) : { text: "popped out", cls: "" };
+    const tabs = availableTabs();
+    const tab = activeTab();
+    const popLabel = docked ? "Pop out the full panel" : "Dock back in the sidebar";
+    let body = "";
+    if (open) {
+      const tabRow = tabs.length > 1
+        ? `<div class="tocw-d-tabs" role="tablist" style="grid-template-columns:repeat(${tabs.length},minmax(0,1fr));">${tabs.map((t) => `<button type="button" role="tab" aria-selected="${t === tab}" class="${t === tab ? "on" : ""}" data-d="tab:${t}">${TAB_LABELS[t]}</button>`).join("")}</div>`
+        : "";
+      const inner = tab === "war" ? renderDockWar() : tab === "bank" ? renderDockBank() : renderDockChain(remaining);
+      body = `<div class="tocw-d-body">${tabRow}${needsKey() ? `<div class="tocw-d-alert">Add your Torn key to start. <button type="button" class="tocw-d-link" data-d="settings">Settings</button></div>` : inner}</div>`;
+    }
+    dock.innerHTML = `
+      <div class="tocw-d-bar">
+        <button type="button" class="tocw-d-toggle" data-d="toggle" aria-expanded="${open}" title="${docked ? (open ? "Collapse Overseer" : "Expand Overseer") : "Dock Overseer back here"}">
+          <span class="tocw-d-name">Overseer</span>
+          ${chip ? `<span id="tocw-d-chip" class="tocw-d-chip ${chip.cls}">${escapeHtml(chip.text)}</span>` : `<span id="tocw-d-chip" class="tocw-d-chip" hidden></span>`}
+          <span class="tocw-d-arrow" aria-hidden="true">${docked ? (open ? "▾" : "▸") : "↗"}</span>
+        </button>
+        <button type="button" class="tocw-d-pop" data-d="pop" aria-label="${popLabel}" title="${popLabel}">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${docked
+            ? `<path d="M9 2h5v5"></path><path d="M14 2L7.5 8.5"></path><path d="M12 9.5V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3.5"></path>`
+            : `<path d="M7 14H2V9"></path><path d="M2 14l6.5-6.5"></path><path d="M4 6.5V3a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H9.5"></path>`}</svg>
+        </button>
+      </div>
+      ${body}`;
+  }
+
+  function onDockClick(e) {
+    const el = e.target.closest("[data-d]");
+    if (!el) return;
+    const act = el.getAttribute("data-d");
+    if (act === "toggle") {
+      if (state.dock.mode !== "sidebar") return dockBack(true);
+      state.dock.open = !state.dock.open;
+      gmSet(STORE.dockOpen, state.dock.open);
+      if (state.dock.open && activeTab() === "bank") void loadBank(false);
+      render();
+    } else if (act === "pop") {
+      if (state.dock.mode === "sidebar") popOut();
+      else dockBack(true);
+    } else if (act.startsWith("tab:")) {
+      setTab(act.slice(4));
+    } else if (act === "hit-next") {
+      hitNextTarget();
+    } else if (act === "alarm") {
+      state.alarm = !state.alarm;
+      gmSet(STORE.alarm, state.alarm);
+      if (state.alarm) {
+        primeAudio();
+        if (state.alarmSound) beep(1);
+      }
+      render();
+    } else if (act === "settings") {
+      setDockMode("float");
+      state.settingsOpen = true;
+      render();
+    } else if (act === "open-war") {
+      popOut("war");
+    } else if (act === "open-bank") {
+      popOut("bank");
+    }
+  }
+
+  // The 1s tick: keep the bar's countdown moving and re-mount it if Torn's sidebar was
+  // re-rendered underneath it (a few React updates do that).
+  function tickDock() {
+    if (state.dock.mode === "sidebar" || dockMounted() || dockPending()) {
+      if (!dockMounted()) {
+        if (Date.now() - dockLastMountTry > 1500) {
+          dockLastMountTry = Date.now();
+          if (ensureDock()) render({ background: true });
+        }
+        // No sidebar turned up (Torn PDA, a narrow window): show the floating panel now
+        // rather than at the next poll.
+        if (!dockPending() && !dockFloatShown) {
+          dockFloatShown = true;
+          render({ background: true });
+        }
+        return;
+      }
+    }
+    if (!dockMounted() || !state.chain?.active || state.dock.mode !== "sidebar") return;
+    const remaining = chainRemaining();
+    const chip = document.getElementById("tocw-d-chip");
+    if (chip) {
+      chip.textContent = `${state.chain.current} · ${duration(remaining)}`;
+      chip.className = `tocw-d-chip${remaining <= 60 ? " bad" : remaining <= 120 ? " warn" : ""}`;
+      chip.hidden = false;
+    }
+    const t = document.getElementById("tocw-d-timer");
+    if (t) {
+      t.textContent = duration(remaining);
+      t.className = `tocw-d-timer ${timerUrgencyClass(remaining)}`;
+    }
+  }
+
   function createLauncher() {
     if (document.getElementById("tocw-launcher")) return;
     const launcher = document.createElement("button");
@@ -6626,7 +6978,8 @@
       // is collapsed or hidden and you're not watching it.
       evaluateAlarms();
       updateWakeLock();
-      if (state.hidden) return;
+      tickDock();
+      if (state.hidden || dockActive()) return;
       if (state.collapsed) {
         // Minimized: only the compact status drop-timer is visible — keep it ticking.
         const cel = document.getElementById("tocw-ctimer");
@@ -6756,6 +7109,12 @@
         markBankSeen,
         updateLauncher,
         createLauncher,
+        findSidebarAnchor,
+        ensureDock,
+        renderDock,
+        dockActive,
+        dockChip,
+        setDockMode,
         money,
         warFormatCountdown,
         warFormatSpan,
