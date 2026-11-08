@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.9
+// @version      0.8.10
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -1225,7 +1225,7 @@
   .totr-receipts a{color:#8ab8ff;word-break:break-all}
   .totr-msg{padding:8px 10px;background:#0b0e13;border:1px solid #2f3b4d;border-radius:6px;white-space:pre-line;color:#c9d2de}
   .totr-chip{display:inline-block;white-space:nowrap;margin-left:6px;padding:1px 6px;border-radius:4px;font:700 11px system-ui,sans-serif}
-  .totr-chip--ok{background:#0f3324;color:#5fe0a6}.totr-chip--warn{background:#3a2a0f;color:#f0c674}.totr-chip--low{background:#2a1430;color:#f0a6ff}
+  .totr-chip--ok{background:#0f3324;color:#5fe0a6}.totr-chip--warn{background:#3a2a0f;color:#f0c674}.totr-chip--low{background:#2a1430;color:#f0a6ff}.totr-chip--dim{background:#1a2230;color:#9aa7b8}
   .totr-mini{white-space:nowrap;font:700 11px system-ui,sans-serif;color:#e6ebf2;background:#161d28;border:1px solid #3a475b;border-radius:5px;height:24px;padding:0 8px;cursor:pointer;margin-left:6px}
   .totr-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0;padding:8px 10px;background:#11161f;border:1px solid #2f3b4d;border-radius:8px;font:13px system-ui,sans-serif;color:#e6ebf2}
   .totr-card{display:flex;flex-direction:column;align-items:flex-start;gap:4px;padding:6px 10px;border-radius:7px;background:#161d28;border:1px solid #232c3a;color:#e6ebf2;text-decoration:none;font-size:13px}
@@ -2292,13 +2292,25 @@
           netAfterFee(d.marketValue) != null ? el("span", { class: "totr-muted", title: "What a sale at market value pays you after Torn's 5% item market fee — pay more than this and reselling at MV loses money." }, `· ${fmtMoney(netAfterFee(d.marketValue))} after 5% fee`) : null,
           d.buyPrice != null ? el("span", { class: "totr-muted" }, `You buy at ${fmtMoney(d.buyPrice)}`) : null,
           mode === "bazaar" && sellAtOf(current.itemId) != null ? el("span", { class: "totr-muted" }, `· You sell at ${fmtMoney(sellAtOf(current.itemId))}`) : null,
-          el("span", { class: "totr-muted" }, "· 5 cheapest"),
+          el("span", { class: "totr-muted", title: "The five cheapest bazaars selling this item right now — every one, deal or not. Deals (the Overseer eye) are a separate list: items on your Script Pricelist at or under your price." }, "· 5 cheapest bazaars"),
           sellModeLink(),
           el("a", { class: "totr-mini", href: itemPageUrl(current.itemId), target: "_blank", rel: "noopener", style: "margin-left:auto;display:inline-flex;align-items:center;text-decoration:none", title: "Every listing, buyers and your three ways to sell, on Overseer" }, "Full page"),
           el("button", { class: "totr-mini", type: "button", onclick: () => modules.priceCheck.toggle(current.itemId, strip, { name: d.itemName }) }, "Price check"),
         ].filter(Boolean)); // native append() would print a null as the text "null" // native append() would print a null as the text "null"
       }
+      // 0.8.10: players read this strip as a deals list and asked why a −17% item never reached
+      // their Deals. Deals only watch your Script Pricelist — say so, and offer the one-tap add
+      // (the site starts the row at your deal % of MV; you still press Save there).
+      let notOnList = null;
+      if (d && d.buyPrice == null && d.marketValue > 0) {
+        const pct = prefs().dealPct;
+        notOnList = el("div", { class: "totr-muted", style: "width:100%;flex-basis:100%;display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+          el("span", null, "Not on your Script Pricelist — Deals only alert for items on it."),
+          el("a", { class: "totr-mini", href: `${SITE_URL}/trading/buy-list?add=${current.itemId}&pct=${pct}`, target: "_blank", rel: "noopener", style: "display:inline-flex;align-items:center;text-decoration:none", title: `Opens Overseer with ${d.itemName || "this item"} started at ${pct}% of market value (${fmtMoney(Math.round(d.marketValue * pct / 100))}); press Save there.` },
+            `Add at ${fmtMoney(Math.round(d.marketValue * pct / 100))}`));
+      }
       const body = el("div", { class: "totr-body", style: "flex-direction:row;flex-wrap:wrap" });
+      if (notOnList) body.append(notOnList);
       if (current.error) body.append(el("div", { class: "totr-error" }, current.error));
       else if (!d) body.append(el("div", { class: "totr-muted" }, "Checking bazaars…"));
       else if (!d.bazaars || !d.bazaars.length) body.append(el("div", { class: "totr-muted" }, d.bazaarError ? "Bazaar listings unavailable right now." : "No bazaars selling this right now."));
@@ -2325,7 +2337,13 @@
     function stripChip(b, under, pct, mode, d) {
       if (under) return el("span", { class: "totr-chip totr-chip--buy" }, "Under your buy");
       if (showsMarketPct(mode)) {
-        return pct != null ? el("span", { class: "totr-chip " + (pct <= 0 ? "totr-chip--ok" : "totr-chip--warn") }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`) : null;
+        // 0.8.10: green only at or under your deal % of MV (−10% or better at the default 90) —
+        // a −0.6% listing used to glow the same green as −17%, and read as a deal.
+        if (pct == null) return null;
+        const dealLine = -(100 - prefs().dealPct);
+        const cls = pct <= dealLine ? "totr-chip--ok" : pct <= 0 ? "totr-chip--dim" : "totr-chip--warn";
+        const title = pct <= dealLine ? `At or under your deal line (${prefs().dealPct}% of MV)` : pct <= 0 ? `Under MV, but not by your deal % (${prefs().dealPct}% of MV = ${dealLine}%)` : "Over market value";
+        return el("span", { class: "totr-chip " + cls, title }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`);
       }
       const v = resaleVerdict({ mode, ask: b.price, marketValue: d.marketValue, sellAt: sellAtOf(current.itemId), market: sellMarketOf(current.itemId), stock: d.stock, quote: d }, Date.now());
       return v ? el("span", { class: "totr-chip " + (verdictIsGreen(v) ? "totr-chip--ok" : "totr-chip--warn"), title: v.title }, v.label) : null;
