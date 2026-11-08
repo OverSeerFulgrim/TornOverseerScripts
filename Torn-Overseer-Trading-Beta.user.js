@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.6
+// @version      0.8.7
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -535,6 +535,22 @@
   }
 
   /** Send a page's stock at most once per `everyMs` per page. `sentAt` is { add?, manage? } in ms. */
+  /**
+   * 0.8.7: a settle timer that starts on the first call and is NOT pushed back by later
+   * calls while it is pending — unlike a debounce, a page that never stops changing (Torn's
+   * sidebar countdowns tick every second) still gets its turn. Returns arm(fn).
+   */
+  function settleOnce(ms, timers) {
+    const t = timers || { set: (fn, d) => setTimeout(fn, d) };
+    let pending = false;
+    return (fn) => {
+      if (pending) return false;
+      pending = true;
+      t.set(() => { pending = false; fn(); }, ms);
+      return true;
+    };
+  }
+
   function snapshotDue(sentAt, page, nowMs, everyMs) {
     const last = sentAt && Number(sentAt[page]);
     return !(Number.isFinite(last) && nowMs - last >= 0 && nowMs - last < everyMs);
@@ -2024,14 +2040,17 @@
     const STOCK_EVERY_MS = 10 * 60 * 1000;
     const STOCK_SETTLE_MS = 3000;
     const STOCK_MAX_ITEMS = 2000;
-    let stockTimer = null;
     let stockNote = null;
     let stockOff = false; // the server doesn't know stock_snapshot yet — stop asking this visit
 
+    // 0.8.7: armed ONCE, never pushed back. run() fires on every DOM change, and Torn's
+    // sidebar redraws its energy/nerve/happy countdowns every second — clearing and restarting
+    // the timer on each run meant the 3 s settle never elapsed and the Add page was never sent
+    // (Fulgrim, 2026-11-07: Manage got through in a quiet moment, Add never did).
+    const stockSettle = settleOnce(STOCK_SETTLE_MS);
     function scheduleStock() {
       if (stockOff) return;
-      clearTimeout(stockTimer);
-      stockTimer = setTimeout(() => { sendStock().catch(() => { /* noted below */ }); }, STOCK_SETTLE_MS);
+      stockSettle(() => { sendStock().catch(() => { /* noted below */ }); });
     }
     async function sendStock() {
       const page = isManage() ? "manage" : "add";
@@ -3583,7 +3602,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

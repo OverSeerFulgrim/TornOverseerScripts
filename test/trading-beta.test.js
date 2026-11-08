@@ -554,3 +554,20 @@ test("freeLabel: bought stock, no stock and a pre-WO-85 server show nothing", ()
   assert.equal(tr.freeLabel(null), null);
   assert.equal(tr.freeLabel(undefined), null);
 });
+
+test("settleOnce fires once after the first call, however often it is re-armed (0.8.7)", () => {
+  // Torn's sidebar countdowns re-run the bazaar module every second; a debounce that
+  // restarts on each run never fires, which is how the Add page stopped being sent.
+  const queued = [];
+  const arm = tr.settleOnce(3000, { set: (fn, ms) => queued.push({ fn, ms }) });
+  let sent = 0;
+  assert.equal(arm(() => { sent += 1; }), true);
+  for (let i = 0; i < 10; i += 1) assert.equal(arm(() => { sent += 100; }), false);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].ms, 3000);
+  queued[0].fn();
+  assert.equal(sent, 1);
+  // After it fired, the next call arms a new one.
+  assert.equal(arm(() => { sent += 1; }), true);
+  assert.equal(queued.length, 2);
+});
