@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.4
+// @version      0.8.5
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -246,6 +246,24 @@
   /** A control that already fills the max ("Max", "fill max") — Torn's own or another script's. */
   function isMaxLabel(text) {
     return /^\s*(fill\s+)?max\s*$/i.test(String(text || ""));
+  }
+
+  /**
+   * 0.8.5 (WO-85): the Manage row's stock word from `sell_prices`' `stock`
+   * ({ freeUnits, unknownUnits, paidUnits, freeWords }). All free → "FREE · LOOT"; mixed →
+   * "n FREE"; nothing paid and nothing free → "GIFT · COST UNKNOWN"; else nothing. Pure.
+   * (Ported from the extension's bundled copy, where it shipped as 0.8.4.)
+   */
+  function freeLabel(stock) {
+    if (!stock) return null;
+    const free = Number(stock.freeUnits) || 0, unk = Number(stock.unknownUnits) || 0, paid = Number(stock.paidUnits) || 0;
+    if (free > 0 && paid === 0 && unk === 0) {
+      const word = Array.isArray(stock.freeWords) && stock.freeWords[0] ? stock.freeWords[0] : "free";
+      return { kind: "free", text: `FREE · ${word.toUpperCase()}`, title: `All ${free.toLocaleString("en-US")} you hold cost you nothing (${(Array.isArray(stock.freeWords) ? stock.freeWords : []).join(", ") || "free"}) — safe to list at $1.` };
+    }
+    if (free > 0) return { kind: "free", text: `${free.toLocaleString("en-US")} FREE`, title: `${free.toLocaleString("en-US")} of the ones you hold cost you nothing${paid ? "; the rest were bought" : ""}${unk ? "; some have no known cost" : ""}.` };
+    if (unk > 0 && paid === 0) return { kind: "unknown", text: "GIFT · COST UNKNOWN", title: "Nobody paid an attributable price for these (a gift, a box's contents, the armory) — not free, just unknown." };
+    return null;
   }
 
   /** How many you can buy: all in stock, or as many as the money on hand covers. 0 if not one. */
@@ -1104,6 +1122,7 @@
   .totr-vs--competitive{color:#5fe0a6;border-color:#2f6b52}.totr-vs--above{color:#f0c674;border-color:#7a6431}.totr-vs--far_above{color:#ff8a80;border-color:#7a3a35}
   .totr-dollar{font:800 13px system-ui,sans-serif;color:#f5c518;background:#0b0e13;border:1px solid #3a475b;border-radius:5px;width:26px;height:24px;cursor:pointer;padding:0}
   .totr-bz-profit{font-weight:700;color:#5fe0a6;white-space:nowrap}.totr-bz-profit--floor{color:#e2a6ef}.totr-bz-profit--loss{color:#ff8a8a}.totr-bz-paid{color:#c9d2de;white-space:nowrap}
+  .totr-free{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.05em;white-space:nowrap}.totr-free--free{background:#10321f;color:#6fdc8c}.totr-free--unknown{background:#2a2f3a;color:#9ca3af}
   .totr-bz-state{font-weight:700;white-space:nowrap}.totr-bz-state--ok{color:#5fe0a6}.totr-bz-state--warn{color:#f0c674}.totr-bz-state--info{color:#8ab8ff}.totr-bz-state--low{color:#e2a6ef}
   .totr-hlink{font:700 12px Arial,sans-serif;letter-spacing:.06em;color:#ccc;background:transparent;border:0;padding:0 8px;cursor:pointer;text-decoration:none}
   .totr-hage{color:#9aa7b8;font-weight:400;letter-spacing:.03em}
@@ -1810,6 +1829,10 @@
       // different prices); nothing when the ledger has no open lot for the item.
       const paid = paidText(s);
       if (isManage() && paid) box.append(el("span", { class: "totr-bz-paid", title: "What you paid for the ones you still hold (your ledger's open lots; an average if you bought at different prices)" }, paid));
+      // 0.8.5 (WO-85): stock that cost you nothing (loot, a find, a perk) — what's safe to list
+      // at $1 without losing money. Nothing is priced for you; the pill only says so.
+      const free = isManage() ? freeLabel(s && s.stock) : null;
+      if (free) box.append(el("span", { class: `totr-free totr-free--${free.kind}`, title: free.title }, free.text));
       // 0.7.14 (WO-64): your bazaar vs the best trader vs the item market, on Overseer.
       if (isManage() && r.itemId) box.append(el("a", { class: "totr-linkbtn", href: itemPageUrl(r.itemId, "sell"), target: "_blank", rel: "noopener", title: "Compare your bazaar, the best trader and the item market for this item" }, "Compare"));
       // 0.7.12: a loss reads red (it used to stay green with only a minus sign).
@@ -3514,7 +3537,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

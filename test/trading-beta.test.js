@@ -526,3 +526,21 @@ test("minutesAgo reads like a person", () => {
   assert.equal(tr.minutesAgo("2026-11-06T11:55:00Z", now), "5 min ago");
   assert.equal(tr.minutesAgo("nope", now), "");
 });
+
+// ---- 0.8.5 (WO-85): free stock on Manage rows ---------------------------------------------
+
+test("freeLabel: all-free stock says FREE and names the source; mixed says how many; a gift is unknown", () => {
+  assert.deepEqual(tr.freeLabel({ freeUnits: 81, unknownUnits: 0, paidUnits: 0, freeWords: ["loot"] }).text, "FREE · LOOT");
+  assert.equal(tr.freeLabel({ freeUnits: 81, unknownUnits: 0, paidUnits: 0, freeWords: ["loot"] }).kind, "free");
+  assert.equal(tr.freeLabel({ freeUnits: 14, unknownUnits: 0, paidUnits: 4, freeWords: ["found"] }).text, "14 FREE");
+  const gift = tr.freeLabel({ freeUnits: 0, unknownUnits: 1, paidUnits: 0, freeWords: [] });
+  assert.equal(gift.text, "GIFT · COST UNKNOWN");
+  assert.equal(gift.kind, "unknown");
+});
+
+test("freeLabel: bought stock, no stock and a pre-WO-85 server show nothing", () => {
+  assert.equal(tr.freeLabel({ freeUnits: 0, unknownUnits: 0, paidUnits: 3, freeWords: [] }), null);
+  assert.equal(tr.freeLabel({ freeUnits: 0, unknownUnits: 0, paidUnits: 0, freeWords: [] }), null);
+  assert.equal(tr.freeLabel(null), null);
+  assert.equal(tr.freeLabel(undefined), null);
+});
