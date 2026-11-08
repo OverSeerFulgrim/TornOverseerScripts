@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.8
+// @version      0.8.9
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -1995,7 +1995,10 @@
       if (s.floor != null) choices.push({ label: "Your floor (cost + %)", price: s.floor, floor: true });
       const list = el("div", { class: "totr-pick-list" });
       const head = el("div", { class: "totr-pick-head" }, el("strong", null, name.trim()),
-        el("span", { class: "totr-muted" }, [s.teMarketValue ? `TE MV ${fmtMoney(s.teMarketValue)}` : null, s.costEach != null ? `paid ${fmtMoney(s.costEach)}` : null].filter(Boolean).join(" · ")),
+        // 0.8.9: "paid" is the average cost of the units you STILL HOLD (open lots), not the
+        // 90-day history — say how many, so it reconciles with the Price check's history card.
+        el("span", { class: "totr-muted", title: s.costEach != null ? "Average cost of the units you still hold (your ledger's open lots) — the base of your floor. The Price check's \"Acquired\" median covers everything you bought in 90 days, sold or not." : undefined },
+          [s.teMarketValue ? `TE MV ${fmtMoney(s.teMarketValue)}` : null, s.costEach != null ? `paid ${fmtMoney(s.costEach)}${s.onHand > 0 ? ` · ${Number(s.onHand).toLocaleString("en-US")} held` : ""}` : null].filter(Boolean).join(" · ")),
         el("button", { type: "button", class: "totr-pick-x", "aria-label": "Close", onclick: closePopup }, "✕"));
       const draw = () => {
         list.replaceChildren(...choices.map((c) => el("button", {
@@ -2805,7 +2808,9 @@
       const kids = [el("div", { class: "totr-pc-stats" },
         stat("Acquired", `${h.boughtUnits}${h.medianCost != null ? " @ " + money(h.medianCost) : ""}`),
         stat("Sold", `${h.soldUnits}${h.medianSale != null ? " @ " + money(h.medianSale) : ""}`),
-        h.realizedProfit != null ? stat("Profit", money(h.realizedProfit)) : null)];
+        h.realizedProfit != null ? stat("Profit", money(h.realizedProfit)) : null,
+        // 0.8.9: what the stock still on hand cost — the "paid" figure on the bazaar Manage row.
+        h.onHand > 0 && h.onHandCostEach != null ? stat("On hand", `${h.onHand} @ ${money(h.onHandCostEach)}`) : null)];
       const stock = [`On hand ${h.onHand}`];
       if (h.sellPerDay) stock.push(`sells ~${Math.round(h.sellPerDay * 10) / 10}/day`);
       if (h.daysOfStock != null) stock.push(`≈ ${Math.round(h.daysOfStock)} days of stock`);
