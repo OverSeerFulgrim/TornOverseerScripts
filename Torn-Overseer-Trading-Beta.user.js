@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.2
+// @version      0.8.3
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -416,6 +416,34 @@
   /** The chip text for a resale. */
   function resaleLabel(r) {
     return `${r.via === "bazaar" ? "resell" : "flip"} +${fmtMoney(r.profit)} (${r.pct.toFixed(1)}%)`;
+  }
+  /**
+   * 0.7.15 (WO-80): what a buy page says about a listing at `ask`, after "under your buy" (which the
+   * caller decides first). In order:
+   *  - "hold": you already hold it and none sold in 30 days (`notSellingLine`) — amber, whatever the
+   *    resale says; the resale (if any) goes in the tooltip. The strongest reason not to buy more.
+   *  - "target_high": bazaar mode and your sell-list price is far above the cheapest bazaar listing
+   *    (WO-53's >10% line) — amber; a RESELL number against that target is not a sale.
+   *  - "resale": the green chip as before (bazaar mode: sell-list within 10% of cheapest, or no
+   *    verdict possible — stale / nobody listing / display price — in which case we don't claim the
+   *    target is wrong either).
+   * `market` is the MC-3 snapshot carried by `sell_prices`; `stock` the quote's holding. Pure.
+   */
+  function resaleVerdict({ mode, ask, marketValue, sellAt, market, stock }, nowMs) {
+    const resale = resaleFor(mode, ask, marketValue, sellAt);
+    const vs = mode === "bazaar" ? vsCheapest(sellAt, market, nowMs) : null;
+    const vsLine = vs && vs.label ? `your sell-list price ${fmtMoney(sellAt)} ${vs.label} ${vs.title}` : (mode === "bazaar" && Number(sellAt) > 0 ? `your sell-list price ${fmtMoney(sellAt)} · cheapest listing unchecked` : "");
+    const resaleLine = resale ? (resale.via === "bazaar" ? `${resaleLabel(resale)} at your sell-list price ${fmtMoney(sellAt)} (no fee in a bazaar)` : `${resaleLabel(resale)} resold at market value ${fmtMoney(marketValue)} after Torn's 5% fee`) : "";
+    const stuck = notSellingLine(stock, nowMs);
+    if (stuck) {
+      const onHand = Number(stock.onHand).toLocaleString("en-US");
+      return { kind: "hold", label: `HOLD ${onHand} · NOT SELLING`, title: [stuck, vsLine, resaleLine].filter(Boolean).join(" · "), resale, vs };
+    }
+    if (vs && vs.band === "far_above") {
+      return { kind: "target_high", label: `TARGET ${vs.label} OVER MARKET`, title: `${vsLine} · fix it on Overseer's Bazaar tab`, resale, vs };
+    }
+    if (resale) return { kind: "resale", label: resaleLabel(resale), title: [resaleLine, vsLine].filter(Boolean).join(" · "), resale, vs };
+    return null;
   }
 
   /** The trade panel's money guard. */
@@ -1082,7 +1110,9 @@
   .totr-hlink--ok{color:#8bc34a}.totr-hlink--qty{color:#7fb2ff}.totr-hlink--warn{color:#f0c674}.totr-hlink--clear{color:#e57373}
   li.totr-deal{position:relative;outline:2px solid #4c8dff;outline-offset:-2px}
   li.totr-flip{position:relative;outline:2px dashed #5fe0a6;outline-offset:-2px}
+  li.totr-hold{position:relative;outline:2px dashed #e0a23b;outline-offset:-2px}
   .totr-dealchip--flip{color:#082217;background:#5fe0a6;border-color:#5fe0a6}
+  .totr-dealchip--hold{color:#2a1a05;background:#e0a23b;border-color:#e0a23b}
   .totr-dealchip{position:absolute;top:4px;left:4px;z-index:2;font:700 10px/1.5 system-ui,sans-serif;color:#cfe0ff;background:#16263f;border:1px solid #4c8dff;border-radius:4px;padding:0 5px;pointer-events:none;white-space:nowrap}.totr-hlink:disabled{color:#777;cursor:default}
   .totr-bzline{font:12px system-ui,sans-serif;color:#9aa7b8;margin:6px 0}
   .totr-pick-pop{position:absolute;z-index:99999;width:380px;margin:0;box-shadow:0 18px 44px rgba(0,0,0,.65)}
@@ -2054,14 +2084,17 @@
     if (anchor && anchor.parentElement) anchor.insertAdjacentElement("beforebegin", sellModeBar());
   }
   // Bazaar mode's resale price: your sell-list price, from `sell_prices` (100 ids a call).
-  const sellAtCache = new Map(); // itemId → sellAt | null
+  // 0.7.15: keeps the MC-3 `market` snapshot too, so the resale chip can check the cheapest listing.
+  const sellAtCache = new Map(); // itemId → { sellAt, market } | null
+  const sellAtOf = (id) => { const v = sellAtCache.get(id); return v ? v.sellAt : null; };
+  const sellMarketOf = (id) => { const v = sellAtCache.get(id); return v ? v.market : null; };
   async function loadSellAt(ids) {
     const want = [...new Set(ids)].filter((id) => !sellAtCache.has(id));
     for (let i = 0; i < want.length; i += 100) {
       const chunk = want.slice(i, i + 100);
       try {
         const res = await callTrader("sell_prices", { itemIds: chunk });
-        for (const it of (res && res.items) || []) sellAtCache.set(it.itemId, it.sellAt != null ? Number(it.sellAt) : null);
+        for (const it of (res && res.items) || []) sellAtCache.set(it.itemId, it.sellAt != null ? { sellAt: Number(it.sellAt), market: it.market || null } : null);
       } catch { return false; } // leave uncached; the next scan retries
       for (const id of chunk) if (!sellAtCache.has(id)) sellAtCache.set(id, null);
     }
@@ -2098,7 +2131,7 @@
           el("span", { class: "totr-muted" }, `Market ${fmtMoney(d.marketValue)}`),
           netAfterFee(d.marketValue) != null ? el("span", { class: "totr-muted", title: "What a sale at market value pays you after Torn's 5% item market fee — pay more than this and reselling at MV loses money." }, `· ${fmtMoney(netAfterFee(d.marketValue))} after 5% fee`) : null,
           d.buyPrice != null ? el("span", { class: "totr-muted" }, `You buy at ${fmtMoney(d.buyPrice)}`) : null,
-          mode === "bazaar" && sellAtCache.get(current.itemId) != null ? el("span", { class: "totr-muted" }, `· You sell at ${fmtMoney(sellAtCache.get(current.itemId))}`) : null,
+          mode === "bazaar" && sellAtOf(current.itemId) != null ? el("span", { class: "totr-muted" }, `· You sell at ${fmtMoney(sellAtOf(current.itemId))}`) : null,
           el("span", { class: "totr-muted" }, "· 5 cheapest"),
           sellModeLink(),
           el("a", { class: "totr-mini", href: itemPageUrl(current.itemId), target: "_blank", rel: "noopener", style: "margin-left:auto;display:inline-flex;align-items:center;text-decoration:none", title: "Every listing, buyers and your three ways to sell, on Overseer" }, "Full page"),
@@ -2134,8 +2167,8 @@
       if (showsMarketPct(mode)) {
         return pct != null ? el("span", { class: "totr-chip " + (pct <= 0 ? "totr-chip--ok" : "totr-chip--warn") }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`) : null;
       }
-      const r = resaleFor(mode, b.price, d.marketValue, sellAtCache.get(current.itemId));
-      return r ? el("span", { class: "totr-chip totr-chip--ok" }, resaleLabel(r)) : null;
+      const v = resaleVerdict({ mode, ask: b.price, marketValue: d.marketValue, sellAt: sellAtOf(current.itemId), market: sellMarketOf(current.itemId), stock: d.stock }, Date.now());
+      return v ? el("span", { class: "totr-chip " + (v.kind === "resale" ? "totr-chip--ok" : "totr-chip--warn"), title: v.title }, v.label) : null;
     }
 
     async function load(itemId) {
@@ -2191,12 +2224,15 @@
         // Buy-list deals win; otherwise a flip if reselling at MV clears the 5% fee. t.price is
         // read off the tile on every scan, so a listing that sold never leaves a stale chip.
         const mode = prefs().sellMode;
-        const flip = deal ? null : resaleFor(mode, t.price, q && q.marketValue, sellAtCache.get(t.itemId));
-        const sig = deal ? `d${t.price}:${buyAt}` : flip ? `f${t.price}:${flip.via}:${flip.profit}` : "";
+        // 0.7.15 (WO-80): the verdict checks your sell-list price against the cheapest bazaar and
+        // turns amber on stock you hold that isn't selling, instead of a green flip with a footnote.
+        const v = deal ? null : resaleVerdict({ mode, ask: t.price, marketValue: q && q.marketValue, sellAt: sellAtOf(t.itemId), market: sellMarketOf(t.itemId), stock: q && q.stock }, Date.now());
+        const sig = deal ? `d${t.price}:${buyAt}` : v ? `v${t.price}:${v.kind}:${v.label}` : "";
         if ((t.li.dataset.totrDeal || "") === sig) continue;
         t.li.dataset.totrDeal = sig;
         t.li.classList.toggle("totr-deal", deal);
-        t.li.classList.toggle("totr-flip", Boolean(flip));
+        t.li.classList.toggle("totr-flip", Boolean(v && v.kind === "resale"));
+        t.li.classList.toggle("totr-hold", Boolean(v && v.kind !== "resale"));
         t.li.querySelector(".totr-dealchip")?.remove();
         const stuckNote = notSellingLine(q && q.stock, Date.now());
         const stuckTail = stuckNote ? `\n${stuckNote}` : "";
@@ -2204,11 +2240,11 @@
           const under = buyAt - t.price;
           t.li.append(el("span", { class: "totr-dealchip", "data-totr-ui": "1", title: `Cheapest listing ${fmtMoney(t.price)} · your Pricelist buy price ${fmtMoney(buyAt)}${stuckTail}` },
             under > 0 ? `${fmtMoney(under)} under your buy` : "at your buy"));
-        } else if (flip) {
-          const why = flip.via === "bazaar"
-            ? `Cheapest listing ${fmtMoney(t.price)} · your bazaar sell-list price ${fmtMoney(sellAtCache.get(t.itemId))} (no fee in a bazaar).`
-            : `Cheapest listing ${fmtMoney(t.price)} · market value ${fmtMoney(q.marketValue)} · resold at MV it nets ${fmtMoney(netAfterFee(q.marketValue))} after Torn's 5% fee. MV is an average, not a promised sale.`;
-          t.li.append(el("span", { class: "totr-dealchip totr-dealchip--flip", "data-totr-ui": "1", title: `${why}${stuckTail}` }, resaleLabel(flip)));
+        } else if (v) {
+          const why = v.kind === "resale" && v.resale.via === "market"
+            ? `Cheapest listing ${fmtMoney(t.price)} · market value ${fmtMoney(q.marketValue)} · resold at MV it nets ${fmtMoney(netAfterFee(q.marketValue))} after Torn's 5% fee. MV is an average, not a promised sale.`
+            : `Cheapest listing ${fmtMoney(t.price)} · ${v.title}`;
+          t.li.append(el("span", { class: "totr-dealchip " + (v.kind === "resale" ? "totr-dealchip--flip" : "totr-dealchip--hold"), "data-totr-ui": "1", title: why }, v.label));
         }
       }
     }
@@ -2349,15 +2385,19 @@
         if (c.price <= 1) continue; // $1 listings are display/locked items, not deals
         let label = null; let cls = null;
         const mode = prefs().sellMode;
-        const resale = mode === "bazaar" ? resaleFor(mode, c.price, q.marketValue, sellAtCache.get(c.itemId)) : null;
+        // 0.7.15 (WO-80): in bazaar mode the verdict checks your sell-list price against the cheapest
+        // bazaar (amber TARGET … OVER MARKET when it is >10% over) and goes amber HOLD n · NOT SELLING
+        // on stock you already hold that hasn't sold in 30 days — in every sell mode.
+        const v = resaleVerdict({ mode, ask: c.price, marketValue: q.marketValue, sellAt: sellAtOf(c.itemId), market: sellMarketOf(c.itemId), stock: q.stock }, Date.now());
+        let title = null;
         // 0.7.12: under your buy is BLUE on every page (it was green here, blue on the grid).
-        if (q.buyPrice != null && c.price < q.buyPrice) { label = "UNDER YOUR BUY"; cls = "buy"; }
-        else if (resale) { label = `RESELL +${fmtMoney(resale.profit)}`; cls = "ok"; }
+        if (q.buyPrice != null && c.price < q.buyPrice) { label = "UNDER YOUR BUY"; cls = "buy"; title = notSellingLine(q.stock, Date.now()) || null; }
+        else if (v && v.kind !== "resale") { label = v.label; cls = "warn"; title = v.title; }
+        else if (v && mode === "bazaar") { label = `RESELL +${fmtMoney(v.resale.profit)}`; cls = "ok"; title = v.title; }
         else if (showsMarketPct(mode) && q.marketValue && c.price <= q.marketValue * dealPct / 100 && !hasQuality(c.card)) { label = `${Math.round((c.price / q.marketValue) * 100)}% OF MARKET`; cls = "warn"; }
         if (!label) continue;
         c.card.style.boxShadow = cls === "buy" ? "inset 0 0 0 3px #4c8dff" : cls === "ok" ? "inset 0 0 0 3px #5fe0a6" : "inset 0 0 0 3px #e0a23b";
-        const stuckNote = notSellingLine(q.stock, Date.now());
-        c.card.querySelector("[data-testid='price']")?.after(el("span", { class: `totr-chip totr-chip--${cls}`, "data-totr-ui": "1", title: stuckNote || undefined }, stuckNote ? `${label} · HOLD ${Number(q.stock.onHand).toLocaleString("en-US")}` : label));
+        c.card.querySelector("[data-testid='price']")?.after(el("span", { class: `totr-chip totr-chip--${cls}`, "data-totr-ui": "1", title: title || undefined }, label));
       }
     }
 
@@ -3462,7 +3502,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

@@ -419,6 +419,50 @@ test("resaleFor: market = flip after the 5% fee; bazaar = your sell-list price, 
   assert.equal(tr.resaleFor("trade", 100, 1000, 1000), null);
 });
 
+test("resaleVerdict (WO-80): a sell-list price far over the cheapest bazaar is not a resale", () => {
+  // Spray Paint : Red, 2026-11-07: ask $399, sell list $510, cheapest bazaar $369.
+  const now = Date.parse("2026-11-07T23:00:00Z");
+  const market = { cheapest: 369, bazaarAverage: 380, listings: 12, capturedAt: "2026-11-07T22:40:00Z", weekCheapest: 372, yesterdayCheapest: 370 };
+  const v = tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: 510, market, stock: null }, now);
+  assert.equal(v.kind, "target_high");
+  assert.equal(v.label, "TARGET +38.2% OVER MARKET");
+  assert.match(v.title, /sell-list price \$510/);
+  assert.match(v.title, /Bazaar tab/);
+  // Within 10% of the cheapest: the green resale stays.
+  const near = tr.resaleVerdict({ mode: "bazaar", ask: 340, marketValue: 383, sellAt: 395, market, stock: null }, now);
+  assert.equal(near.kind, "resale");
+  assert.equal(near.label, "resell +$55 (16.2%)");
+  assert.match(near.title, /\+7\.0% vs cheapest bazaar \$369/);
+  // No verdict possible (stale snapshot): still green, but says the cheapest listing is unchecked.
+  const stale = tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: 510, market: { ...market, capturedAt: "2026-11-07T10:00:00Z" }, stock: null }, now);
+  assert.equal(stale.kind, "resale");
+  assert.match(stale.title, /sell-list price \$510/);
+  // Market mode never looks at the sell list.
+  const mk = tr.resaleVerdict({ mode: "market", ask: 300, marketValue: 383, sellAt: 510, market, stock: null }, now);
+  assert.equal(mk.kind, "resale");
+  assert.equal(mk.resale.via, "market");
+  assert.equal(tr.resaleVerdict({ mode: "trade", ask: 300, marketValue: 383, sellAt: 510, market, stock: null }, now), null);
+});
+
+test("resaleVerdict (WO-80): stock you hold that isn't selling beats any resale, in every mode", () => {
+  const now = Date.parse("2026-11-07T23:00:00Z");
+  const ago = (d) => new Date(now - d * 86400000).toISOString();
+  const stuck = { onHand: 28, oldestLotAt: ago(54), sold30d: 0 };
+  const market = { cheapest: 369, bazaarAverage: 380, listings: 12, capturedAt: "2026-11-07T22:40:00Z", weekCheapest: 372, yesterdayCheapest: 370 };
+  const v = tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: 510, market, stock: stuck }, now);
+  assert.equal(v.kind, "hold");
+  assert.equal(v.label, "HOLD 28 · NOT SELLING");
+  assert.match(v.title, /^You already hold 28 · none sold in 30 days/);
+  assert.match(v.title, /sell-list price \$510/);
+  // Even with a real resale on offer.
+  const m = tr.resaleVerdict({ mode: "market", ask: 300, marketValue: 383, sellAt: null, market: null, stock: stuck }, now);
+  assert.equal(m.kind, "hold");
+  assert.match(m.title, /flip \+\$63/);
+  // Recently bought or still selling: no hold.
+  assert.equal(tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: null, market: null, stock: { onHand: 28, oldestLotAt: ago(54), sold30d: 3 } }, now), null);
+  assert.equal(tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: null, market: null, stock: { onHand: 28, oldestLotAt: ago(5), sold30d: 0 } }, now), null);
+});
+
 test("resaleLabel names the route", () => {
   assert.equal(tr.resaleLabel({ profit: 100, pct: 11.11, via: "bazaar" }), "resell +$100 (11.1%)");
   assert.equal(tr.resaleLabel({ profit: 50, pct: 5.55, via: "market" }), "flip +$50 (5.5%)");
