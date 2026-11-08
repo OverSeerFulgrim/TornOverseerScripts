@@ -425,9 +425,9 @@ test("resaleVerdict (WO-80): a sell-list price far over the cheapest bazaar is n
   const market = { cheapest: 369, bazaarAverage: 380, listings: 12, capturedAt: "2026-11-07T22:40:00Z", weekCheapest: 372, yesterdayCheapest: 370 };
   const v = tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: 510, market, stock: null }, now);
   assert.equal(v.kind, "target_high");
-  assert.equal(v.label, "+38% over market");
+  assert.equal(v.label, "TARGET +38% vs bazaar low");
   assert.match(v.title, /sell-list price \$510/);
-  assert.match(v.title, /Bazaar tab/);
+  assert.match(v.title, /Sell tab/);
   // Within 10% of the cheapest: the green resale stays.
   const near = tr.resaleVerdict({ mode: "bazaar", ask: 340, marketValue: 383, sellAt: 395, market, stock: null }, now);
   assert.equal(near.kind, "resale");
@@ -570,4 +570,76 @@ test("settleOnce fires once after the first call, however often it is re-armed (
   // After it fired, the next call arms a new one.
   assert.equal(arm(() => { sent += 1; }), true);
   assert.equal(queued.length, 2);
+});
+
+test("realisticResale (WO-89): the market's own exits, not your target", () => {
+  const now = Date.parse("2026-11-08T22:00:00Z");
+  const market = { cheapest: 250, bazaarAverage: 270, listings: 10, capturedAt: "2026-11-08T21:50:00Z", weekCheapest: 255, yesterdayCheapest: 252 };
+  // Dozen Roses, 2026-11-08: ask $255 vs bazaar low $250 — nothing realistic, however cheap vs MV ($286).
+  assert.equal(tr.realisticResale(255, { market, itemMarketLow: null }, now), null);
+  // Funeral Wreath: ask $200, bazaar low $200, but the item market's low is $369 → $350 after fee.
+  const wreath = tr.realisticResale(200, { market: { ...market, cheapest: 200 }, itemMarketLow: 369 }, now);
+  assert.equal(wreath.via, "item_market");
+  assert.equal(wreath.net, 350);
+  assert.equal(wreath.profit, 150);
+  // Matching the bazaar low counts when it clears 5%: ask $230 vs low $250 = 8.7%.
+  const bz = tr.realisticResale(230, { market, itemMarketLow: null }, now);
+  assert.equal(bz.via, "bazaar_low");
+  assert.equal(bz.profit, 20);
+  // Under 5% is not called: ask $240 vs $250 = 4.2%.
+  assert.equal(tr.realisticResale(240, { market, itemMarketLow: null }, now), null);
+  // The better of the two wins; a stale snapshot, a $1 display low or a listing-less market drop out.
+  assert.equal(tr.realisticResale(200, { market, itemMarketLow: 369 }, now).via, "item_market");
+  assert.equal(tr.realisticResale(200, { market: { ...market, capturedAt: "2026-11-08T10:00:00Z" }, itemMarketLow: null }, now), null);
+  assert.equal(tr.realisticResale(200, { market: { ...market, cheapest: 1, listings: 30 }, itemMarketLow: null }, now), null);
+  assert.equal(tr.realisticResale(200, { market: { ...market, listings: 0 }, itemMarketLow: null }, now), null);
+  assert.equal(tr.realisticResale(1, { market, itemMarketLow: 369 }, now), null);
+});
+
+test("resaleVerdict (WO-89): a stale high target no longer hides a real resale; below-cost prompts a buy", () => {
+  const now = Date.parse("2026-11-08T22:00:00Z");
+  const market = { cheapest: 250, bazaarAverage: 270, listings: 10, capturedAt: "2026-11-08T21:50:00Z", weekCheapest: 255, yesterdayCheapest: 252 };
+  // Roses: target $280 is +12% over the $250 low and no market exit beats $255 → amber, named plainly.
+  const roses = tr.resaleVerdict({ mode: "bazaar", ask: 255, marketValue: 286, sellAt: 280, market, stock: null, quote: { avgCost: null, avgCostQty: 0 } }, now);
+  assert.equal(roses.kind, "target_high");
+  assert.equal(roses.label, "TARGET +12% vs bazaar low");
+  assert.doesNotMatch(roses.label, /market$/);
+  // Wreath: same stale target, but the item market pays $350 after fee → green, says where.
+  const wreath = tr.resaleVerdict({ mode: "bazaar", ask: 200, marketValue: 246, sellAt: 240, market: { ...market, cheapest: 200, weekCheapest: 205, yesterdayCheapest: 203 }, stock: null, quote: null, itemMarketLow: 369 }, now);
+  assert.equal(wreath.kind, "resale");
+  assert.equal(wreath.label, "resell +$150 (75.0%)");
+  assert.match(wreath.title, /item market at its low \$369/);
+  assert.match(wreath.title, /sell-list price \$240/);
+  assert.equal(tr.verdictIsGreen(wreath), true);
+  // Below your cost: you hold 12 at $265, listing $230 (13% under) → green buy prompt, before any target warning.
+  const cost = tr.resaleVerdict({ mode: "bazaar", ask: 230, marketValue: 286, sellAt: 300, market: { ...market, cheapest: 235 }, stock: null, quote: { avgCost: 265, avgCostQty: 12 } }, now);
+  assert.equal(cost.kind, "below_cost");
+  assert.equal(cost.label, "BELOW YOUR COST $265");
+  assert.match(cost.title, /average down to \$248/);
+  assert.equal(tr.verdictIsGreen(cost), true);
+  // …but HOLD still wins over everything.
+  const stuck = { onHand: 12, oldestLotAt: "2026-09-01T00:00:00Z", sold30d: 0 };
+  const hold = tr.resaleVerdict({ mode: "bazaar", ask: 230, marketValue: 286, sellAt: 300, market, stock: stuck, quote: { avgCost: 265, avgCostQty: 12 }, itemMarketLow: 500 }, now);
+  assert.equal(hold.kind, "hold");
+  assert.equal(tr.verdictIsGreen(hold), false);
+  // A realistic resale clears before below-cost does.
+  const both = tr.resaleVerdict({ mode: "bazaar", ask: 200, marketValue: 286, sellAt: 300, market, stock: null, quote: { avgCost: 265, avgCostQty: 12 } }, now);
+  assert.equal(both.kind, "resale");
+  assert.match(both.title, /matching the cheapest bazaar \$250/);
+  // Market mode is untouched by all of it.
+  const mk = tr.resaleVerdict({ mode: "market", ask: 230, marketValue: 286, sellAt: 300, market, stock: null, quote: { avgCost: 265, avgCostQty: 12 } }, now);
+  assert.equal(mk.kind, "resale");
+  assert.equal(mk.resale.via, "market");
+});
+
+test("belowCost / itemMarketLowFrom (WO-89)", () => {
+  assert.equal(tr.belowCost(230, { avgCost: 265, avgCostQty: 12 }).after, 248);
+  assert.equal(tr.belowCost(262, { avgCost: 265, avgCostQty: 12 }), null);   // only 1.1% under
+  assert.equal(tr.belowCost(230, { avgCost: 265, avgCostQty: 0 }), null);    // nothing held
+  assert.equal(tr.belowCost(230, { avgCost: null, avgCostQty: 3 }), null);   // no known cost
+  assert.equal(tr.belowCost(1, { avgCost: 265, avgCostQty: 12 }), null);     // $1 display listing
+  assert.equal(tr.belowCost(230, null), null);
+  assert.equal(tr.itemMarketLowFrom([{ price: 400 }, { price: 369, amount: 2 }, { price: 1 }, { price: "x" }]), 369);
+  assert.equal(tr.itemMarketLowFrom([]), null);
+  assert.equal(tr.itemMarketLowFrom(null), null);
 });
