@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.5
+// @version      0.8.6
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -266,6 +266,23 @@
     return null;
   }
 
+  /**
+   * 0.8.6 (WO-83): what to put in an EMPTY quantity box when a listing opens — as many as you
+   * can afford (all in stock if the money covers it) — and the line beside it. Null when the
+   * box already holds something (the player typed it; never overwrite), when the price or
+   * money can't be read, or when one is too dear (then `{ qty: 0, line: "can't afford one" }`
+   * so the caller can still say so).
+   */
+  function prefillQty(price, stock, money, current) {
+    if (current != null && String(current).trim() !== "") return null;
+    if (price == null || money == null) return null;
+    const p = Number(price); const m = Number(money);
+    if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(m) || m < 0) return null;
+    const qty = maxAffordable(p, stock, m);
+    if (qty < 1) return { qty: 0, line: "can't afford one" };
+    return { qty, line: `max · ${fmtMoney(qty * p)} total` };
+  }
+
   /** How many you can buy: all in stock, or as many as the money on hand covers. 0 if not one. */
   function maxAffordable(price, stock, money) {
     const p = Number(price); const st = Number(stock); const m = Number(money);
@@ -458,7 +475,8 @@
       return { kind: "hold", label: `HOLD ${onHand} · NOT SELLING`, title: [stuck, vsLine, resaleLine].filter(Boolean).join(" · "), resale, vs };
     }
     if (vs && vs.band === "far_above") {
-      return { kind: "target_high", label: `TARGET ${vs.label} OVER MARKET`, title: `${vsLine} · fix it on Overseer's Bazaar tab`, resale, vs };
+      // 0.8.6: short enough for a grid tile ("+20% over market"); the sentence lives in the tooltip.
+      return { kind: "target_high", label: `${vs.gapPct > 0 ? "+" : ""}${Math.round(vs.gapPct)}% over market`, title: `${vsLine} · fix it on Overseer's Bazaar tab`, resale, vs };
     }
     if (resale) return { kind: "resale", label: resaleLabel(resale), title: [resaleLine, vsLine].filter(Boolean).join(" · "), resale, vs };
     return null;
@@ -1122,6 +1140,7 @@
   .totr-vs--competitive{color:#5fe0a6;border-color:#2f6b52}.totr-vs--above{color:#f0c674;border-color:#7a6431}.totr-vs--far_above{color:#ff8a80;border-color:#7a3a35}
   .totr-dollar{font:800 13px system-ui,sans-serif;color:#f5c518;background:#0b0e13;border:1px solid #3a475b;border-radius:5px;width:26px;height:24px;cursor:pointer;padding:0}
   .totr-bz-profit{font-weight:700;color:#5fe0a6;white-space:nowrap}.totr-bz-profit--floor{color:#e2a6ef}.totr-bz-profit--loss{color:#ff8a8a}.totr-bz-paid{color:#c9d2de;white-space:nowrap}
+  .totr-maxline{display:block;font-size:11px;color:#9ca3af;margin-top:2px;white-space:nowrap}
   .totr-free{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.05em;white-space:nowrap}.totr-free--free{background:#10321f;color:#6fdc8c}.totr-free--unknown{background:#2a2f3a;color:#9ca3af}
   .totr-bz-state{font-weight:700;white-space:nowrap}.totr-bz-state--ok{color:#5fe0a6}.totr-bz-state--warn{color:#f0c674}.totr-bz-state--info{color:#8ab8ff}.totr-bz-state--low{color:#e2a6ef}
   .totr-hlink{font:700 12px Arial,sans-serif;letter-spacing:.06em;color:#ccc;background:transparent;border:0;padding:0 8px;cursor:pointer;text-decoration:none}
@@ -2300,9 +2319,24 @@
       }
       return rows;
     }
+    // 0.8.6 (WO-83): the same fill on the item market — a seller row's quantity box, when it
+    // opens empty, gets as many as you can afford of what that seller has. VERIFY the row and
+    // quantity selectors on live Torn (the box appears after the row's Buy is clicked).
+    function prefillSellerRows(a) {
+      for (const { row, price } of sellerRows(a)) {
+        const input = [...row.querySelectorAll("input")].find((x) => !x.closest("[data-totr-ui]") && x.type !== "hidden" && x.type !== "checkbox");
+        if (!input || input.dataset.totrPrefilled) continue;
+        input.dataset.totrPrefilled = "1";
+        const pre = prefillQty(price, parseStock(row.textContent), walletNow(), input.value);
+        if (!pre) continue;
+        if (pre.qty > 0) setNativeValue(input, pre.qty);
+        (input.parentElement || row).appendChild(el("span", { class: "totr-maxline", "data-totr-ui": "1" }, pre.line));
+      }
+    }
     function markSellerList() {
       const a = anchor();
       if (!a) return;
+      try { prefillSellerRows(a); } catch (err) { console.warn("[Overseer Trading] prefill", err); }
       const buy = current.data && current.data.buyPrice != null ? current.data.buyPrice : null;
       const old = a.querySelector(".totr-priceline");
       const rows = buy == null ? [] : sellerRows(a);
@@ -2451,6 +2485,18 @@
         }
         if (!input || !box) continue;
         const holder = box.closest("[data-testid='item']") || box;
+        // 0.8.6 (WO-83): the quantity box fills itself with as many as you can afford when the
+        // listing opens — once, only while empty; a number you type is never overwritten.
+        if (!input.dataset.totrPrefilled) {
+          input.dataset.totrPrefilled = "1";
+          const price = moneyIn(holder.querySelector("[data-testid='price']") || holder);
+          const pre = price ? prefillQty(price.value, parseStock(holder.textContent), walletNow(), input.value) : null;
+          if (pre) {
+            if (pre.qty > 0) setNativeValue(input, pre.qty);
+            const where = input.closest("label") || input.parentElement || box;
+            where.appendChild(el("span", { class: "totr-maxline", "data-totr-ui": "1", title: pre.qty > 0 ? "Filled with as many as you can afford (all in stock if your money covers it). Change it if you want fewer — you still press Buy." : "Not even one at this price with the money on hand." }, pre.line));
+          }
+        }
         if (holder.querySelector(".totr-max")) continue;
         // Something on the listing already fills the max (Torn's green "fill max", or another
         // script's): a second Max would only sit on top of it.
@@ -3537,7 +3583,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

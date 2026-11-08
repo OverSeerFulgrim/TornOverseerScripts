@@ -425,7 +425,7 @@ test("resaleVerdict (WO-80): a sell-list price far over the cheapest bazaar is n
   const market = { cheapest: 369, bazaarAverage: 380, listings: 12, capturedAt: "2026-11-07T22:40:00Z", weekCheapest: 372, yesterdayCheapest: 370 };
   const v = tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: 510, market, stock: null }, now);
   assert.equal(v.kind, "target_high");
-  assert.equal(v.label, "TARGET +38.2% OVER MARKET");
+  assert.equal(v.label, "+38% over market");
   assert.match(v.title, /sell-list price \$510/);
   assert.match(v.title, /Bazaar tab/);
   // Within 10% of the cheapest: the green resale stays.
@@ -528,6 +528,16 @@ test("minutesAgo reads like a person", () => {
 });
 
 // ---- 0.8.5 (WO-85): free stock on Manage rows ---------------------------------------------
+
+test("prefillQty (WO-83): fills an empty box with what you can afford, never a typed one", () => {
+  assert.deepEqual(tr.prefillQty(300, 4, 1_000_000, ""), { qty: 4, line: "max · $1,200 total" });
+  assert.deepEqual(tr.prefillQty(300, 4, 700, ""), { qty: 2, line: "max · $600 total" });
+  assert.deepEqual(tr.prefillQty(300, null, 700, ""), { qty: 2, line: "max · $600 total" });
+  assert.deepEqual(tr.prefillQty(22_000, 6, 5_000, ""), { qty: 0, line: "can't afford one" });
+  assert.equal(tr.prefillQty(300, 4, 1_000_000, "1"), null);
+  assert.equal(tr.prefillQty(300, 4, null, ""), null);
+  assert.equal(tr.prefillQty(null, 4, 1_000, ""), null);
+});
 
 test("freeLabel: all-free stock says FREE and names the source; mixed says how many; a gift is unknown", () => {
   assert.deepEqual(tr.freeLabel({ freeUnits: 81, unknownUnits: 0, paidUnits: 0, freeWords: ["loot"] }).text, "FREE · LOOT");
