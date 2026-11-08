@@ -79,6 +79,26 @@ test("opening the panel lists the deals and clears the count", async () => {
   assert.equal(doc.getElementById("totr-fab"), null);
 });
 
+test("the panel's ↻ asks the server again right away, inside the poll window (0.8.4)", async () => {
+  const { doc, calls } = page();
+  await tick();
+  doc.querySelector("#totr-eye button").click();
+  await tick();
+  const before = calls.filter((c) => c.includes('"action":"deals"')).length;
+  assert.equal(before, 1, "opening inside the poll window does not re-ask");
+  const btn = doc.querySelector("#totr-sheet .totr-sheet-refresh");
+  assert.ok(btn, "refresh button in the panel header");
+  assert.equal(btn.getAttribute("aria-label"), "Check now");
+  btn.click();
+  // Re-rendered while busy: the button is disabled and says so.
+  const spinning = doc.querySelector("#totr-sheet .totr-sheet-refresh");
+  assert.ok(spinning.hasAttribute("disabled"));
+  await tick();
+  assert.equal(calls.filter((c) => c.includes('"action":"deals"')).length, before + 1);
+  assert.ok(!doc.querySelector("#totr-sheet .totr-sheet-refresh").hasAttribute("disabled"));
+  assert.match(doc.querySelector("#totr-sheet .totr-sheet-foot").textContent, /Checked/);
+});
+
 test("a non-subscriber gets only the eye, opening a locked panel", async () => {
   const { doc, calls } = page({ status: 402, body: { error: "Trading needs a subscription." } });
   await tick();
@@ -91,6 +111,7 @@ test("a non-subscriber gets only the eye, opening a locked panel", async () => {
   const sheet = doc.getElementById("totr-sheet");
   assert.match(sheet.textContent, /Why it's separate from your faction/);
   assert.match(sheet.textContent, /Get Trading/);
+  assert.equal(sheet.querySelector(".totr-sheet-refresh"), null, "no refresh on the locked panel");
 });
 
 test("a page load inside the poll window reuses the cached deals", async () => {

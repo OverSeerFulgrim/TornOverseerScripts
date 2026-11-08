@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.3
+// @version      0.8.4
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -1183,6 +1183,10 @@
   .totr-sheet-head img{width:20px;height:20px}
   .totr-sheet-title{font-weight:800;letter-spacing:.04em;flex:1}
   .totr-sheet-x{width:40px;height:36px;border:0;background:transparent;color:#9aa7b8;font:700 16px system-ui,sans-serif;cursor:pointer}
+  .totr-sheet-refresh{width:36px;height:36px;border:0;background:transparent;color:#9aa7b8;font:700 18px system-ui,sans-serif;cursor:pointer;line-height:1}
+  .totr-sheet-refresh:hover,.totr-sheet-x:hover{color:#e6ebf2}
+  .totr-sheet-refresh[disabled]{cursor:default;color:#5f6b7c;animation:totr-spin 1s linear infinite}
+  @keyframes totr-spin{to{transform:rotate(360deg)}}
   .totr-sheet-tabs{display:grid;grid-template-columns:1fr 1fr;margin:10px 12px 0;border:1px solid #2f3b4d;border-radius:9px;overflow:hidden}
   .totr-sheet-tab{min-height:38px;border:0;background:#11161f;color:#9aa7b8;font:600 13px system-ui,sans-serif;cursor:pointer}
   .totr-sheet-tab--on{background:#e23b3b;color:#fff}
@@ -3241,6 +3245,7 @@
       if (s.locked && !force && now - (s.at || 0) < LOCKED_RECHECK_MS) return;
       if (!s.locked && !force && now - (s.at || 0) < DEALS_POLL_MS) return;
       busy = true;
+      if (open) render(); // the header's ↻ spins while we ask
       try {
         const res = await callTrader("deals");
         s.locked = false;
@@ -3346,6 +3351,12 @@
     }
 
     // ---- the panel ------------------------------------------------------------------------
+    /** The header's ↻: re-ask the server and the item market now, whatever the poll timer says. */
+    function refresh() {
+      if (busy) return;
+      return poll(true);
+    }
+
     function toggle(want) {
       open = want == null ? !open : want;
       if (open) {
@@ -3397,6 +3408,7 @@
       const head = el("div", { class: "totr-sheet-head" },
         el("img", { src: EYE_SRC, alt: "" }),
         el("span", { class: "totr-sheet-title" }, "OVERSEER TRADING"),
+        s.locked ? null : el("button", { type: "button", class: "totr-sheet-refresh", "aria-label": busy ? "Checking…" : "Check now", title: busy ? "Checking…" : "Check now", disabled: busy ? "disabled" : null, onclick: () => refresh() }, "↻"),
         el("button", { type: "button", class: "totr-sheet-x", "aria-label": "Close", onclick: () => toggle(false) }, "✕"));
       const body = el("div", { class: "totr-sheet-body" });
       const parts = [head];
