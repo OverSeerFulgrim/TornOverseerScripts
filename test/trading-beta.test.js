@@ -663,3 +663,29 @@ test("bazaarWorth (0.8.11): listed × stock, paid and profit when the ledger kno
   assert.equal(tr.bazaarWorth([]), null);
   assert.equal(tr.bazaarWorth(null), null);
 });
+
+test("pickMarketChecks re-checks the items showing a deal first, then rotates (0.8.12)", () => {
+  const w = Array.from({ length: 10 }, (_, i) => ({ itemId: i + 1 }));
+  // Item 9 shows a deal read 20 min ago, item 7 one read 10 min ago; 3 had none.
+  const market = { 9: { at: 1_000, deal: { itemId: 9 } }, 7: { at: 2_000, deal: { itemId: 7 } }, 3: { at: 500, deal: null } };
+  assert.deepEqual(tr.pickMarketChecks(w, 0, 4, market).map((x) => x.itemId), [9, 7, 1, 2]);
+  // No duplicates when the rotation reaches a deal item.
+  assert.deepEqual(tr.pickMarketChecks(w, 2, 4, market).map((x) => x.itemId), [9, 7, 10, 1]);
+  // More deals than slots: oldest reads win.
+  const busy = { 1: { at: 50, deal: {} }, 2: { at: 40, deal: {} }, 3: { at: 30, deal: {} }, 4: { at: 20, deal: {} }, 5: { at: 10, deal: {} } };
+  assert.deepEqual(tr.pickMarketChecks(w, 0, 4, busy).map((x) => x.itemId), [5, 4, 3, 2]);
+  // Old signature unchanged.
+  assert.deepEqual(tr.pickMarketChecks(w, 1, 2).map((x) => x.itemId), [3, 4]);
+});
+
+test("liveMarketDeals hides item-market deals older than 15 minutes (0.8.12)", () => {
+  const now = 10_000_000;
+  const market = {
+    1: { at: now - 14 * 60_000, deal: { itemId: 1 } },
+    2: { at: now - 16 * 60_000, deal: { itemId: 2 } }, // the stale Resupply Box
+    3: { at: now, deal: null },
+  };
+  assert.deepEqual(tr.liveMarketDeals(market, now).map((d) => d.itemId), [1]);
+  assert.deepEqual(tr.liveMarketDeals(market, now, 20 * 60_000).map((d) => d.itemId), [1, 2]);
+  assert.deepEqual(tr.liveMarketDeals(undefined, now), []);
+});

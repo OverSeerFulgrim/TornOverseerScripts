@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.11
+// @version      0.8.12
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -880,6 +880,13 @@
   const DEALS_POLL_MS = 5 * 60_000;
   /** Item-market reads per poll, with the player's own key (~1 Torn call a minute). */
   const MARKET_CHECKS_PER_POLL = 4;
+  /**
+   * 0.8.12: an item-market deal older than this is not shown. The rotation reads
+   * 4 buy-list items per 5-minute poll, so with ~100 items a sold-out listing
+   * stayed on the Deals panel for up to two hours (blazebugg's Resupply Box,
+   * 2026-11-08). Shown deals are now re-checked first; this is the backstop.
+   */
+  const MARKET_DEAL_MAX_AGE_MS = 15 * 60_000;
   /** A non-subscriber is asked again this often (subscribing unlocks without a reinstall). */
   const LOCKED_RECHECK_MS = 6 * 3600_000;
 
@@ -928,14 +935,40 @@
     return out.sort((a, b) => b.underPct - a.underPct || a.itemId - b.itemId);
   }
 
-  /** Which watched items get an item-market read this poll (a rotation over the list). */
-  function pickMarketChecks(watched, slot, n) {
+  /**
+   * Which watched items get an item-market read this poll. 0.8.12: items whose
+   * last read found a deal go FIRST (oldest read first), so a deal on the panel is
+   * re-confirmed every poll; the rest of the slots continue the rotation.
+   */
+  function pickMarketChecks(watched, slot, n, market) {
     const list = watched || [];
     if (list.length <= n) return list.slice();
-    const start = ((Math.floor(slot) * n) % list.length + list.length) % list.length;
     const out = [];
-    for (let k = 0; k < n; k++) out.push(list[(start + k) % list.length]);
+    const taken = new Set();
+    const showing = list
+      .filter((w) => market && market[w.itemId] && market[w.itemId].deal)
+      .sort((a, b) => (market[a.itemId].at || 0) - (market[b.itemId].at || 0));
+    for (const w of showing) {
+      if (out.length >= n) break;
+      out.push(w);
+      taken.add(w.itemId);
+    }
+    const start = ((Math.floor(slot) * n) % list.length + list.length) % list.length;
+    for (let k = 0; k < list.length && out.length < n; k++) {
+      const w = list[(start + k) % list.length];
+      if (taken.has(w.itemId)) continue;
+      out.push(w);
+      taken.add(w.itemId);
+    }
     return out;
+  }
+
+  /** 0.8.12: item-market deals read within MARKET_DEAL_MAX_AGE_MS — older ones may have sold. */
+  function liveMarketDeals(market, nowMs, maxAgeMs) {
+    const limit = maxAgeMs == null ? MARKET_DEAL_MAX_AGE_MS : maxAgeMs;
+    return Object.values(market || {})
+      .filter((m) => m && m.deal && Number.isFinite(m.at) && nowMs - m.at <= limit)
+      .map((m) => m.deal);
   }
 
   function minutesAgo(iso, now) {
@@ -3532,8 +3565,7 @@
 
     function deals() {
       const s = load();
-      const market = Object.values(s.market || {}).map((m) => m && m.deal).filter(Boolean);
-      return mergeDeals(s.deals, market, s.watched);
+      return mergeDeals(s.deals, liveMarketDeals(s.market, Date.now()), s.watched);
     }
     function unseen() { return unseenDeals(deals(), load().seen); }
 
@@ -3556,7 +3588,7 @@
         // Item market, with the player's own key: a few watched items per poll, in rotation.
         const key = prefs().tornKey;
         if (key) {
-          const pick = pickMarketChecks(s.watched, Math.floor(now / DEALS_POLL_MS), MARKET_CHECKS_PER_POLL);
+          const pick = pickMarketChecks(s.watched, Math.floor(now / DEALS_POLL_MS), MARKET_CHECKS_PER_POLL, s.market);
           for (const item of pick) {
             try {
               const r = await requestJson(`https://api.torn.com/v2/market/${item.itemId}/itemmarket?offset=0&comment=overseer&key=${encodeURIComponent(key)}`);
@@ -3814,7 +3846,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
