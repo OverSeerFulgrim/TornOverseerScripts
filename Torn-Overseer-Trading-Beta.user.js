@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.10
+// @version      0.8.11
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -512,6 +512,33 @@
       title: `You hold ${qty.toLocaleString("en-US")} at an average ${fmtMoney(avg)}; this is ${pct.toFixed(1)}% under it. Buying another ${qty.toLocaleString("en-US")} here would bring your average down to ${fmtMoney(after)}.`,
       avg, after, pct,
     };
+  }
+
+  /**
+   * 0.8.11: what the bazaar on screen adds up to. `items` = [{ listed, held, costEach, sellAt }] per
+   * Manage row (listed = the price typed, null when empty or $1). Returns { listed, paid, atTargets,
+   * profit, unpriced, items } with sums over rows that carry each number, or null with no rows. Pure.
+   */
+  function bazaarWorth(items) {
+    const out = { listed: 0, paid: 0, atTargets: 0, profit: 0, unpriced: 0, items: 0 };
+    let anyCost = false;
+    for (const it of Array.isArray(items) ? items : []) {
+      const held = Number(it && it.held) > 0 ? Number(it.held) : 1;
+      const listed = Number(it && it.listed);
+      const cost = Number(it && it.costEach);
+      const target = Number(it && it.sellAt);
+      out.items += 1;
+      if (Number.isFinite(listed) && listed > 1) out.listed += listed * held; else out.unpriced += 1;
+      if (Number.isFinite(target) && target > 0) out.atTargets += target * held;
+      if (Number.isFinite(cost) && cost > 0) {
+        anyCost = true;
+        out.paid += cost * held;
+        if (Number.isFinite(listed) && listed > 1) out.profit += (listed - cost) * held;
+      }
+    }
+    if (!out.items) return null;
+    if (!anyCost) { out.paid = null; out.profit = null; }
+    return out;
   }
 
   /** 0.8.8: the lowest asking price in a Torn item-market `listings` array (ignores $1 and junk). */
@@ -2048,6 +2075,24 @@
       node.classList.toggle("totr-hlink--warn", a.stale);
       if (!ageTimer && IS_BROWSER) ageTimer = setInterval(updateAge, 30_000);
     }
+    /** 0.8.11: the Manage header's WORTH figure — listed prices × stock, with paid and profit when known. */
+    function updateWorth(list) {
+      const node = document.getElementById("totr-hworth");
+      if (!node) return;
+      const w = bazaarWorth(list.filter(shownRow).map((r) => {
+        const s = sell.get(r.itemId);
+        return { listed: listedPrice(r.price), held: r.held, costEach: s ? s.costEach : null, sellAt: s ? s.sellAt : null };
+      }));
+      if (!w || !w.listed) { node.hidden = true; return; }
+      node.hidden = false;
+      const k = (n) => fmtMoney(Math.round(n));
+      const text = `WORTH ${k(w.listed)}`;
+      if (node.textContent !== text) node.textContent = text;
+      const lines = [`${w.items} listing${w.items === 1 ? "" : "s"} at the prices typed: ${k(w.listed)}${w.unpriced ? ` (${w.unpriced} without a price)` : ""}`];
+      if (w.atTargets) lines.push(`At your sell-list targets: ${k(w.atTargets)}`);
+      if (w.paid != null) lines.push(`You paid ${k(w.paid)} for this stock (ledger) · ${w.profit >= 0 ? "+" : "−"}${k(Math.abs(w.profit))} if it all sells at the prices typed`);
+      node.title = lines.join("\n");
+    }
     function reloadTargets() {
       sell.clear();
       fresh.loadedAt = null;
@@ -2071,6 +2116,8 @@
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
       links.push(el("a", { class: "totr-hlink", href: `${SITE_URL}/trading/bazaar`, target: "_blank", rel: "noopener" }, "SETTINGS"));
       links.unshift(el("button", { type: "button", id: "totr-hage", class: "totr-hlink totr-hage", onclick: reloadTargets }));
+      // 0.8.11: "WORTH $1.2m" — what the bazaar adds up to at the prices typed (filled in by updateWorth).
+      if (manage) links.unshift(el("span", { id: "totr-hworth", class: "totr-hlink totr-hage", "data-totr-ui": "1" }));
       box = el("span", { id: "totr-hlinks", "data-totr-ui": "1", "data-sig": sig }, ...links);
       const header = headerEl();
       if (header) { header.style.display = "flex"; header.style.alignItems = "center"; box.style.marginLeft = "auto"; header.append(box); }
@@ -2179,6 +2226,7 @@
       if (await load(list)) document.getElementById("totr-bzline")?.remove();
       list.forEach(decorate);
       headerLinks(list);
+      updateWorth(list);
       updateAge();
       statusLine(list);
       if (!lastError) scheduleStock();
@@ -3766,7 +3814,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

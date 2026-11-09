@@ -643,3 +643,23 @@ test("belowCost / itemMarketLowFrom (WO-89)", () => {
   assert.equal(tr.itemMarketLowFrom([]), null);
   assert.equal(tr.itemMarketLowFrom(null), null);
 });
+
+test("bazaarWorth (0.8.11): listed × stock, paid and profit when the ledger knows the cost", () => {
+  const w = tr.bazaarWorth([
+    { listed: 84_999, held: 1, costEach: 68_555, sellAt: 84_998 },
+    { listed: 36_968, held: 12, costEach: 33_500, sellAt: 36_968 },
+    { listed: null, held: 2, costEach: 100, sellAt: 2_730 },       // no price typed
+    { listed: 1, held: 1, costEach: null, sellAt: null },           // Torn's $1 placeholder
+  ]);
+  assert.equal(w.items, 4);
+  assert.equal(w.listed, 84_999 + 36_968 * 12);
+  assert.equal(w.unpriced, 2);
+  assert.equal(w.paid, 68_555 + 33_500 * 12 + 200);
+  assert.equal(w.profit, (84_999 - 68_555) + (36_968 - 33_500) * 12);
+  assert.equal(w.atTargets, 84_998 + 36_968 * 12 + 2_730 * 2);
+  // No cost anywhere → paid/profit unknown, not zero.
+  const nc = tr.bazaarWorth([{ listed: 500, held: 3, costEach: null, sellAt: null }]);
+  assert.equal(nc.listed, 1500); assert.equal(nc.paid, null); assert.equal(nc.profit, null);
+  assert.equal(tr.bazaarWorth([]), null);
+  assert.equal(tr.bazaarWorth(null), null);
+});
