@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.16
+// @version      0.8.17
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -26,12 +26,12 @@
 // @updateURL https://update.greasyfork.org/scripts/599500/Torn%20Overseer%20Trading%20%28beta%29.meta.js
 // ==/UserScript==
 
-// DRAFT (WO-29 TS-2 skeleton, written 2026-10-04 before TS-1 exists).
-// Shape = the merged "Torn Overseer" script: a small core (storage, sign-in, requests, router,
-// panel helpers) plus page modules. When the beta graduates (TS-6) the `modules.*` blocks move
-// into the Chain Watch script unchanged and this file is retired.
+// Torn Overseer Trading — the trading module of Torn Overseer (WO-29), published on Greasy Fork
+// and bundled in the Torn Overseer browser extension. A small core (storage, sign-in, requests,
+// router, panel helpers) plus page modules; the planned merge moves the `modules.*` blocks into
+// the Chain Watch script unchanged and retires this file.
 //
-// Ground rules (plan §5):
+// Ground rules:
 //  - One click = one action. The script fills inputs; the player presses Torn's own
 //    Change / Accept / Buy / Confirm. Nothing is submitted on page load.
 //  - Never hides Torn's own warnings.
@@ -39,8 +39,10 @@
 //  - The Torn key lives in GM storage only (same rule as Chain Watch); the site keeps no copy
 //    (connect-torn-key persist:false). PDA's injected key is used, never saved.
 //
-// Selectors marked VERIFY come from the five scripts this replaces and must be checked against
-// Fulgrim's screenshots of the live pages before TS-2 ships (Claude does not test on torn.com).
+// Selectors marked VERIFY have not yet been confirmed against the live page; each mark says
+// what to look for. They are checked by hand on torn.com (Claude does not test on torn.com),
+// and the mark comes out once one is confirmed — the list is in torn-overseer-v2's
+// docs/improvement-review-fixes-plan.md (WO-94 #17).
 
 (function () {
   "use strict";
@@ -4165,10 +4167,16 @@
     window.addEventListener("hashchange", schedule);
     // Our own UI and Chain Watch's panel (which redraws every second) never wake a re-scan.
     const ours = (node) => node && node.closest && node.closest(".totr, [data-totr-ui], #tocw, [id^='tocw-']");
-    new MutationObserver((records) => {
-      if (records.every((r) => ours(r.target))) return;
-      schedule();
-    }).observe(document.body, { childList: true, subtree: true });
+    // 0.8.17 (WO-94 #16): the page-wide watcher only on the trading pages. Elsewhere the
+    // script is only there for the deal alerts, whose eye already has its own 2-second check
+    // (alerts.start), so watching every node on every Torn page bought nothing but work —
+    // on pages whose timers tick every second it re-ran the router about once a second.
+    if (isTradingPage(location)) {
+      new MutationObserver((records) => {
+        if (records.every((r) => ours(r.target))) return;
+        schedule();
+      }).observe(document.body, { childList: true, subtree: true });
+    }
     run();
   }
 
