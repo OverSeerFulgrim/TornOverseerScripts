@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.12
+// @version      0.8.14
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -70,15 +70,19 @@
     sessionToken: "totr_session_token",
     fillPct: "totr_fill_pct",
     dealPct: "totr_deal_pct",
+    dealMin: "totr_deal_min",
     ignored: "totr_ignored",
     collapsed: "totr_collapsed",
     stockSentAt: "totr_stock_sent_at",
     sellMode: "totr_sell_mode",
+    stripHeight: "totr_strip_height",
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
   const DEFAULT_FILL_PCT = 0;
   const DEFAULT_DEAL_PCT = 90;
+  /** 0.8.13: the Deals panel's "at least X% under your price" choices. 0 = every deal (default). */
+  const DEAL_MIN_OPTIONS = [0, 5, 10, 20];
   const MAX_FILL_PCT = 100;
   /** Fill can go under market value, but not absurdly: a fat-fingered -95 would give stock away. */
   const MIN_FILL_PCT = -50;
@@ -925,6 +929,89 @@
     };
   }
 
+  /** 0.8.14 (WO-93 B): bazaars the strip asks for, and how many it shows before "+N more". */
+  const STRIP_ASK = 20;
+  const STRIP_SHOW = 5;
+
+  /**
+   * 0.8.14 (WO-93 B): which strip cards show. Five by default; all of them once the player
+   * opened "+N more". `hidden` is what the button offers.
+   */
+  function stripCards(list, showAll) {
+    const all = Array.isArray(list) ? list : [];
+    if (showAll || all.length <= STRIP_SHOW) return { shown: all, hidden: 0 };
+    return { shown: all.slice(0, STRIP_SHOW), hidden: all.length - STRIP_SHOW };
+  }
+
+  /** 0.8.14: the strip header's count — "5 cheapest bazaars", or "cheapest bazaars 5 of 20". */
+  function stripCountLabel(shown, total) {
+    return total > shown ? `· cheapest bazaars ${shown} of ${total}` : `· ${total} cheapest bazaar${total === 1 ? "" : "s"}`;
+  }
+
+  /**
+   * 0.8.14 (WO-93 C): what an item is FOR, from Overseer (Torn's item type + effect text).
+   * Fulgrim sold all his Jemmys and needed one for Burglary — OC and crime items keep one back.
+   */
+  const ITEM_USES = ["oc", "crime", "use", "gear", "set", "none"];
+  const USE_LABEL = { oc: "Used in OC", crime: "Crime tool", use: "Use it", gear: "Gear", set: "Set / museum", none: "No use" };
+  const USE_HINT = {
+    oc: "Torn lists this item for an organized crime role — keep one.",
+    crime: "Torn's item text names a crime this helps or unlocks (Burglary, Larceny …) — keep one.",
+    use: "Something you use up: drugs, boosters, medical, energy drinks, candy, alcohol, books.",
+    gear: "Weapons, armor and clothing.",
+    set: "Plushies, flowers and artifacts — sets and the museum.",
+    none: "Torn gives this item no use: safe to sell anywhere.",
+  };
+  function usesOf(value) {
+    if (!Array.isArray(value)) return [];
+    return ITEM_USES.filter((u) => value.includes(u));
+  }
+  function keepsOne(uses) { return usesOf(uses).some((u) => u === "oc" || u === "crime"); }
+  /** How many of `held` the Add page may list: one fewer for OC / crime items. */
+  function keepQty(held, uses) {
+    const n = Number.isFinite(held) && held > 0 ? Math.floor(held) : 0;
+    return keepsOne(uses) ? Math.max(0, n - 1) : n;
+  }
+  /** Does a row pass the Show filter? `null` = All; rows without data always pass. */
+  function matchesUse(uses, filter) { return filter == null || uses == null || usesOf(uses).includes(filter); }
+
+  /** 0.8.14 (WO-93 A): a remembered strip height worth reserving (px), else null. */
+  function stripMinHeight(value) {
+    const n = Math.round(Number(value));
+    return Number.isFinite(n) && n >= 60 && n <= 600 ? n : null;
+  }
+
+  /** 0.8.13: a saved minimum discount, or 0 (every deal) when it isn't one of the choices. */
+  function dealMinOf(value) {
+    const n = Number(value);
+    return DEAL_MIN_OPTIONS.includes(n) ? n : 0;
+  }
+
+  /**
+   * 0.8.13: players read the Deals badge as "% under market value" and asked why a 0.3% deal
+   * showed. A deal is anything at or under YOUR price; this lets them ask for a bigger gap.
+   * Hidden deals are counted, never silently lost.
+   */
+  function splitDealsByMin(deals, minPct) {
+    const min = dealMinOf(minPct);
+    const shown = [];
+    const hidden = [];
+    for (const d of deals || []) {
+      if (!d) continue;
+      if (min <= 0 || (Number(d.underPct) || 0) >= min) shown.push(d);
+      else hidden.push(d);
+    }
+    return { shown, hidden };
+  }
+
+  /** 0.8.13: the Deals badge says what the % is measured against. */
+  function dealBadge(underPct) {
+    const pct = Number(underPct) || 0;
+    if (pct <= 0) return "at your price";
+    const shown = pct >= 10 ? Math.round(pct) : Math.round(pct * 10) / 10;
+    return `${shown}% under your price`;
+  }
+
   /** Server bazaar deals + the script's own item-market deals, biggest discount first. */
   function mergeDeals(bazaarDeals, marketDeals, watched) {
     const onList = new Set((watched || []).map((w) => w.itemId));
@@ -1089,6 +1176,7 @@
       sessionToken: String(gmGet(STORE.sessionToken, "") || "").trim() || readPdaSession(tornKey),
       fillPct: clampPct(gmGet(STORE.fillPct, DEFAULT_FILL_PCT), DEFAULT_FILL_PCT, MAX_FILL_PCT, MIN_FILL_PCT),
       dealPct: clampPct(gmGet(STORE.dealPct, DEFAULT_DEAL_PCT), DEFAULT_DEAL_PCT, 100),
+      dealMin: dealMinOf(gmGet(STORE.dealMin, 0)),
       ignored: new Set((gmGet(STORE.ignored, []) || []).map(Number).filter(Number.isSafeInteger)),
       sellMode: sellModeOf(gmGet(STORE.sellMode, null)),
     };
@@ -1291,6 +1379,9 @@
   .totr-card{display:flex;flex-direction:column;align-items:flex-start;gap:4px;padding:6px 10px;border-radius:7px;background:#161d28;border:1px solid #232c3a;color:#e6ebf2;text-decoration:none;font-size:13px}
   .totr-card-line{display:flex;gap:6px;align-items:baseline;white-space:nowrap}
   .totr-card-name{color:#9fc3ff;max-width:120px;overflow:hidden;text-overflow:ellipsis}
+  .totr-card--skel{width:128px;height:46px;box-sizing:border-box;background:#141a24;border-color:#1e2633;justify-content:center}
+  .totr-skel-bar{display:block;height:9px;border-radius:4px;background:#222b39}
+  .totr-mini--more{align-self:stretch;height:auto;min-height:24px;border-color:#4c8dff;color:#cfe0ff;margin-left:0}
   .totr-card--under{border-color:#4c8dff;box-shadow:inset 0 0 0 1px #4c8dff}
   .totr-chip--buy{background:#16263f;color:#cfe0ff;box-shadow:0 0 0 1px #4c8dff}
   .totr-mode{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
@@ -1309,6 +1400,11 @@
   .totr-dollar{font:800 13px system-ui,sans-serif;color:#f5c518;background:#0b0e13;border:1px solid #3a475b;border-radius:5px;width:26px;height:24px;cursor:pointer;padding:0}
   .totr-bz-profit{font-weight:700;color:#5fe0a6;white-space:nowrap}.totr-bz-profit--floor{color:#e2a6ef}.totr-bz-profit--loss{color:#ff8a8a}.totr-bz-paid{color:#c9d2de;white-space:nowrap}
   .totr-maxline{display:block;font-size:11px;color:#9ca3af;margin-top:2px;white-space:nowrap}
+  .totr-use{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;white-space:nowrap;background:#262b33;color:#c9d1dc}.totr-use--oc{background:#2a1430;color:#f0a6ff}.totr-use--crime{background:#3a2a0f;color:#f0c674}.totr-use--use{background:#0f3324;color:#5fe0a6}.totr-use--gear{background:#16263f;color:#cfe0ff}.totr-use--set{background:#1d2a2a;color:#8fe3e3}
+  .totr-keep{font-size:11px;font-weight:700;color:#f0c674;white-space:nowrap}
+  .totr-usebar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;font:12px system-ui,sans-serif;color:#9aa7b8}
+  .totr-usebar button{font:700 11px system-ui,sans-serif;border-radius:12px;padding:3px 9px;background:#161d28;border:1px solid #3a475b;color:#c9d1dc;cursor:pointer}
+  .totr-usebar button[aria-pressed="true"]{background:#16263f;border-color:#4c8dff;color:#cfe0ff}
   .totr-free{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.05em;white-space:nowrap}.totr-free--free{background:#10321f;color:#6fdc8c}.totr-free--unknown{background:#2a2f3a;color:#9ca3af}
   .totr-bz-state{font-weight:700;white-space:nowrap}.totr-bz-state--ok{color:#5fe0a6}.totr-bz-state--warn{color:#f0c674}.totr-bz-state--info{color:#8ab8ff}.totr-bz-state--low{color:#e2a6ef}
   .totr-hlink{font:700 12px Arial,sans-serif;letter-spacing:.06em;color:#ccc;background:transparent;border:0;padding:0 8px;cursor:pointer;text-decoration:none}
@@ -1400,6 +1496,12 @@
   .totr-deal-card{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #232c3a;background:#161d28;border-radius:10px}
   .totr-deal-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
   .totr-deal-pct{font:700 11px system-ui,sans-serif;color:#06210f;background:#3ecf8e;border-radius:4px;padding:0 5px;margin-left:6px}
+  .totr-min{display:flex;flex-direction:column;gap:6px}
+  .totr-min-row{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+  .totr-min-btn{min-height:36px;border:1px solid #2f3b4d;border-radius:8px;background:#11161f;color:#c3ccd8;font:600 13px system-ui,sans-serif;cursor:pointer}
+  .totr-min-btn--on{border-color:#3ecf8e;background:#123224;color:#7ee2b4;font-weight:700}
+  .totr-min-hidden{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;border:1px dashed #2f3b4d;border-radius:10px;color:#9aa7b8;font-size:12px}
+  .totr-min-empty{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;padding:14px 4px}
   .totr-deal-open{min-height:40px;padding:0 14px;border-radius:8px;background:#e23b3b;color:#fff !important;text-decoration:none;font-weight:700;display:inline-flex;align-items:center}
   .totr-sheet-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px 12px;border-top:1px solid #232c3a;background:#11161f;color:#9aa7b8;font-size:12px}
   .totr-sheet-foot a,.totr-sheet-body a.totr-link{color:#8ab8ff;font-weight:600}
@@ -1859,6 +1961,7 @@
     let lastError = null;
     let popup = null;
     const fresh = { loadedAt: null, refsAt: null }; // 0.7.11: target freshness (see targetsAge)
+    let useFilter = null; // 0.8.14 (WO-93 C): the Show chips — this visit only, never a setting
     let ageTimer = null;
 
     function rowOf(input) {
@@ -1965,13 +2068,17 @@
       return { text: `${d > 0 ? "+" : ""}${d}%`, cls: d < 0 ? "info" : "warn", off: true };
     }
 
-    function fillRow(r, price) {
+    /** 0.8.14 (WO-93 C): what Add may list — one fewer for OC / crime items, unless `all`. */
+    function listQty(r, all) { return all ? r.held : keepQty(r.held, sell.get(r.itemId) && sell.get(r.itemId).uses); }
+    function fillRow(r, price, all) {
       const s = sell.get(r.itemId);
       const p = price != null ? price : s && s.sellAt;
       if (p == null) return;
+      // 0.8.14: never list your last OC / crime item unless asked ("List anyway").
+      if (!isManage() && !listQty(r, all)) { refresh(r); return; }
       // Quantity first: Torn redraws a row when its qty changes and can drop a price typed
       // just before. Then check once more a moment later and put the price back if it was lost.
-      if (r.qty && !isManage() && !r.qty.value) setNativeValue(r.qty, r.held);
+      if (r.qty && !isManage() && (all || !r.qty.value)) setNativeValue(r.qty, listQty(r, all));
       if (setNativeValue(r.price, p)) noteFill(r.itemId, p, "bazaar");
       setTimeout(() => {
         if (r.price.isConnected && listedPrice(r.price) !== Math.round(p)) setNativeValue(r.price, p);
@@ -1990,7 +2097,10 @@
       refresh(r);
     }
     // FILL QTY is an explicit ask: set every row to all you hold, even over a 1 already typed.
-    function fillQty(r) { if (r.qty && !isManage() && String(r.qty.value) !== String(r.held)) setNativeValue(r.qty, r.held); }
+    function fillQty(r) {
+      const n = listQty(r, false);
+      if (r.qty && !isManage() && n && String(r.qty.value) !== String(n)) setNativeValue(r.qty, n);
+    }
 
     function decorate(r) {
       if (!r.itemId) return;
@@ -2020,6 +2130,13 @@
       // at $1 without losing money. Nothing is priced for you; the pill only says so.
       const free = isManage() ? freeLabel(s && s.stock) : null;
       if (free) box.append(el("span", { class: `totr-free totr-free--${free.kind}`, title: free.title }, free.text));
+      // 0.8.14 (WO-93 C): what the item is for, and Keep 1 on OC / crime items (Add page).
+      for (const u of usesOf(s && s.uses)) box.append(el("span", { class: `totr-use totr-use--${u}`, title: USE_HINT[u] }, USE_LABEL[u]));
+      if (!isManage() && s && keepsOne(s.uses)) {
+        const left = keepQty(r.held, s.uses);
+        box.append(el("span", { class: "totr-keep", title: "Fill and FILL QTY leave one of this in your inventory: an OC role or a crime needs it." }, left ? `Keep 1 · lists ${left}` : "Keep 1 · not listed"));
+        box.append(el("button", { class: "totr-mini", type: "button", title: "List every one, including the last", onclick: () => fillRow(r, null, true) }, "List anyway"));
+      }
       // 0.7.14 (WO-64): your bazaar vs the best trader vs the item market, on Overseer.
       if (isManage() && r.itemId) box.append(el("a", { class: "totr-linkbtn", href: itemPageUrl(r.itemId, "sell"), target: "_blank", rel: "noopener", title: "Compare your bazaar, the best trader and the item market for this item" }, "Compare"));
       // 0.7.12: a loss reads red (it used to stay green with only a minus sign).
@@ -2144,7 +2261,7 @@
       if (box) box.remove();
       const links = manage
         ? [el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, onclick: () => off.filter(shownRow).forEach((r) => fillRow(r)) }, off.length ? `FIX ${off.length} OFF TARGET` : "ALL ON TARGET")]
-        : [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", onclick: () => rows().filter(shownRow).forEach((r) => { if (!listedPrice(r.price)) fillRow(r); else if (r.qty && !r.qty.value) setNativeValue(r.qty, r.held); }) }, "FILL ALL"),
+        : [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", onclick: () => rows().filter(shownRow).forEach((r) => { if (!listedPrice(r.price)) fillRow(r); else if (r.qty && !r.qty.value && listQty(r, false)) setNativeValue(r.qty, listQty(r, false)); }) }, "FILL ALL"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--qty", onclick: () => rows().filter(shownRow).forEach(fillQty) }, "FILL QTY"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
       links.push(el("a", { class: "totr-hlink", href: `${SITE_URL}/trading/bazaar`, target: "_blank", rel: "noopener" }, "SETTINGS"));
@@ -2159,6 +2276,37 @@
         const anchor = parent && (parent.closest("table") || parent);
         if (anchor) anchor.insertAdjacentElement("beforebegin", el("div", { class: "totr-bar totr", "data-totr-ui": "1" }, el("strong", null, "Overseer"), box));
       }
+    }
+    /** 0.8.14 (WO-93 C): hide rows that don't match the Show chip (FILL ALL then skips them too). */
+    function applyUseFilter(list) {
+      for (const r of list) {
+        const s = sell.get(r.itemId);
+        const hide = !matchesUse(s ? s.uses : null, useFilter);
+        if (hide && r.row.dataset.totrUseHidden !== "1") { r.row.dataset.totrUseHidden = "1"; r.row.style.display = "none"; }
+        else if (!hide && r.row.dataset.totrUseHidden === "1") { delete r.row.dataset.totrUseHidden; r.row.style.display = ""; }
+      }
+    }
+    function useBar(list) {
+      const counts = Object.fromEntries(ITEM_USES.map((u) => [u, 0]));
+      let any = false;
+      for (const r of list) {
+        const s = sell.get(r.itemId);
+        for (const u of usesOf(s && s.uses)) { counts[u]++; any = true; }
+      }
+      let bar = document.getElementById("totr-usebar");
+      if (!any && useFilter == null) { bar?.remove(); return; } // an older server: no tags, no chips
+      const sig = `${useFilter}|${ITEM_USES.map((u) => counts[u]).join(",")}`;
+      if (bar && bar.isConnected && bar.dataset.sig === sig) return;
+      const pick = (u) => { useFilter = useFilter === u ? null : u; applyUseFilter(rows()); useBar(rows()); };
+      const next = el("div", { id: "totr-usebar", class: "totr-usebar", "data-totr-ui": "1", "data-sig": sig },
+        el("span", null, "Show"),
+        el("button", { type: "button", "aria-pressed": String(useFilter == null), onclick: () => pick(null) }, "All"),
+        ...ITEM_USES.filter((u) => counts[u] || useFilter === u).map((u) =>
+          el("button", { type: "button", "aria-pressed": String(useFilter === u), title: USE_HINT[u], onclick: () => pick(u) }, `${USE_LABEL[u]} ${counts[u]}`)));
+      if (bar && bar.isConnected) { bar.replaceWith(next); return; }
+      const parent = list[0] && list[0].row.parentElement;
+      const anchor = parent && (parent.closest("table") || parent);
+      if (anchor) anchor.insertAdjacentElement("beforebegin", next);
     }
     function statusLine(list) {
       let line = document.getElementById("totr-bzline");
@@ -2258,6 +2406,8 @@
       }
       if (await load(list)) document.getElementById("totr-bzline")?.remove();
       list.forEach(decorate);
+      applyUseFilter(list);
+      useBar(list);
       headerLinks(list);
       updateWorth(list);
       updateAge();
@@ -2344,6 +2494,8 @@
 
   modules.itemMarket = (() => {
     let current = { itemId: null, data: null, error: null };
+    // 0.8.14 (WO-93 B): "+N more" stays open for this page visit, across items.
+    let showAll = false;
 
     function itemIdNow() {
       const m = location.hash.match(/itemID=(\d+)/i);
@@ -2367,13 +2519,29 @@
       const mode = prefs().sellMode;
       placeSellModeBar(strip);
       const head = el("div", { class: "totr-head" }, el("strong", null, "Bazaars"));
+      // 0.8.14 (WO-93 A): the strip keeps its height while it loads — Full page / Price check are
+      // there from the start, the body holds skeleton cards, and the last real height is the
+      // minimum — so Torn's Buy buttons below don't jump under the cursor when the quote lands.
+      const reserved = stripMinHeight(gmGet(STORE.stripHeight, null));
+      strip.style.minHeight = !d && !current.error && reserved ? `${reserved}px` : "";
+      const total = d && Array.isArray(d.bazaars) ? d.bazaars.length : 0;
+      const cards = stripCards(d && d.bazaars ? [...d.bazaars].sort((x, y) => x.price - y.price) : [], showAll);
+      if (!d) {
+        head.append(
+          el("span", { class: "totr-muted" }, current.error ? "" : "Market … · checking bazaars"),
+          current.itemId ? el("a", { class: "totr-mini", href: itemPageUrl(current.itemId), target: "_blank", rel: "noopener", style: "margin-left:auto;display:inline-flex;align-items:center;text-decoration:none", title: "Every listing, buyers and your three ways to sell, on Overseer" }, "Full page") : null,
+          current.itemId ? el("button", { class: "totr-mini", type: "button", onclick: () => modules.priceCheck.toggle(current.itemId, strip, {}) }, "Price check") : null,
+        );
+      }
       if (d) {
         head.append(...[
           el("span", { class: "totr-muted" }, `Market ${fmtMoney(d.marketValue)}`),
           netAfterFee(d.marketValue) != null ? el("span", { class: "totr-muted", title: "What a sale at market value pays you after Torn's 5% item market fee — pay more than this and reselling at MV loses money." }, `· ${fmtMoney(netAfterFee(d.marketValue))} after 5% fee`) : null,
           d.buyPrice != null ? el("span", { class: "totr-muted" }, `You buy at ${fmtMoney(d.buyPrice)}`) : null,
           mode === "bazaar" && sellAtOf(current.itemId) != null ? el("span", { class: "totr-muted" }, `· You sell at ${fmtMoney(sellAtOf(current.itemId))}`) : null,
-          el("span", { class: "totr-muted", title: "The five cheapest bazaars selling this item right now — every one, deal or not. Deals (the Overseer eye) are a separate list: items on your Script Pricelist at or under your price." }, "· 5 cheapest bazaars"),
+          // 0.8.14 (WO-93 C): what the item is for, from Torn's own item text.
+          ...usesOf(d.uses).map((u) => el("span", { class: `totr-use totr-use--${u}`, title: USE_HINT[u] }, USE_LABEL[u])),
+          total ? el("span", { class: "totr-muted", title: "The cheapest bazaars selling this item right now — every one, deal or not. Deals (the Overseer eye) are a separate list: items on your Script Pricelist at or under your price." }, stripCountLabel(cards.shown.length, total)) : null,
           sellModeLink(),
           el("a", { class: "totr-mini", href: itemPageUrl(current.itemId), target: "_blank", rel: "noopener", style: "margin-left:auto;display:inline-flex;align-items:center;text-decoration:none", title: "Every listing, buyers and your three ways to sell, on Overseer" }, "Full page"),
           el("button", { class: "totr-mini", type: "button", onclick: () => modules.priceCheck.toggle(current.itemId, strip, { name: d.itemName }) }, "Price check"),
@@ -2391,13 +2559,16 @@
             `Add at ${fmtMoney(Math.round(d.marketValue * pct / 100))}`));
       }
       const body = el("div", { class: "totr-body", style: "flex-direction:row;flex-wrap:wrap" });
-      if (notOnList) body.append(notOnList);
       if (current.error) body.append(el("div", { class: "totr-error" }, current.error));
-      else if (!d) body.append(el("div", { class: "totr-muted" }, "Checking bazaars…"));
+      else if (!d) {
+        for (let i = 0; i < STRIP_SHOW; i++) {
+          body.append(el("div", { class: "totr-card totr-card--skel", "aria-hidden": "true" },
+            el("span", { class: "totr-skel-bar", style: "width:96px" }), el("span", { class: "totr-skel-bar", style: "width:60px" })));
+        }
+      }
       else if (!d.bazaars || !d.bazaars.length) body.append(el("div", { class: "totr-muted" }, d.bazaarError ? "Bazaar listings unavailable right now." : "No bazaars selling this right now."));
       else {
-        const list = [...d.bazaars].sort((x, y) => x.price - y.price);
-        for (const b of list) {
+        for (const b of cards.shown) {
           const pct = d.marketValue ? ((b.price - d.marketValue) / d.marketValue) * 100 : null;
           const under = d.buyPrice != null && b.price < d.buyPrice;
           const href = b.playerId ? `https://www.torn.com/bazaar.php?userId=${b.playerId}&totr=${current.itemId}-${b.price}#/` : null;
@@ -2409,9 +2580,15 @@
               el("span", { class: "totr-muted" }, `× ${b.qty}`)),
             stripChip(b, under, pct, mode, d)));
         }
+        if (cards.hidden) body.append(el("button", { class: "totr-mini totr-mini--more", type: "button", onclick: () => { showAll = true; render(); } }, `+${cards.hidden} more`));
+        else if (showAll && total > STRIP_SHOW) body.append(el("button", { class: "totr-mini totr-mini--more", type: "button", onclick: () => { showAll = false; render(); } }, "Show fewer"));
         if (d.hiddenOutliers) body.append(el("div", { class: "totr-muted", style: "flex-basis:100%" }, `${d.hiddenOutliers} dollar-bazaar listing${d.hiddenOutliers === 1 ? "" : "s"} hidden`));
       }
+      // The pricelist line goes under the cards now, inside the height reserved above.
+      if (notOnList) body.append(notOnList);
       strip.replaceChildren(head, body);
+      // Remember a settled, folded strip's height for the next item's loading state.
+      if (d && !showAll && strip.offsetHeight) gmSet(STORE.stripHeight, strip.offsetHeight);
     }
 
     /** One chip per strip card: blue under your buy, else what fits the sell mode. */
@@ -2435,7 +2612,7 @@
       if (prefs().sellMode === "bazaar") loadSellAt([itemId]).then(() => { if (current.itemId === itemId) render(); });
       render();
       try {
-        const res = await callTrader("quote", { itemIds: [itemId] });
+        const res = await callTrader("quote", { itemIds: [itemId], bazaarLimit: STRIP_ASK });
         if (current.itemId !== itemId) return;
         current.data = (res && res.items || []).find((q) => q.itemId === itemId) || null;
         if (!current.data) current.error = "No price data for this item.";
@@ -3563,9 +3740,16 @@
       try { localStorage.setItem(ALERTS_STORE, JSON.stringify(state)); } catch { /* storage off: just re-asks */ }
     }
 
-    function deals() {
+    function allDeals() {
       const s = load();
       return mergeDeals(s.deals, liveMarketDeals(s.market, Date.now()), s.watched);
+    }
+    /** 0.8.13: only deals that clear the player's minimum discount — the counts and the list. */
+    function dealSplit() { return splitDealsByMin(allDeals(), prefs().dealMin); }
+    function deals() { return dealSplit().shown; }
+    function setDealMin(value) {
+      gmSet(STORE.dealMin, dealMinOf(value));
+      render();
     }
     function unseen() { return unseenDeals(deals(), load().seen); }
 
@@ -3707,7 +3891,7 @@
         : d.sellerId ? `https://www.torn.com/bazaar.php?userId=${d.sellerId}&totr=${d.itemId}-${d.price}#/` : null;
       return el("div", { class: "totr-deal-card" },
         el("div", { class: "totr-deal-main" },
-          el("div", null, el("b", null, d.name || `Item ${d.itemId}`), el("span", { class: "totr-deal-pct" }, d.underPct > 0 ? `−${d.underPct}%` : "at price")),
+          el("div", null, el("b", null, d.name || `Item ${d.itemId}`), el("span", { class: "totr-deal-pct" }, dealBadge(d.underPct))),
           el("div", null, el("b", null, fmtMoney(d.price)), el("span", { class: "totr-muted" }, ` · ×${d.qtyUnder || 1} · ${d.source === "market" ? "Item market" : `Bazaar${d.sellerName ? " · " + d.sellerName : ""}`}`)),
           el("div", { class: "totr-muted" }, `Your price ${fmtMoney(d.buyPrice)}`)),
         href ? el("a", { class: "totr-deal-open", href }, "Open") : null);
@@ -3748,7 +3932,8 @@
         body.append(...lockedBody());
         parts.push(body);
       } else {
-        const list = deals();
+        const { shown: list, hidden } = dealSplit();
+        const min = prefs().dealMin;
         parts.push(el("div", { class: "totr-sheet-tabs", role: "tablist" },
           el("button", { type: "button", role: "tab", class: "totr-sheet-tab" + (tab === "deals" ? " totr-sheet-tab--on" : ""), onclick: () => { tab = "deals"; render(); } }, `Deals · ${list.length}`),
           el("button", { type: "button", role: "tab", class: "totr-sheet-tab" + (tab === "list" ? " totr-sheet-tab--on" : ""), onclick: () => { tab = "list"; render(); } }, `Buy list · ${(s.watched || []).length}`)));
@@ -3757,9 +3942,30 @@
           if (!(s.watched || []).length) {
             body.append(el("div", { class: "totr-muted" }, "Your buy list is empty. Add the items you buy and the prices you'll pay, and deals show up here."),
               el("a", { class: "totr-link", href: `${SITE_URL}/trading/buy-list`, target: "_blank", rel: "noopener" }, "Set up your buy list"));
-          } else if (!list.length) {
-            body.append(el("div", { class: "totr-muted" }, "Nothing under your prices right now."));
-          } else body.append(...list.map(dealCard));
+          } else {
+            body.append(el("div", { class: "totr-min" },
+              el("span", { class: "totr-muted" }, "Only show deals at least this far under your price"),
+              el("div", { class: "totr-min-row", role: "group", "aria-label": "Minimum discount" },
+                ...DEAL_MIN_OPTIONS.map((v) => el("button", {
+                  type: "button",
+                  class: "totr-min-btn" + (v === min ? " totr-min-btn--on" : ""),
+                  "aria-pressed": v === min ? "true" : "false",
+                  onclick: () => setDealMin(v),
+                }, v === 0 ? "Any" : `${v}%`)))));
+            const showAll = el("a", { class: "totr-link", href: "#", onclick: (e) => { e.preventDefault(); setDealMin(0); } }, hidden.length === 1 ? "Show" : "Show them");
+            if (!list.length) {
+              body.append(el("div", { class: "totr-min-empty" },
+                el("b", null, min > 0 ? `No deals ${min}% or more under your price` : "Nothing under your prices right now."),
+                hidden.length ? el("span", { class: "totr-muted" }, `${hidden.length} smaller deal${hidden.length === 1 ? " is" : "s are"} hidden by your filter.`) : null,
+                hidden.length ? showAll : null));
+            } else {
+              body.append(...list.map(dealCard));
+              if (hidden.length) {
+                body.append(el("div", { class: "totr-min-hidden" },
+                  el("span", null, `${hidden.length} smaller deal${hidden.length === 1 ? "" : "s"} hidden (under ${min}%)`), showAll));
+              }
+            }
+          }
         } else {
           for (const w of s.watched || []) {
             body.append(el("div", { class: "totr-deal-card" },
@@ -3846,7 +4052,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTradingPage, dealKey, unseenDeals, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { usesOf, keepsOne, keepQty, matchesUse, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

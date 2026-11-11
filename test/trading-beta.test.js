@@ -689,3 +689,74 @@ test("liveMarketDeals hides item-market deals older than 15 minutes (0.8.12)", (
   assert.deepEqual(tr.liveMarketDeals(market, now, 20 * 60_000).map((d) => d.itemId), [1, 2]);
   assert.deepEqual(tr.liveMarketDeals(undefined, now), []);
 });
+
+test("dealMinOf keeps only the offered minimums (0.8.13)", () => {
+  assert.equal(tr.dealMinOf(5), 5);
+  assert.equal(tr.dealMinOf("10"), 10);
+  assert.equal(tr.dealMinOf(20), 20);
+  assert.equal(tr.dealMinOf(8), 0);
+  assert.equal(tr.dealMinOf(null), 0);
+  assert.equal(tr.dealMinOf("junk"), 0);
+});
+
+test("splitDealsByMin hides deals under the minimum and counts them (0.8.13)", () => {
+  const kit = { itemId: 1, underPct: 16.3 };
+  const morph = { itemId: 2, underPct: 3.2 };
+  const at = { itemId: 3, underPct: 0 };
+  const all = tr.splitDealsByMin([kit, morph, at], 0);
+  assert.deepEqual(all.shown, [kit, morph, at]);
+  assert.deepEqual(all.hidden, []);
+  const five = tr.splitDealsByMin([kit, morph, at], 5);
+  assert.deepEqual(five.shown, [kit]);
+  assert.deepEqual(five.hidden, [morph, at]);
+  const twenty = tr.splitDealsByMin([kit, morph], 20);
+  assert.deepEqual(twenty.shown, []);
+  assert.equal(twenty.hidden.length, 2);
+  assert.deepEqual(tr.splitDealsByMin([{ itemId: 4, underPct: 5 }], 5).shown.length, 1);
+  assert.deepEqual(tr.splitDealsByMin(null, 5), { shown: [], hidden: [] });
+  // An unknown saved value acts as "Any".
+  assert.equal(tr.splitDealsByMin([morph], 7).shown.length, 1);
+});
+
+test("dealBadge says the % is under your price (0.8.13)", () => {
+  assert.equal(tr.dealBadge(16.3), "16% under your price");
+  assert.equal(tr.dealBadge(3.2), "3.2% under your price");
+  assert.equal(tr.dealBadge(0.3), "0.3% under your price");
+  assert.equal(tr.dealBadge(0), "at your price");
+  assert.equal(tr.dealBadge(undefined), "at your price");
+});
+
+test("WO-93 stripCards: five by default, all once opened", () => {
+  const list = Array.from({ length: 12 }, (_, i) => ({ price: 100 + i }));
+  const folded = tr.stripCards(list, false);
+  assert.equal(folded.shown.length, tr.STRIP_SHOW);
+  assert.equal(folded.hidden, 7);
+  assert.deepEqual(tr.stripCards(list, true), { shown: list, hidden: 0 });
+  assert.deepEqual(tr.stripCards(list.slice(0, 3), false), { shown: list.slice(0, 3), hidden: 0 });
+  assert.deepEqual(tr.stripCards(undefined, false), { shown: [], hidden: 0 });
+});
+
+test("WO-93 stripCountLabel and stripMinHeight", () => {
+  assert.equal(tr.stripCountLabel(5, 20), "· cheapest bazaars 5 of 20");
+  assert.equal(tr.stripCountLabel(4, 4), "· 4 cheapest bazaars");
+  assert.equal(tr.stripCountLabel(1, 1), "· 1 cheapest bazaar");
+  assert.equal(tr.stripMinHeight(168.4), 168);
+  for (const bad of [null, undefined, "x", 10, 5000]) assert.equal(tr.stripMinHeight(bad), null);
+});
+
+test("WO-93 C keep 1: OC and crime items list one fewer on Add", () => {
+  assert.deepEqual(tr.usesOf(["crime", "oc", "x"]), ["oc", "crime"]);
+  assert.equal(tr.keepsOne(["oc", "crime"]), true);
+  assert.equal(tr.keepsOne(["use"]), false);
+  assert.equal(tr.keepQty(1, ["crime"]), 0); // the last Jemmy stays
+  assert.equal(tr.keepQty(3, ["oc"]), 2);
+  assert.equal(tr.keepQty(12, ["use"]), 12);
+  assert.equal(tr.keepQty(5, undefined), 5);
+});
+
+test("WO-93 C matchesUse: All, a tag, and rows still loading", () => {
+  assert.equal(tr.matchesUse(["oc"], null), true);
+  assert.equal(tr.matchesUse(["oc"], "oc"), true);
+  assert.equal(tr.matchesUse(["use"], "none"), false);
+  assert.equal(tr.matchesUse(null, "none"), true);
+});
