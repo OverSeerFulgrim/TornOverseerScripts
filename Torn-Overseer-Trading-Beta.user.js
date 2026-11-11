@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.14
+// @version      0.8.16
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -17,6 +17,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
+// @grant        GM_registerMenuCommand
 // @connect      ijolgywtybadfuvyopeg.supabase.co
 // @connect      tornexchange.com
 // @connect      api.torn.com
@@ -932,6 +933,8 @@
   /** 0.8.14 (WO-93 B): bazaars the strip asks for, and how many it shows before "+N more". */
   const STRIP_ASK = 20;
   const STRIP_SHOW = 5;
+  /** 0.8.15: how long the strip waits before saying the answer is slow and offering Retry. */
+  const STRIP_SLOW_MS = 8000;
 
   /**
    * 0.8.14 (WO-93 B): which strip cards show. Five by default; all of them once the player
@@ -1217,20 +1220,28 @@
       throw new Error("This script needs Tampermonkey (or Torn PDA).");
     }
     return new Promise((resolve, reject) => {
+      // 0.8.15: a request must ALWAYS settle. Some script managers never call back on a
+      // cancelled or stalled request (no onabort, timeout ignored), which left the Bazaars strip
+      // on its loading cards for good — so a timer of our own backs the manager's timeout.
+      const ms = options.timeout || 20000;
+      let settled = false;
+      const settle = (fn, value) => { if (settled) return; settled = true; clearTimeout(guard); fn(value); };
+      const guard = setTimeout(() => settle(reject, new Error(`Timed out calling ${url}`)), ms + 5000);
       GM_xmlhttpRequest({
-        method, url, headers, data, timeout: options.timeout || 20000,
+        method, url, headers, data, timeout: ms,
         onload: (res) => {
-          try { resolve(parseHttpJson(res.status, res.responseText, url)); } catch (e) { reject(e); }
+          try { settle(resolve, parseHttpJson(res.status, res.responseText, url)); } catch (e) { settle(reject, e); }
         },
-        onerror: () => reject(new Error(`Network error calling ${url}`)),
-        ontimeout: () => reject(new Error(`Timed out calling ${url}`)),
+        onerror: () => settle(reject, new Error(`Network error calling ${url}`)),
+        ontimeout: () => settle(reject, new Error(`Timed out calling ${url}`)),
+        onabort: () => settle(reject, new Error(`Request cancelled calling ${url}`)),
       });
     });
   }
 
   async function connect() {
     const { tornKey } = prefs();
-    if (!tornKey) throw httpError("No Torn API key saved in this script yet — open Price check on any item (or any trade) and paste a Limited key.", 401);
+    if (!tornKey) throw httpError("No Torn API key saved in this script yet — pick \"Set Torn API key\" in the Tampermonkey menu (or open Price check on any item) and paste a Limited key.", 401);
     const res = await requestJson(`${FUNCTIONS_URL}/connect-torn-key`, {
       method: "POST",
       headers: { "Content-Type": "application/json", apikey: ANON_KEY, Authorization: `Bearer ${ANON_KEY}` },
@@ -1558,6 +1569,75 @@
       el("div", { class: "totr-muted" }, "Connect once with your Torn API key (Limited is enough — never a Full key). It stays in Tampermonkey's private storage; tornoverseer.com keeps no copy. Every Overseer panel on Torn uses it from then on."),
       el("div", { class: "totr-actions" }, input, el("button", { class: "totr-btn totr-btn--primary", type: "button", onclick: save }, "Connect")),
       error ? null : msg);
+  }
+
+  // 0.8.16 (Xnappum's feedback): set or change the key from the Tampermonkey menu, so a new
+  // player doesn't have to find a trade or a Price check first. One entry, one dialog.
+  /** What the key dialog says about the key the script holds now. */
+  function keyStatusLabel(storedKey, pdaKey) {
+    const stored = String(storedKey || "").trim();
+    if (stored) return `A key is saved (ends …${stored.slice(-4)}).`;
+    if (String(pdaKey || "").trim()) return "Using the key Torn PDA provides.";
+    return "No key saved yet.";
+  }
+
+  let rerunPage = () => {};
+  function openKeyDialog() {
+    if (!IS_BROWSER) return;
+    document.getElementById("totr-keydlg")?.remove();
+    const close = () => { overlay.remove(); document.removeEventListener("keydown", onEsc, true); };
+    const onEsc = (e) => { if (e.key === "Escape") close(); };
+    const status = el("div", { class: "totr-muted" }, keyStatusLabel(gmGet(STORE.tornKey, ""), pdaApiKey()));
+    const msg = el("div", { class: "totr-muted" });
+    const input = keyInput();
+    let busy = false;
+    const save = async () => {
+      const key = input.value.trim();
+      if (!key || busy) return;
+      if (!gmSet(STORE.tornKey, key)) { msg.className = "totr-error"; msg.textContent = "This browser's script manager can't store secrets — use Tampermonkey."; return; }
+      saveSessionToken("");
+      busy = true; msg.className = "totr-muted"; msg.textContent = "Checking the key with Overseer…";
+      try {
+        await connect();
+        input.value = "";
+        status.textContent = keyStatusLabel(key, "");
+        msg.className = "totr-muted"; msg.textContent = "Connected — every Overseer panel on Torn uses this key now.";
+        rerunPage();
+      } catch (err) {
+        const text = (err && err.message) || String(err);
+        if (BAD_KEY_RE.test(text)) { forgetKey(); status.textContent = keyStatusLabel("", pdaApiKey()); }
+        msg.className = "totr-error"; msg.textContent = text;
+      } finally {
+        busy = false;
+      }
+    };
+    const remove = () => {
+      forgetKey();
+      status.textContent = keyStatusLabel("", pdaApiKey());
+      msg.className = "totr-muted"; msg.textContent = "Key removed from this script.";
+    };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save(); } });
+    const box = el("div", { class: "totr", style: "width:min(440px,calc(100vw - 24px));margin:0;box-shadow:0 10px 30px rgba(0,0,0,.6)" },
+      el("div", { class: "totr-head" }, el("div", { class: "totr-title" }, "Overseer Trading — Torn API key")),
+      el("div", { class: "totr-body" },
+        status,
+        el("div", { class: "totr-muted" }, "Limited is enough — never a Full key. It stays in Tampermonkey's private storage; tornoverseer.com keeps no copy."),
+        el("div", { class: "totr-actions" }, input, el("button", { class: "totr-btn totr-btn--primary", type: "button", onclick: save }, "Save")),
+        msg,
+        el("div", { class: "totr-actions" },
+          el("button", { class: "totr-btn", type: "button", onclick: remove }, "Remove key"),
+          el("button", { class: "totr-btn", type: "button", onclick: close }, "Close"))));
+    const overlay = el("div", { id: "totr-keydlg", "data-totr-ui": "1", style: "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding-top:12vh" }, box);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    document.addEventListener("keydown", onEsc, true);
+    document.body.append(overlay);
+    input.focus();
+  }
+
+  function registerMenu() {
+    // Tampermonkey / Violentmonkey only — Torn PDA has no script menu (and injects its own key).
+    if (typeof GM_registerMenuCommand !== "function") return;
+    try { GM_registerMenuCommand("Set Torn API key", openKeyDialog); } catch { /* menu unavailable */ }
   }
 
   // --- Trade window (TS-2) ----------------------------------------------------------------
@@ -2400,7 +2480,7 @@
       const list = rows();
       if (!list.length) return;
       if (!prefs().tornKey && !prefs().sessionToken) {
-        lastError = "connect first: open Price check on any item (or any trade) and paste your Torn key.";
+        lastError = "connect first: pick \"Set Torn API key\" in the Tampermonkey menu and paste your Torn key.";
         statusLine(list);
         return;
       }
@@ -2493,9 +2573,12 @@
   }
 
   modules.itemMarket = (() => {
-    let current = { itemId: null, data: null, error: null };
+    let current = { itemId: null, data: null, error: null, slow: false };
     // 0.8.14 (WO-93 B): "+N more" stays open for this page visit, across items.
     let showAll = false;
+    // 0.8.15: which quote is in flight (a newer load or a Retry outdates the older answer).
+    let loadSeq = 0;
+    let loading = false;
 
     function itemIdNow() {
       const m = location.hash.match(/itemID=(\d+)/i);
@@ -2505,16 +2588,41 @@
       return id && /^\d+$/.test(id) ? Number(id) : null;
     }
 
+    // 0.8.15: Torn can keep more than one seller list in the page (a hidden or outgoing copy
+    // next to the one on screen) — take the first one that is actually drawn.
     function anchor() {
-      return document.querySelector("[class*='sellerListWrapper___'], [class^='sellerList___'], [class*=' sellerList___']");
+      const all = [...document.querySelectorAll("[class*='sellerListWrapper___'], [class^='sellerList___'], [class*=' sellerList___']")];
+      const drawn = (n) => n.getClientRects().length > 0 || [...n.children].some((c) => c.getClientRects().length > 0);
+      return all.find(drawn) || all[0] || null;
+    }
+    /** The one strip that sits in `a`; any other copy (a stale list, a node Torn cloned) is removed. */
+    function stripIn(a) {
+      let strip = null;
+      for (const s of document.querySelectorAll("#totr-strip")) {
+        if (!strip && a.contains(s)) strip = s; else s.remove();
+      }
+      return strip;
     }
 
+    // 0.8.15: a drawing error must never leave the loading cards up for good — say what broke.
     function render() {
+      try { draw(); } catch (err) {
+        console.warn("[Overseer Trading] strip", err);
+        const strip = document.getElementById("totr-strip");
+        if (!strip) return;
+        strip.style.minHeight = "";
+        strip.replaceChildren(
+          el("div", { class: "totr-head" }, el("strong", null, "Bazaars")),
+          el("div", { class: "totr-body" }, el("div", { class: "totr-error" }, `Couldn't show this box (${(err && err.message) || err}). Please report it in the Overseer Discord — script v${VERSION}.`)));
+      }
+    }
+
+    function draw() {
       const a = anchor();
       if (!a) return;
-      let strip = document.getElementById("totr-strip");
+      let strip = stripIn(a);
       // Inside Torn's seller list at the top: as its sibling it became a narrow flex column.
-      if (!strip || !strip.isConnected) { strip?.remove(); strip = el("div", { id: "totr-strip", class: "totr", style: "width:100%;flex-basis:100%;box-sizing:border-box;margin-bottom:8px" }); a.prepend(strip); }
+      if (!strip) { strip = el("div", { id: "totr-strip", class: "totr", style: "width:100%;flex-basis:100%;box-sizing:border-box;margin-bottom:8px" }); a.prepend(strip); }
       const d = current.data;
       const mode = prefs().sellMode;
       placeSellModeBar(strip);
@@ -2528,7 +2636,8 @@
       const cards = stripCards(d && d.bazaars ? [...d.bazaars].sort((x, y) => x.price - y.price) : [], showAll);
       if (!d) {
         head.append(
-          el("span", { class: "totr-muted" }, current.error ? "" : "Market … · checking bazaars"),
+          el("span", { class: "totr-muted" }, current.error ? "" : current.slow ? "Overseer is taking longer than usual…" : "Market … · checking bazaars"),
+          !current.error && current.slow && current.itemId ? el("button", { class: "totr-mini", type: "button", title: "Ask again", onclick: () => load(current.itemId) }, "Retry") : null,
           current.itemId ? el("a", { class: "totr-mini", href: itemPageUrl(current.itemId), target: "_blank", rel: "noopener", style: "margin-left:auto;display:inline-flex;align-items:center;text-decoration:none", title: "Every listing, buyers and your three ways to sell, on Overseer" }, "Full page") : null,
           current.itemId ? el("button", { class: "totr-mini", type: "button", onclick: () => modules.priceCheck.toggle(current.itemId, strip, {}) }, "Price check") : null,
         );
@@ -2608,17 +2717,24 @@
     }
 
     async function load(itemId) {
-      current = { itemId, data: null, error: null };
+      const seq = ++loadSeq;
+      current = { itemId, data: null, error: null, slow: false };
+      loading = true;
       if (prefs().sellMode === "bazaar") loadSellAt([itemId]).then(() => { if (current.itemId === itemId) render(); });
       render();
+      // 0.8.15: after a few seconds the loading cards say so and offer Retry.
+      const slowTimer = setTimeout(() => { if (seq === loadSeq && loading) { current.slow = true; render(); } }, STRIP_SLOW_MS);
       try {
         const res = await callTrader("quote", { itemIds: [itemId], bazaarLimit: STRIP_ASK });
-        if (current.itemId !== itemId) return;
+        if (seq !== loadSeq) return;
         current.data = (res && res.items || []).find((q) => q.itemId === itemId) || null;
         if (!current.data) current.error = "No price data for this item.";
       } catch (err) {
-        if (current.itemId !== itemId) return;
+        if (seq !== loadSeq) return;
         current.error = err.status === 402 ? "Trading needs an Overseer subscription." : (err.message || String(err));
+      } finally {
+        clearTimeout(slowTimer);
+        if (seq === loadSeq) loading = false;
       }
       render();
     }
@@ -2751,8 +2867,12 @@
         const id = itemIdNow();
         if (!id) return;
         if (id !== current.itemId) { load(id); return; }
-        const strip = document.getElementById("totr-strip");
-        if (!strip) render(); else placeSellModeBar(strip);
+        // 0.8.15: nothing loaded, nothing failed and nothing in flight = a stuck strip; ask again.
+        if (!current.data && !current.error && !loading) { load(id); return; }
+        // Redraw when the strip is missing, duplicated, or left behind in a list Torn replaced.
+        const a = anchor();
+        const strips = document.querySelectorAll("#totr-strip");
+        if (strips.length !== 1 || (a && !a.contains(strips[0]))) render(); else placeSellModeBar(strips[0]);
         markSellerList();
       },
     };
@@ -4039,6 +4159,8 @@
       // Price check rides along on the trading pages (incl. the Items page).
       try { modules.priceCheck.scan(); } catch (err) { console.warn("[Overseer Trading]", err); }
     };
+    rerunPage = run;
+    registerMenu();
     const schedule = () => { clearTimeout(timer); timer = setTimeout(run, isTradingPage(location) ? 150 : 1000); };
     window.addEventListener("hashchange", schedule);
     // Our own UI and Chain Watch's panel (which redraws every second) never wake a re-scan.
@@ -4052,7 +4174,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { usesOf, keepsOne, keepQty, matchesUse, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

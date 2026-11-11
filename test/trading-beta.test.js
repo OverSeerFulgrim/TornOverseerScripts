@@ -760,3 +760,11 @@ test("WO-93 C matchesUse: All, a tag, and rows still loading", () => {
   assert.equal(tr.matchesUse(["use"], "none"), false);
   assert.equal(tr.matchesUse(null, "none"), true);
 });
+
+test("keyStatusLabel says which key the script holds, never the whole key", () => {
+  assert.equal(tr.keyStatusLabel("abcdEFGH12345678", ""), "A key is saved (ends …5678).");
+  assert.equal(tr.keyStatusLabel("  abcdEFGH12345678 ", "pdaKEY"), "A key is saved (ends …5678).");
+  assert.equal(tr.keyStatusLabel("", "pdaKEY"), "Using the key Torn PDA provides.");
+  assert.equal(tr.keyStatusLabel("", ""), "No key saved yet.");
+  assert.equal(tr.keyStatusLabel(null, undefined), "No key saved yet.");
+});
