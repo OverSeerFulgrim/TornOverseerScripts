@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.35.2
+// @version      0.35.3
 // @description  Watcher-focused chain HUD, docked as an Overseer bar in Torn's sidebar (pop it out for the full panel): zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -43,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.35.2";
+      : "") || "0.35.3";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -4889,8 +4889,20 @@
     return !state.hidden && !state.collapsed && !state.settingsOpen && !state.focus && activeTab() === "war";
   }
 
-  function ffKey() {
+  // v0.35.3: Torn PDA's GM storage does not survive a page load, so a typed FF Scouter
+  // key vanished after every fight (Xnappum, 2026-11-14). An FF Scouter key IS a Torn key
+  // registered once at ffscouter.com, so with no saved key PDA's own injected key is used
+  // instead — nothing new is stored, and nothing is put in page-readable localStorage.
+  function savedFfKey() {
     return readString(STORE.ffKey, "").trim();
+  }
+
+  function ffKey() {
+    return savedFfKey() || pdaApiKey();
+  }
+
+  function ffUsingPdaKey() {
+    return !savedFfKey() && !!pdaApiKey();
   }
 
   async function warCall(action, body = {}) {
@@ -5043,6 +5055,7 @@
       W.ffError = null;
     } catch (error) {
       W.ffError = error?.message || "FF Scouter didn't answer.";
+      if (ffUsingPdaKey()) W.ffError += " (Using your TornPDA key — register it once at ffscouter.com.)";
       W.ffAt = Date.now(); // don't hammer it; try again after the TTL
       W.ffIds = sig;
     } finally {
@@ -6330,8 +6343,8 @@
           <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
             <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
           </label>
-          <label>FF Scouter key <span class="tocw-muted">— optional; shows stat estimates on War tab targets. Register at ffscouter.com (a Torn key won't work here). Sent only to ffscouter.com.</span>
-            <input id="tocw-set-ff-key" type="password" value="${escapeHtml(readString(STORE.ffKey, ""))}" autocomplete="off" placeholder="Your FF Scouter key" />
+          <label>FF Scouter key ${pdaApiKey() ? "(TornPDA key used when blank)" : ""} <span class="tocw-muted">— optional; shows stat estimates on War tab targets. Use a Torn key you've registered once at ffscouter.com. Sent only to ffscouter.com.${pdaApiKey() ? " TornPDA forgets a key typed here when the page changes, so leave it blank to use your PDA key." : ""}</span>
+            <input id="tocw-set-ff-key" type="password" value="${escapeHtml(savedFfKey())}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Your FF Scouter-registered key"}" />
           </label>
           <label>Site session token
             <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
@@ -6465,8 +6478,10 @@
       const ok = saveSettings(collect());
       applyAlarmSettings();
       // v0.32.0: the optional FF Scouter key (GM-only, like the Torn key).
-      const nextFf = valueOf("tocw-set-ff-key");
-      if (nextFf !== readString(STORE.ffKey, "")) {
+      let nextFf = String(valueOf("tocw-set-ff-key") || "").trim();
+      // Never persist PDA's injected key — it is provided fresh on every load.
+      if (pdaApiKey() && nextFf === pdaApiKey()) nextFf = "";
+      if (nextFf !== savedFfKey()) {
         gmSet(STORE.ffKey, nextFf);
         state.war.ff = {};
         state.war.ffIds = "";
