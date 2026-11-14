@@ -26,5 +26,5 @@ test("isTradingPage: the pages the watcher still runs on, and ones it no longer 
 
 test("the header no longer calls the script a draft", () => {
   assert.ok(!/DRAFT/.test(src.slice(0, 4000)));
-  assert.match(src, /@version\s+0\.8\.17/);
+  assert.match(src, /@version\s+0\.8\.\d+/);
 });

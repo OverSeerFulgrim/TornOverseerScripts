@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.17
+// @version      0.8.18
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -79,6 +79,7 @@
     stockSentAt: "totr_stock_sent_at",
     sellMode: "totr_sell_mode",
     stripHeight: "totr_strip_height",
+    sellCache: "totr_sell_cache", // 0.8.18: last sell_prices answers (prices only, no secrets)
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
@@ -395,6 +396,8 @@
     const h = Math.floor(m / 60);
     return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
   }
+  /** "5m ago", or "just now". */
+  function agoText(ms) { const t = ageText(ms); return t === "just now" ? t : `${t} ago`; }
   function targetsAge(info, nowMs) {
     const { loadedAt, refsAt, marketAt } = info || {};
     if (!Number.isFinite(loadedAt)) return { text: "", title: "", stale: false };
@@ -414,6 +417,56 @@
     const oldest = Math.min(loadedAt, Number.isFinite(refsAt) ? refsAt : loadedAt);
     const age = ageText(nowMs - oldest);
     return { text: age === "just now" ? "TARGETS FRESH" : `TARGETS ${age.toUpperCase()} OLD`, title: lines.join("\n"), stale: why.length > 0 };
+  }
+
+  // ---- 0.8.18: slow or lost requests (Xnappum, 2026-11-12) ---------------------------------
+  // The server answers in 1-5 s, but some calls from Europe never arrive and sat out the whole
+  // 20 s timeout plus a 30 s pause. Reads now give up after 10 s and ask once more straight away,
+  // and your bazaar page keeps the last sell-list prices it saw so a lost call isn't a blank page.
+  /** Reads that are safe to send twice. Anything that writes is never retried on a timeout. */
+  const RETRY_READS = new Set(["sell_prices", "quote", "price_check", "deals", "stock_stats", "price_trade", "hello", "items"]);
+  const FIRST_TRY_MS = 10_000;
+  function isTimeoutError(err) { return /^Timed out calling /.test(String((err && err.message) || "")); }
+  /**
+   * The Supabase region the database lives in. Pinning functions there saves each read a trip
+   * across the Atlantic for players in Europe; it changes nothing for players near Oregon.
+   */
+  const FUNCTION_REGION = "us-west-2";
+  function withRegion(url, headers) {
+    return String(url).startsWith(`${FUNCTIONS_URL}/`) ? { ...headers, "x-region": FUNCTION_REGION } : headers;
+  }
+
+  /** Last sell_prices answers on your own bazaar page, kept across visits. */
+  const SELL_CACHE_CAP = 400;
+  const SELL_CACHE_MAX_AGE_MS = 24 * 3600000;
+  /** Cached prices older than this are shown, but Fill / FILL ALL / FIX won't type them. */
+  const SELL_CACHE_FILL_MS = 10 * 60000;
+  /** Store fresh answers (newest wins), keeping at most `cap` items. */
+  function sellCachePut(cache, items, nowMs, cap = SELL_CACHE_CAP) {
+    const out = { ...(cache && typeof cache === "object" ? cache : {}) };
+    for (const it of Array.isArray(items) ? items : []) {
+      if (it && Number.isInteger(it.itemId) && it.itemId > 0) out[it.itemId] = { at: nowMs, item: it };
+    }
+    const keys = Object.keys(out);
+    if (keys.length > cap) {
+      keys.sort((a, b) => out[a].at - out[b].at).slice(0, keys.length - cap).forEach((k) => delete out[k]);
+    }
+    return out;
+  }
+  /** Cached answers for `ids` that are under a day old, each marked with when it was loaded. */
+  function sellCacheGet(cache, ids, nowMs, maxAgeMs = SELL_CACHE_MAX_AGE_MS) {
+    const out = new Map();
+    for (const id of ids) {
+      const hit = cache && cache[id];
+      if (!hit || !hit.item || !Number.isFinite(hit.at) || nowMs - hit.at > maxAgeMs || nowMs < hit.at - 60000) continue;
+      out.set(id, { ...hit.item, cachedAt: hit.at });
+    }
+    return out;
+  }
+  /** Whether a sell-list answer may be typed into a price box: fresh, or cached under 10 minutes. */
+  function canFillFrom(s, nowMs) {
+    if (!s || s.sellAt == null) return false;
+    return !Number.isFinite(s.cachedAt) || nowMs - s.cachedAt <= SELL_CACHE_FILL_MS;
   }
 
   function netAfterFee(price) {
@@ -1212,7 +1265,7 @@
 
   async function requestJson(url, options = {}) {
     const method = options.method || "GET";
-    const headers = options.headers || {};
+    const headers = withRegion(url, options.headers || {});
     const data = options.body == null ? undefined : JSON.stringify(options.body);
     if (typeof window.PDA_httpPost === "function" && typeof window.PDA_httpGet === "function") {
       const res = method === "POST" ? await window.PDA_httpPost(url, headers, data || "") : await window.PDA_httpGet(url, headers);
@@ -1257,15 +1310,20 @@
   async function callTrader(action, body = {}, retried = false) {
     let token = prefs().sessionToken;
     if (!token) token = await connect();
+    const send = (timeout) => requestJson(`${FUNCTIONS_URL}/trader-script`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json", apikey: ANON_KEY, Authorization: `Bearer ${ANON_KEY}`,
+        "X-Session-Token": token,
+      },
+      body: { action, ...body },
+      timeout,
+    });
     try {
-      return await requestJson(`${FUNCTIONS_URL}/trader-script`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json", apikey: ANON_KEY, Authorization: `Bearer ${ANON_KEY}`,
-          "X-Session-Token": token,
-        },
-        body: { action, ...body },
-      });
+      if (!RETRY_READS.has(action)) return await send();
+      // 0.8.18: a read that hasn't answered in 10 s was lost on the way; ask once more now.
+      try { return await send(FIRST_TRY_MS); } catch (err) { if (!isTimeoutError(err)) throw err; }
+      return await send();
     } catch (err) {
       if (err && err.status === 401 && !retried && prefs().tornKey) {
         saveSessionToken("");
@@ -1408,6 +1466,8 @@
   .totr-bz--manage .totr-dollar{height:22px;width:22px}
   .totr-bz--manage .totr-bz-profit{grid-column:1 / -1;font-size:11px;line-height:12px}
   .totr-mini--floor{border-color:#c77dd8}
+  .totr-mini--cached{border-style:dashed;opacity:.85}
+  .totr-mini:disabled{opacity:.45;cursor:not-allowed}
   .totr-vs{font:700 11px system-ui,sans-serif;padding:1px 5px;border-radius:9px;border:1px solid #3a475b;white-space:nowrap;color:#9aa7b8}
   .totr-vs--competitive{color:#5fe0a6;border-color:#2f6b52}.totr-vs--above{color:#f0c674;border-color:#7a6431}.totr-vs--far_above{color:#ff8a80;border-color:#7a3a35}
   .totr-dollar{font:800 13px system-ui,sans-serif;color:#f5c518;background:#0b0e13;border:1px solid #3a475b;border-radius:5px;width:26px;height:24px;cursor:pointer;padding:0}
@@ -2043,6 +2103,7 @@
     let lastError = null;
     let popup = null;
     const fresh = { loadedAt: null, refsAt: null }; // 0.7.11: target freshness (see targetsAge)
+    const isCached = (s) => !!(s && Number.isFinite(s.cachedAt)); // 0.8.18
     let useFilter = null; // 0.8.14 (WO-93 C): the Show chips — this visit only, never a setting
     let ageTimer = null;
 
@@ -2154,6 +2215,8 @@
     function listQty(r, all) { return all ? r.held : keepQty(r.held, sell.get(r.itemId) && sell.get(r.itemId).uses); }
     function fillRow(r, price, all) {
       const s = sell.get(r.itemId);
+      // 0.8.18: an automatic fill never types a sell-list price cached over 10 minutes ago.
+      if (price == null && !canFillFrom(s, Date.now())) return;
       const p = price != null ? price : s && s.sellAt;
       if (p == null) return;
       // 0.8.14: never list your last OC / crime item unless asked ("List anyway").
@@ -2188,13 +2251,18 @@
       if (!r.itemId) return;
       const s = sell.get(r.itemId);
       if (s === undefined) return; // not loaded yet
-      const key = `${r.itemId}:${s ? s.sellAt : "x"}`;
+      const stale = s && s.sellAt != null && !canFillFrom(s, Date.now());
+      const key = `${r.itemId}:${s ? s.sellAt : "x"}:${isCached(s) ? (stale ? "old" : "c") : "f"}`;
       if (r.row.dataset.totr === key) { refresh(r); return; }
       r.row.querySelectorAll("[data-totr-row]").forEach((n) => n.remove());
       r.row.dataset.totr = key;
       const box = el("span", { class: "totr-bz" + (isManage() ? " totr-bz--manage" : ""), "data-totr-ui": "1", "data-totr-row": "1" });
       if (s && s.sellAt != null) {
-        box.append(el("button", { class: "totr-mini" + (s.heldAtFloor ? " totr-mini--floor" : ""), type: "button", title: s.ruleLabel || "", onclick: () => fillRow(r) }, `Fill ${fmtMoney(s.sellAt)}`));
+        const cachedTitle = isCached(s) ? `Last loaded ${agoText(Date.now() - s.cachedAt)} — Overseer didn't answer just now. ` : "";
+        box.append(el("button", {
+          class: "totr-mini" + (s.heldAtFloor ? " totr-mini--floor" : "") + (isCached(s) ? " totr-mini--cached" : ""), type: "button", disabled: stale,
+          title: stale ? `${cachedTitle}Too old to fill — waiting for fresh prices.` : cachedTitle + (s.ruleLabel || ""), onclick: () => fillRow(r),
+        }, `Fill ${fmtMoney(s.sellAt)}`));
         // WO-53 MC-3: the same "vs cheapest" pill as the site's Bazaar tab, beside Fill.
         const vs = vsCheapest(s.sellAt, s.market, Date.now());
         if (vs.label) box.append(el("span", { class: `totr-vs totr-vs--${vs.band}`, title: vs.title }, vs.label));
@@ -2247,7 +2315,7 @@
       const s = sell.get(r.itemId) || {};
       const name = (nameNode(r.row) || {}).textContent || "Item";
       const choices = [];
-      if (s.sellAt != null) choices.push({ label: `Sell list (${(s.ruleLabel || "").replace(/^.*?:\s*/, "") || "your rule"})`, price: s.sellAt, main: true });
+      if (s.sellAt != null && canFillFrom(s, Date.now())) choices.push({ label: `Sell list (${(s.ruleLabel || "").replace(/^.*?:\s*/, "") || "your rule"})${isCached(s) ? ` · ${agoText(Date.now() - s.cachedAt)}` : ""}`, price: s.sellAt, main: true });
       if (s.teMarketValue && s.teMarketValue !== s.sellAt) choices.push({ label: "TE market value", price: s.teMarketValue });
       const cheapest = { label: "Cheapest bazaar now", price: null, loading: true };
       choices.push(cheapest);
@@ -2394,7 +2462,9 @@
       let line = document.getElementById("totr-bzline");
       const loaded = list.filter((r) => sell.get(r.itemId));
       const byHand = loaded.filter((r) => sell.get(r.itemId).sellAt == null).length;
-      const text = lastError ? `Overseer: ${lastError}` : `Overseer prices from your sell list${byHand ? ` · ${byHand} priced by hand` : ""}${stockNote ? ` · ${stockNote}` : ""} · v${VERSION}`;
+      const oldest = loaded.reduce((m, r) => { const s = sell.get(r.itemId); return isCached(s) ? Math.min(m, s.cachedAt) : m; }, Infinity);
+      const cachedNote = Number.isFinite(oldest) ? ` · showing prices from ${agoText(Date.now() - oldest)}, refreshing…` : "";
+      const text = lastError ? `Overseer: ${lastError}${cachedNote}` : `Overseer prices from your sell list${byHand ? ` · ${byHand} priced by hand` : ""}${stockNote ? ` · ${stockNote}` : ""} · v${VERSION}`;
       if (line && line.isConnected) { if (line.textContent !== text) line.textContent = text; return; }
       const parent = list[0] && list[0].row.parentElement;
       const anchor = parent && (parent.closest("table") || parent);
@@ -2405,7 +2475,8 @@
 
     async function load(list) {
       if (Date.now() < retryAfter) return false;
-      const ids = [...new Set(list.map((r) => r.itemId).filter((id) => id && !sell.has(id) && !pending.has(id)))].slice(0, 100);
+      // 0.8.18: rows showing CACHED prices are asked for again until a fresh answer lands.
+      const ids = [...new Set(list.map((r) => r.itemId).filter((id) => id && (!sell.has(id) || isCached(sell.get(id))) && !pending.has(id)))].slice(0, 100);
       if (!ids.length) return false;
       ids.forEach((id) => pending.add(id));
       try {
@@ -2415,7 +2486,8 @@
         const refsAt = Date.parse((res && res.referencesAt) || "");
         if (Number.isFinite(refsAt)) fresh.refsAt = fresh.refsAt == null ? refsAt : Math.min(fresh.refsAt, refsAt);
         for (const it of (res && res.items) || []) sell.set(it.itemId, it);
-        for (const id of ids) if (!sell.has(id)) sell.set(id, null);
+        for (const id of ids) if (!sell.has(id) || isCached(sell.get(id))) sell.set(id, null);
+        gmSet(STORE.sellCache, sellCachePut(gmGet(STORE.sellCache, {}), (res && res.items) || [], now));
         lastError = null;
       } catch (err) {
         const permanent = (err && [401, 402, 403].includes(err.status)) || /Unknown action/i.test(String(err && err.message));
@@ -2427,6 +2499,10 @@
         // unloaded and the next pass asks again after a short pause.
         if (permanent) for (const id of ids) sell.set(id, null);
         else {
+          // 0.8.18: show the last prices this page saw instead of nothing (labelled, and
+          // Fill won't type them once they're over 10 minutes old).
+          const cached = sellCacheGet(gmGet(STORE.sellCache, {}), ids.filter((id) => !sell.has(id)), Date.now());
+          for (const [id, item] of cached) sell.set(id, item);
           retryAfter = Date.now() + SELL_RETRY_MS;
           // Torn's bazaar page can sit still, so don't wait for a DOM change to ask again.
           if (IS_BROWSER) setTimeout(() => { run().catch(() => {}); }, SELL_RETRY_MS + 50);
@@ -4182,7 +4258,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
