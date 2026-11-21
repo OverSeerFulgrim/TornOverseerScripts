@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.35.3
+// @version      0.36.0
 // @description  Watcher-focused chain HUD, docked as an Overseer bar in Torn's sidebar (pop it out for the full panel): zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -43,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.35.3";
+      : "") || "0.36.0";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -165,6 +165,8 @@
     celebrate: "tocw_celebrate",
     targetIds: "tocw_target_ids",
     targetIndex: "tocw_target_index",
+    // v0.36.0 favourites: { [playerId]: name } for the hit list, filled by the ☆ buttons.
+    targetNames: "tocw_target_names",
     // Which panel tab is open (chain | war | bank). A tab that isn't available falls
     // back to chain (v0.34.0 removed Leadership; a saved "leadership" lands on chain).
     tab: "tocw_tab",
@@ -235,6 +237,7 @@
     // click). targetIndex is where you are in the loop, persisted across page loads.
     targetIds: parseTargetIds(readString(STORE.targetIds, "")),
     targetIndex: Math.max(0, Math.round(readNumber(STORE.targetIndex, 0))),
+    targetFf: { map: {}, sig: "", at: 0, error: null, loading: false },
     // Faction-wide watcher defaults from the backend get payload (migration 0098), or
     // null. Leadership sets these once so every member's panel adopts them.
     factionConfig: null,
@@ -382,9 +385,44 @@
     return fac > 0 ? fac : 0;
   }
 
+  // v0.36.0: Torn PDA's GM storage is wiped on every page load, so on PDA every setting
+  // (the hit list, its position, alarms, layout) reset after each attack (Xnappum,
+  // 2026-11-21). In PDA only, NON-secret settings are mirrored to one page-storage record;
+  // a read falls back to it when GM has nothing. Secrets never go here (the session and
+  // the FF Scouter key have their own tagged mirrors). Reading the mirror needs no PDA
+  // check — off PDA nothing ever writes it — which also avoids racing PDA's bridge at load.
+  const PDA_PREFS = "tocw_pda_prefs";
+
+  function readPdaPrefs() {
+    try {
+      const raw = localStorage.getItem(PDA_PREFS);
+      const value = raw ? JSON.parse(raw) : null;
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function writePdaPref(key, value) {
+    if (SECRET_KEYS.has(key) || !isTornPda()) return;
+    try {
+      const prefs = readPdaPrefs();
+      prefs[key] = value;
+      localStorage.setItem(PDA_PREFS, JSON.stringify(prefs));
+    } catch {
+      /* storage full or blocked — the setting just lasts for this page, as before */
+    }
+  }
+
   function gmGet(key, fallback) {
     try {
-      if (typeof GM_getValue === "function") return GM_getValue(key, fallback);
+      if (typeof GM_getValue === "function") {
+        if (SECRET_KEYS.has(key)) return GM_getValue(key, fallback);
+        const value = GM_getValue(key);
+        if (value !== undefined) return value;
+        const prefs = readPdaPrefs();
+        return Object.prototype.hasOwnProperty.call(prefs, key) ? prefs[key] : fallback;
+      }
     } catch {
       /* ignore */
     }
@@ -406,6 +444,7 @@
     try {
       if (typeof GM_setValue === "function") {
         GM_setValue(key, value);
+        writePdaPref(key, value);
         return true;
       }
     } catch {
@@ -2708,6 +2747,13 @@
       .tocw-wr-bar { height: 6px; border-radius: 3px; background: #3b1517; overflow: hidden; } .tocw-wr-bar.thin { height: 4px; background: #0b0e13; }
       .tocw-wr-bar > div { height: 100%; background: #3ecf8e; } .tocw-wr-strip.stop .tocw-wr-bar > div { background: #e23b3b; } .tocw-wr-strip.warn .tocw-wr-bar > div { background: #e0a23b; }
       .tocw-wr-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+      .tocw-wr-star { background: none; border: 0; padding: 0 4px; margin-left: 4px; font-size: 16px; line-height: 1; cursor: pointer; color: #6b7a8c; vertical-align: middle; }
+      .tocw-wr-star.on { color: #f2c94c; }
+      .tocw-tgt-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid #22303f; }
+      .tocw-tgt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tocw-tgt-next { font-size: 10px; font-weight: 700; color: #f2c94c; text-transform: uppercase; }
+      .tocw-tgt-add { display: flex; gap: 6px; margin: 8px 0 4px; }
+      .tocw-tgt-add input { flex: 1; min-width: 0; }
       .tocw-wr-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; background: #1d2633; color: #9aa7b8; }
       .tocw-wr-badge.ready { background: rgba(62,207,142,.14); color: #3ecf8e; } .tocw-wr-badge.hosp { background: rgba(226,59,59,.16); color: #f25151; }
       .tocw-wr-badge.away { background: rgba(62,166,224,.14); color: #6cb6e6; } .tocw-wr-badge.jail { background: rgba(224,162,59,.16); color: #e0a23b; }
@@ -4893,8 +4939,73 @@
   // key vanished after every fight (Xnappum, 2026-11-14). An FF Scouter key IS a Torn key
   // registered once at ffscouter.com, so with no saved key PDA's own injected key is used
   // instead — nothing new is stored, and nothing is put in page-readable localStorage.
+  // v0.36.0: on PDA a typed FF Scouter key is also kept in page storage, tagged with the
+  // Torn account (like the session mirror) so another account on the phone never picks it
+  // up — but only after Torn confirms it is NOT a Full-access key (owner-approved
+  // 2026-11-21). FF Scouter's own script keeps the same key in page storage everywhere.
+  const PDA_FF_MIRROR = "tocw_pda_ff";
+
+  function readPdaFfKey() {
+    const tornKey = settings().tornKey;
+    if (!tornKey) return "";
+    try {
+      const raw = localStorage.getItem(PDA_FF_MIRROR);
+      const m = raw ? JSON.parse(raw) : null;
+      return m && typeof m.f === "string" && m.a === keyTag(tornKey) ? m.f.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function rememberPdaFfKey(ffKeyValue) {
+    const tornKey = settings().tornKey;
+    if (!isTornPda() || !tornKey || !ffKeyValue) return false;
+    try {
+      localStorage.setItem(PDA_FF_MIRROR, JSON.stringify({ f: ffKeyValue, a: keyTag(tornKey) }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function forgetFfKey() {
+    gmSet(STORE.ffKey, "");
+    try {
+      localStorage.removeItem(PDA_FF_MIRROR);
+    } catch {
+      /* ignore */
+    }
+    state.war.ff = {};
+    state.war.ffIds = "";
+    state.war.ffError = null;
+    state.targetFf = { map: {}, sig: "", at: 0, error: null };
+  }
+
+  /** Torn `/key/info` reply → true when the key is Full access (level 4 or a "Full" type). */
+  function keyInfoIsFull(data) {
+    const info = data?.info && typeof data.info === "object" ? data.info : data || {};
+    const access = info.access && typeof info.access === "object" ? info.access : {};
+    const level = Number(info.access_level ?? access.level);
+    const type = String(info.access_type ?? access.type ?? "");
+    return (Number.isFinite(level) && level >= 4) || /full/i.test(type);
+  }
+
+  // Ask Torn what kind of key this is. Resolves "full" | "ok" | "unknown" (no answer).
+  async function checkFfKeyAccess(key) {
+    try {
+      const url = new URL("https://api.torn.com/v2/key/info");
+      url.searchParams.set("key", key);
+      url.searchParams.set("comment", COMMENT);
+      const data = await requestJson(url.toString());
+      if (!data || typeof data !== "object" || data.error) return "unknown";
+      return keyInfoIsFull(data) ? "full" : "ok";
+    } catch {
+      return "unknown";
+    }
+  }
+
   function savedFfKey() {
-    return readString(STORE.ffKey, "").trim();
+    return readString(STORE.ffKey, "").trim() || readPdaFfKey();
   }
 
   function ffKey() {
@@ -5213,7 +5324,7 @@
     ].join("");
     return `<div class="tocw-wr-row${row.isMine ? " mine" : ""}${row.priority === "avoid" ? " avoid" : ""}">
       <div class="tocw-wr-full">
-        <div class="tocw-wr-name"><span class="tocw-wr-dot ${row.dot}" aria-hidden="true"></span>${profileLink(row.id, row.name)} <span class="tocw-wr-muted">[${row.id}] · lvl ${row.level}</span>${badges}</div>
+        <div class="tocw-wr-name"><span class="tocw-wr-dot ${row.dot}" aria-hidden="true"></span>${profileLink(row.id, row.name)} <span class="tocw-wr-muted">[${row.id}] · lvl ${row.level}</span>${badges}${targetStarHtml(row.id, row.name, "tocw-wr-star")}</div>
         ${row.stateLine ? `<div class="tocw-wr-state ${row.dot}">${escapeHtml(row.stateLine)}</div>` : ""}
         ${row.flight ? `<div class="tocw-wr-fine">${escapeHtml(row.flight.route)} · ${escapeHtml(row.flight.lands)}</div>` : ""}
         ${row.note ? `<div class="tocw-wr-fine note">Order: ${escapeHtml(row.note)}</div>` : ""}
@@ -5397,6 +5508,14 @@
     for (const b of box.querySelectorAll("[data-tocw-war-pledge]")) {
       b.addEventListener("click", () => void warAct("pledge", { pledge: b.getAttribute("data-tocw-war-pledge") }));
     }
+    for (const b of box.querySelectorAll("[data-tocw-star]")) {
+      b.addEventListener("click", () => {
+        const name = b.getAttribute("data-tocw-star-name") || "";
+        const result = toggleTarget(Number(b.getAttribute("data-tocw-star")), name);
+        state.notice = starMessage(result, name);
+        render();
+      });
+    }
     for (const b of box.querySelectorAll("[data-tocw-war-view]")) {
       b.addEventListener("click", () => {
         W.view = b.getAttribute("data-tocw-war-view") === "priority" ? "priority" : "all";
@@ -5529,6 +5648,226 @@
       return `<div class="tocw-alert">Your Torn key isn't returning live chain data — it likely needs <strong>faction API access</strong>. Ask leadership to enable it; until then the panel falls back to the Overseer cache, which lags and can't resolve names.</div>`;
     }
     return "";
+  }
+
+  // ---- v0.36.0 favourites: the ☆ buttons (War Room rows, Torn profile pages) and the
+  // named list in Settings all edit the same hit list the HIT button cycles.
+  const MAX_TARGETS = 50;
+
+  function readTargetNames() {
+    const value = gmGet(STORE.targetNames, {});
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  function isTarget(id) {
+    return state.targetIds.includes(Number(id));
+  }
+
+  function saveTargets(names) {
+    // Keep the HIT position on the same player where possible; restart if it fell off.
+    if (state.targetIndex >= state.targetIds.length) state.targetIndex = 0;
+    const keep = {};
+    for (const id of state.targetIds) if (names[id]) keep[id] = names[id];
+    gmSet(STORE.targetIds, state.targetIds.join(","));
+    gmSet(STORE.targetIndex, state.targetIndex);
+    gmSet(STORE.targetNames, keep);
+  }
+
+  /** Add or remove one player. Returns "added" | "removed" | "full" | "invalid". */
+  function toggleTarget(id, name) {
+    const n = Number(id);
+    if (!Number.isInteger(n) || n <= 0) return "invalid";
+    const names = readTargetNames();
+    const at = state.targetIds.indexOf(n);
+    if (at >= 0) {
+      state.targetIds.splice(at, 1);
+      if (at < state.targetIndex) state.targetIndex -= 1;
+      delete names[n];
+      saveTargets(names);
+      return "removed";
+    }
+    if (state.targetIds.length >= MAX_TARGETS) return "full";
+    state.targetIds.push(n);
+    const clean = String(name || "").trim().slice(0, 40);
+    if (clean) names[n] = clean;
+    saveTargets(names);
+    return "added";
+  }
+
+  /** Add several pasted ids (no names). Returns how many were new. */
+  function addTargetIds(raw) {
+    const names = readTargetNames();
+    let added = 0;
+    for (const n of parseTargetIds(raw)) {
+      if (state.targetIds.length >= MAX_TARGETS) break;
+      if (state.targetIds.includes(n)) continue;
+      state.targetIds.push(n);
+      added += 1;
+    }
+    if (added) saveTargets(names);
+    return added;
+  }
+
+  function targetStarHtml(id, name, cls) {
+    const on = isTarget(id);
+    return `<button type="button" class="${cls}${on ? " on" : ""}" data-tocw-star="${Number(id)}" data-tocw-star-name="${escapeHtml(name || "")}" title="${on ? "Remove from your hit list" : "Add to your hit list"}" aria-pressed="${on}">${on ? "★" : "☆"}</button>`;
+  }
+
+  function starMessage(result, name) {
+    const who = name || "That player";
+    if (result === "added") return `${who} added to your hit list.`;
+    if (result === "removed") return `${who} removed from your hit list.`;
+    if (result === "full") return `Your hit list is full (${MAX_TARGETS}). Remove someone in Settings first.`;
+    return "";
+  }
+
+  // FF Scouter stats for the hit list, cached like the War Room's.
+  async function loadTargetFf() {
+    const T = state.targetFf;
+    const key = ffKey();
+    const ids = state.targetIds.slice();
+    if (!key || ids.length === 0 || T.loading) return false;
+    const sig = [...ids].sort((a, b) => a - b).join(",") + "|" + keyTag(key);
+    if (sig === T.sig && Date.now() - T.at < FF_TTL_MS) return false;
+    T.loading = true;
+    try {
+      const next = {};
+      for (let i = 0; i < ids.length; i += 100) {
+        const url = new URL("https://ffscouter.com/api/v1/get-stats");
+        url.searchParams.set("key", key);
+        url.searchParams.set("targets", ids.slice(i, i + 100).join(","));
+        const data = await requestJson(url.toString());
+        if (data && typeof data === "object" && !Array.isArray(data) && data.error) {
+          throw new Error(typeof data.error === "string" ? data.error : data.error?.message || "FF Scouter returned an error.");
+        }
+        Object.assign(next, parseFfStats(data));
+      }
+      T.map = next;
+      T.error = null;
+    } catch (error) {
+      T.error = (error?.message || "FF Scouter didn't answer.") + (ffUsingPdaKey() ? " (Using your TornPDA key — register it once at ffscouter.com, or add your FF Scouter key below.)" : "");
+    } finally {
+      T.sig = sig;
+      T.at = Date.now();
+      T.loading = false;
+    }
+    return true;
+  }
+
+  function targetListHtml() {
+    const ids = state.targetIds;
+    const names = readTargetNames();
+    const T = state.targetFf;
+    const next = ids.length ? state.targetIndex % ids.length : -1;
+    const rows = ids.map((id, i) => {
+      const stat = T.map[id];
+      const ff = stat
+        ? `<span class="tocw-wr-tone ${warStatToneOf(stat.fairFight) || ""}">${stat.fairFight != null ? `FF ${stat.fairFight.toFixed(2)}` : ""}${stat.battleEstimateHuman ? ` · ~${escapeHtml(stat.battleEstimateHuman)}` : ""}</span>`
+        : "";
+      return `<div class="tocw-tgt-row">
+        <span class="tocw-tgt-name">${profileLink(id, names[id] || `ID ${id}`)} <span class="tocw-muted">[${id}]</span>${i === next ? ` <span class="tocw-tgt-next">next</span>` : ""}</span>
+        ${ff}
+        <button type="button" class="small tocw-tgt-x" data-tocw-target-remove="${id}" title="Remove">✕</button>
+      </div>`;
+    }).join("");
+    return `
+      ${rows || `<div class="tocw-muted">No targets yet. Tap ☆ on a War Room row or on a player's Torn profile, or add IDs below.</div>`}
+      ${T.error && ids.length ? `<div class="tocw-muted" style="color:#f0b45a;">FF Scouter: ${escapeHtml(T.error)}</div>` : ""}
+      <div class="tocw-tgt-add">
+        <input id="tocw-target-add" type="text" inputmode="numeric" placeholder="Add by player ID (paste several if you like)" />
+        <button id="tocw-target-add-btn" class="small" type="button">Add</button>
+      </div>
+      <div class="tocw-muted">${ids.length}/${MAX_TARGETS} · the ⚔️ HIT button opens each one in turn.${ids.length ? ` <button id="tocw-target-reset" class="small" type="button">Restart</button>` : ""}</div>`;
+  }
+
+  function wireTargetList() {
+    const host = document.getElementById("tocw-target-list");
+    if (!host) return;
+    const redraw = () => {
+      host.innerHTML = targetListHtml();
+      wireTargetList();
+    };
+    for (const b of host.querySelectorAll("[data-tocw-target-remove]")) {
+      b.addEventListener("click", () => {
+        toggleTarget(Number(b.getAttribute("data-tocw-target-remove")));
+        redraw();
+      });
+    }
+    const add = () => {
+      const input = document.getElementById("tocw-target-add");
+      const raw = input && "value" in input ? String(input.value) : "";
+      const before = state.targetIds.length;
+      const added = addTargetIds(raw);
+      redraw();
+      if (!added && raw.trim()) {
+        const msg = document.createElement("div");
+        msg.className = "tocw-muted";
+        msg.textContent = before >= MAX_TARGETS ? `Your hit list is full (${MAX_TARGETS}).` : "No new player IDs found there.";
+        host.appendChild(msg);
+      }
+    };
+    document.getElementById("tocw-target-add-btn")?.addEventListener("click", add);
+    document.getElementById("tocw-target-add")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        add();
+      }
+    });
+    document.getElementById("tocw-target-reset")?.addEventListener("click", () => {
+      state.targetIndex = 0;
+      gmSet(STORE.targetIndex, 0);
+      redraw();
+    });
+    void loadTargetFf().then((changed) => {
+      if (changed && state.settingsOpen && document.getElementById("tocw-target-list") === host) redraw();
+    });
+  }
+
+  // ☆ on a Torn profile page (profiles.php?XID=…). Torn builds the page after load, so
+  // wait (briefly) for a place to put it. Placement is best-effort: if none of the
+  // anchors appear, the button sits at the top of the content area.
+  function maybeAddProfileStar() {
+    if (!/\/profiles\.php$/.test(location.pathname)) return;
+    const id = Number(new URLSearchParams(location.search).get("XID"));
+    if (!Number.isInteger(id) || id <= 0) return;
+    const nameNow = () => {
+      const t = document.title.match(/^\s*(.+?)\s*\[(\d+)\]/);
+      if (t && Number(t[2]) === id) return t[1];
+      const h = document.querySelector("#skip-to-content");
+      const m = h?.textContent?.match(/^\s*(.+?)'s Profile/i);
+      return m ? m[1] : "";
+    };
+    const place = () => {
+      if (document.getElementById("tocw-profile-star")) return true;
+      const anchor = document.querySelector(".content-title") || document.querySelector("#skip-to-content")?.parentElement
+        || document.querySelector(".profile-wrapper") || document.querySelector(".content-wrapper");
+      if (!anchor) return false;
+      const wrap = document.createElement("div");
+      wrap.id = "tocw-profile-star";
+      const draw = () => {
+        const on = isTarget(id);
+        wrap.style.cssText = "margin:6px 0;display:inline-block;";
+        wrap.innerHTML = `<button type="button" class="tocw-profile-star${on ? " on" : ""}" aria-pressed="${on}" style="cursor:pointer;padding:4px 10px;border-radius:6px;border:1px solid ${on ? "#f2c94c" : "#7a2a2a"};background:${on ? "#2b2410" : "#3a1414"};color:${on ? "#f2c94c" : "#f3dede"};font-weight:700;font-size:12px;">${on ? "★ On your Overseer hit list" : "☆ Add to Overseer hit list"}</button><span class="tocw-profile-star-msg"></span>`;
+        wrap.querySelector("button").addEventListener("click", () => {
+          const name = nameNow();
+          const result = toggleTarget(id, name);
+          draw();
+          const msg = wrap.querySelector(".tocw-profile-star-msg");
+          if (msg && result === "full") msg.textContent = ` ${starMessage(result, name)}`;
+          render();
+        });
+      };
+      draw();
+      if (anchor.classList?.contains("content-title") || anchor.querySelector?.("#skip-to-content")) anchor.appendChild(wrap);
+      else anchor.insertBefore(wrap, anchor.firstChild);
+      return true;
+    };
+    if (place()) return;
+    const obs = new MutationObserver(() => {
+      if (place()) obs.disconnect();
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => obs.disconnect(), 20000);
   }
 
   // The HIT button cycles YOUR target list (player ids you set in Settings): each click
@@ -6270,7 +6609,6 @@
   // full-width panel. Same input ids as before; wireSettings() attaches the handlers.
   function renderSettingsBody() {
     const cfg = settings();
-    const idx = state.targetIds.length ? (state.targetIndex % state.targetIds.length) + 1 : 0;
     return `
       <div class="tocw-settings">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;">
@@ -6279,10 +6617,8 @@
       </div>
 
       <div style="padding:10px;border:1px solid #333;border-radius:8px;">
-        <label style="margin-bottom:4px;">Your attack targets <span class="tocw-muted">— player IDs (one per line or comma-separated)</span>
-          <textarea id="tocw-set-target-ids" rows="3" placeholder="123456&#10;789012&#10;…">${escapeHtml(state.targetIds.join("\n"))}</textarea>
-        </label>
-        <div class="tocw-muted">The ⚔️ HIT button opens each one in turn (one per click), so you hit down your list.${state.targetIds.length ? ` ${state.targetIds.length} target${state.targetIds.length === 1 ? "" : "s"} · currently at #${idx}. <button id="tocw-target-reset" class="small" type="button">Restart</button>` : ""}</div>
+        <div style="font-weight:700;font-size:14px;margin-bottom:6px;">Your hit list</div>
+        <div id="tocw-target-list">${targetListHtml()}</div>
         ${effHitUrl() ? `
           <div class="tocw-muted" style="margin-top:8px;border-top:1px solid #2b3d52;padding-top:8px;">
             You still have an old single-target link saved from before the list existed:
@@ -6343,9 +6679,10 @@
           <label>Torn API key ${pdaApiKey() ? "(provided by TornPDA)" : ""} <span class="tocw-muted">— connects your site session AND fetches the live chain/leaderboard for zero-lag data</span>
             <input id="tocw-set-torn-key" type="password" value="${escapeHtml(pdaApiKey() && cfg.tornKey === pdaApiKey() ? "" : cfg.tornKey)}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Limited-access Torn API key"}" />
           </label>
-          <label>FF Scouter key ${pdaApiKey() ? "(TornPDA key used when blank)" : ""} <span class="tocw-muted">— optional; shows stat estimates on War tab targets. Use a Torn key you've registered once at ffscouter.com. Sent only to ffscouter.com.${pdaApiKey() ? " TornPDA forgets a key typed here when the page changes, so leave it blank to use your PDA key." : ""}</span>
+          <label>FF Scouter key ${pdaApiKey() ? "(TornPDA key used when blank)" : ""} <span class="tocw-muted">— optional; shows stat estimates on War tab targets and your hit list. Use a Limited Torn key you've registered once at ffscouter.com. Sent only to ffscouter.com.${pdaApiKey() ? " On TornPDA it's kept on this phone for your account; Full-access keys are refused." : ""}</span>
             <input id="tocw-set-ff-key" type="password" value="${escapeHtml(savedFfKey())}" autocomplete="off" placeholder="${pdaApiKey() ? "Using the TornPDA key" : "Your FF Scouter-registered key"}" />
           </label>
+          ${savedFfKey() ? `<button id="tocw-ff-clear" class="small" type="button" style="margin:-4px 0 8px;">Clear FF Scouter key</button>` : ""}
           <label>Site session token
             <input id="tocw-set-session" type="password" value="${escapeHtml(cfg.sessionToken)}" autocomplete="off" />
           </label>
@@ -6406,12 +6743,7 @@
       state.alarmTone = ALARM_TONES.includes(tone) ? tone : "beep";
       state.alarmVolume = clampVolume(Number(valueOf("tocw-set-alarm-volume")) / 100);
       state.chainGoalPref = Math.max(0, Math.round(Number(valueOf("tocw-set-goal")) || 0));
-      // Your rotating attack list. If it changed, keep the loop position in range.
-      const targetEl = document.getElementById("tocw-set-target-ids");
-      const newTargets = parseTargetIds(targetEl && "value" in targetEl ? String(targetEl.value) : "");
-      const targetsChanged = newTargets.join(",") !== state.targetIds.join(",");
-      state.targetIds = newTargets;
-      if (targetsChanged || state.targetIndex >= newTargets.length) state.targetIndex = 0;
+      // v0.36.0: the hit list saves itself as you edit it (☆, ✕, Add) — not via this form.
       state.alarmVoice = checked("tocw-set-alarm-voice");
       state.autoFocus = checked("tocw-set-autofocus");
       state.celebrate = checked("tocw-set-celebrate");
@@ -6424,8 +6756,6 @@
       gmSet(STORE.alarmTone, state.alarmTone);
       gmSet(STORE.alarmVolume, state.alarmVolume);
       gmSet(STORE.chainGoal, state.chainGoalPref);
-      gmSet(STORE.targetIds, state.targetIds.join(","));
-      gmSet(STORE.targetIndex, state.targetIndex);
       gmSet(STORE.alarmVoice, state.alarmVoice);
       gmSet(STORE.autoFocus, state.autoFocus);
       gmSet(STORE.celebrate, state.celebrate);
@@ -6449,11 +6779,11 @@
       state.notice = "Old single-target link forgotten.";
       close();
     });
-    document.getElementById("tocw-target-reset")?.addEventListener("click", () => {
-      state.targetIndex = 0;
-      gmSet(STORE.targetIndex, 0);
-      state.notice = "Target list restarted.";
-      close();
+    wireTargetList();
+    document.getElementById("tocw-ff-clear")?.addEventListener("click", () => {
+      forgetFfKey();
+      state.notice = "FF Scouter key cleared.";
+      render();
     });
     document.getElementById("tocw-alarm-test")?.addEventListener("click", () => {
       primeAudio();
@@ -6482,10 +6812,30 @@
       // Never persist PDA's injected key — it is provided fresh on every load.
       if (pdaApiKey() && nextFf === pdaApiKey()) nextFf = "";
       if (nextFf !== savedFfKey()) {
-        gmSet(STORE.ffKey, nextFf);
-        state.war.ff = {};
-        state.war.ffIds = "";
-        state.war.ffError = null;
+        if (!nextFf) {
+          forgetFfKey();
+        } else {
+          gmSet(STORE.ffKey, nextFf);
+          state.war.ff = {};
+          state.war.ffIds = "";
+          state.war.ffError = null;
+          state.targetFf = { map: {}, sig: "", at: 0, error: null };
+          // PDA: keep it past this page only once Torn confirms it isn't Full access.
+          if (isTornPda()) {
+            const typed = nextFf;
+            void checkFfKeyAccess(typed).then((verdict) => {
+              if (verdict === "full") {
+                forgetFfKey();
+                state.notice = "That FF Scouter key is a Full-access key, so it wasn't saved. Register a Limited key at ffscouter.com and use that.";
+              } else if (verdict === "ok") {
+                rememberPdaFfKey(typed);
+              } else {
+                state.notice = "Couldn't check the FF Scouter key with Torn, so it only lasts until the page changes. Save it again in a moment.";
+              }
+              render();
+            });
+          }
+        }
       }
       // Compare the key's VALUE, not just its presence: replacing a rejected key with a
       // working one is the main recovery path, and it would otherwise sit out the
@@ -7109,6 +7459,7 @@
     // WO-36: an Overseer "Open in Torn" link lands here with a one-time draft id.
     maybeRunCompose();
     window.addEventListener("hashchange", maybeRunCompose);
+    maybeAddProfileStar();
     migrateSecretsFromLocalStorage();
     createLauncher();
     // Persisted-on alarms: browsers block audio until a user gesture, so prime the
@@ -7216,6 +7567,17 @@
       module.exports = {
         state,
         settings,
+        gmGet,
+        gmSet,
+        STORE,
+        toggleTarget,
+        addTargetIds,
+        readTargetNames,
+        savedFfKey,
+        rememberPdaFfKey,
+        forgetFfKey,
+        keyInfoIsFull,
+        MAX_TARGETS,
         saveSessionToken,
         keyTag,
         attackTargetFromUrl,
