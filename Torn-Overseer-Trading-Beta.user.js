@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.18
+// @version      0.8.19
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -3966,6 +3966,7 @@
         s.watched = Array.isArray(res && res.watched) ? res.watched : [];
         s.deals = Array.isArray(res && res.deals) ? res.deals : [];
         s.checkedAt = (res && res.checkedAt) || new Date(now).toISOString();
+        s.checked = res && Number.isFinite(res.checked) ? res.checked : null;
         s.error = null;
         // Item market, with the player's own key: a few watched items per poll, in rotation.
         const key = prefs().tornKey;
@@ -4084,13 +4085,18 @@
     }
 
     function dealCard(d) {
-      const href = d.source === "market"
+      // 0.8.19: a deal from Overseer's market scan has no seller yet — open the item's page,
+      // where the bazaar strip lists the cheapest bazaars.
+      const href = d.source === "market" || (d.fromScan && !d.sellerId)
         ? `https://www.torn.com/page.php?sid=ItemMarket#/market/view=search&itemID=${d.itemId}`
         : d.sellerId ? `https://www.torn.com/bazaar.php?userId=${d.sellerId}&totr=${d.itemId}-${d.price}#/` : null;
+      const where = d.source === "market" ? "Item market"
+        : d.fromScan ? `Bazaar · market scan${d.seenAt ? " " + minutesAgo(d.seenAt, Date.now()) : ""}`
+        : `Bazaar${d.sellerName ? " · " + d.sellerName : ""}`;
       return el("div", { class: "totr-deal-card" },
         el("div", { class: "totr-deal-main" },
           el("div", null, el("b", null, d.name || `Item ${d.itemId}`), el("span", { class: "totr-deal-pct" }, dealBadge(d.underPct))),
-          el("div", null, el("b", null, fmtMoney(d.price)), el("span", { class: "totr-muted" }, ` · ×${d.qtyUnder || 1} · ${d.source === "market" ? "Item market" : `Bazaar${d.sellerName ? " · " + d.sellerName : ""}`}`)),
+          el("div", null, el("b", null, fmtMoney(d.price)), el("span", { class: "totr-muted" }, d.fromScan && !d.qtyUnder ? ` · ${where}` : ` · ×${d.qtyUnder || 1} · ${where}`)),
           el("div", { class: "totr-muted" }, `Your price ${fmtMoney(d.buyPrice)}`)),
         href ? el("a", { class: "totr-deal-open", href }, "Open") : null);
     }
@@ -4174,7 +4180,7 @@
         }
         parts.push(body);
         parts.push(el("div", { class: "totr-sheet-foot" },
-          el("span", null, `${s.checkedAt ? "Checked " + minutesAgo(s.checkedAt, Date.now()) : "Checking…"} · ${(s.watched || []).length} watched`),
+          el("span", null, `${s.checkedAt ? "Checked " + minutesAgo(s.checkedAt, Date.now()) : "Checking…"} · ${(s.watched || []).length} watched${Number.isFinite(s.checked) ? ` · ${s.checked} read live` : ""}`),
           el("a", { href: `${SITE_URL}/trading/buy-list`, target: "_blank", rel: "noopener" }, "Edit buy list")));
       }
       sheet.replaceChildren(...parts);
