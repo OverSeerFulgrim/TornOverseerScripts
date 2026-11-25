@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.25
+// @version      0.8.26
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
-// @antifeature  membership  Needs an Overseer Trading subscription (tornoverseer.com)
+// @antifeature  membership  Needs a free Torn Overseer account (sign in at tornoverseer.com with a Limited Torn key)
 // @match        https://www.torn.com/trade.php*
 // @match        https://www.torn.com/bazaar.php*
 // @match        https://www.torn.com/page.php?sid=ItemMarket*
