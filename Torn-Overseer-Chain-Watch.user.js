@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.36.1
+// @version      0.36.2
 // @description  Watcher-focused chain HUD, docked as an Overseer bar in Torn's sidebar (pop it out for the full panel): zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -4502,12 +4502,28 @@
     return typeof ff.get === "function" ? ff.get(id) : ff[id];
   }
 
+  /**
+   * Reserve at the leader's limit SWITCHES (same rule as the site, which the server
+   * enforces): it releases my OLDEST claim that Command did not assign. If every claim
+   * I hold is an order, Reserve is refused with "release it first".
+   */
+  function warSwitchCheck(myClaims) {
+    const nameOf = (r) => r.targetName ?? `#${r.targetId}`;
+    const age = (r) => r.createdAt ?? r.expiresAt ?? "";
+    const byAge = [...myClaims].sort((a, b) => String(age(a)).localeCompare(String(age(b))) || a.targetId - b.targetId);
+    const movable = byAge.find((r) => !r.assigned);
+    if (movable) return { ok: true, releases: nameOf(movable) };
+    return { ok: false, reason: `Command assigned you ${nameOf(byAge[0])} — release it first` };
+  }
+
   function warBuildCards(st, ff, nowMs) {
     const nowSec = Math.floor(nowMs / 1000);
     const resByTarget = new Map(st.reservations.map((r) => [r.targetId, r]));
     const orderByTarget = new Map(st.orders.map((o) => [o.targetId, o]));
-    const held = st.reservations.filter((r) => r.attackerId === st.me.playerId).length;
+    const myClaims = st.reservations.filter((r) => r.attackerId === st.me.playerId);
+    const held = myClaims.length;
     const limit = st.limits.reservationsPerMember;
+    const atLimit = held > 0 && held >= limit ? warSwitchCheck(myClaims) : null;
     const rules = warRulesOf(st);
     return st.enemy.members.map((m) => {
       const kind = warStateKindOf(m, nowSec);
@@ -4525,7 +4541,7 @@
       else if (reservation) reserve = { ok: false, reason: `Reserved by ${reservation.attackerName ?? "someone"}` };
       else if (locks.reserve) reserve = { ok: false, reason: locks.reserve };
       else if (priority === "avoid") reserve = { ok: false, reason: "Command marked this target Avoid" };
-      else if (held >= limit) reserve = { ok: false, reason: `You already hold ${held} — the leader's limit` };
+      else if (atLimit) reserve = atLimit;
       return {
         id: m.id,
         name: m.name,
@@ -4898,14 +4914,17 @@
       };
     }
     const order = (st.orders || []).find((o) => o.targetId === targetId);
-    const held = (st.reservations || []).filter((x) => x.attackerId === st.me.playerId).length;
+    const myClaims = (st.reservations || []).filter((x) => x.attackerId === st.me.playerId);
+    const held = myClaims.length;
     const limit = st.limits?.reservationsPerMember ?? 1;
+    const atLimit = held > 0 && held >= limit ? warSwitchCheck(myClaims) : null;
     const reason = rules.close
       ? "Close to the stop — no new claims"
       : order?.priority === "avoid"
         ? "Command marked this target Avoid"
-        : held >= limit ? `You already hold ${held} — the leader's limit` : null;
-    return { kind: "free", text: "Free · nobody holds this target", held, limit, reason };
+        : atLimit && !atLimit.ok ? atLimit.reason : null;
+    const releases = !reason && atLimit && atLimit.ok ? atLimit.releases : null;
+    return { kind: "free", text: "Free · nobody holds this target", held, limit, reason, releases };
   }
 
   // ── War tab state + IO ─────────────────────────────────────────────────────────────
@@ -5305,7 +5324,8 @@
   function warClaimCell(row, busy, nowMs) {
     if (row.claim.kind === "free") {
       return `<button class="tocw-wr-btn primary" data-tocw-war-reserve="${row.id}" ${busy || !row.reserve.ok ? "disabled" : ""} ${row.reserve.ok ? "" : `title="${escapeHtml(row.reserve.reason)}"`}>Reserve</button>
-        ${row.reserve.ok ? "" : `<div class="tocw-wr-fine">${escapeHtml(row.reserve.reason)}</div>`}`;
+        ${row.reserve.ok ? "" : `<div class="tocw-wr-fine">${escapeHtml(row.reserve.reason)}</div>`}
+        ${row.reserve.ok && row.reserve.releases ? `<div class="tocw-wr-fine warn">Releases ${escapeHtml(row.reserve.releases)}</div>` : ""}`;
     }
     const until = new Date(row.reservation.expiresAt).getTime();
     if (row.claim.kind === "mine") {
@@ -5567,7 +5587,7 @@
     }
     return `<div class="tocw-ab free"><span class="tocw-ab-dot"></span><span style="flex:1;"><strong>Free</strong> · nobody holds this target · you hold ${b.held} of ${b.limit}</span>${b.reason
       ? `<span class="tocw-wr-fine">${escapeHtml(b.reason)}</span>`
-      : `<button class="tocw-wr-btn red" data-tocw-ab-reserve>Reserve 5 min</button>`}</div>`;
+      : `${b.releases ? `<span class="tocw-wr-fine warn">Releases ${escapeHtml(b.releases)}</span>` : ""}<button class="tocw-wr-btn red" data-tocw-ab-reserve>Reserve 5 min</button>`}</div>`;
   }
 
   function drawAttackBanner() {
@@ -7684,6 +7704,7 @@
         warReservationSecondsLeft,
         warRuleLocks,
         warBuildCards,
+        warSwitchCheck,
         warSortCards,
         warListRows,
         warAttacksNotice,

@@ -165,7 +165,10 @@ test("attack-page strip: mine, held, free, stop", () => {
   const free = cw.warBannerFor(st, 3, nowMs);
   assert.equal(free.kind, "free");
   assert.equal(free.reason, null);
-  assert.equal(cw.warBannerFor(roomState({ limits: { reservationsPerMember: 1 } }), 3, nowMs).reason, "You already hold 1 — the leader's limit");
+  // At the limit Reserve switches: no refusal, and the banner names what it releases.
+  const atLimit = cw.warBannerFor(roomState({ limits: { reservationsPerMember: 1 } }), 3, nowMs);
+  assert.equal(atLimit.reason, null);
+  assert.equal(atLimit.releases, "E1");
   assert.equal(cw.warBannerFor(st, 999, nowMs).kind, "free"); // not on the roster we know — still say who holds it
   assert.equal(cw.warBannerFor(roomState({ room: null }), 1, nowMs), null);
   const stop = roomState({ rules: { offlineOnly: false, idleCountsOffline: false, stopAt: 100, score: 120, scoreAvailable: true, reached: true, close: false, toGo: 0, stoppedAt: null, setByName: null, setAt: null, canEdit: false } });
@@ -181,4 +184,22 @@ test("launcher alert: a claim jump, a release, the stop — and dismissals clear
   assert.equal(cw.warAlert(), null);
   reset(roomState({ me: { ...roomState().me, releasedBy: { targetId: 1, targetName: "E1", byName: "Lead", at: iso(NOW) } } }));
   assert.match(cw.warAlert(), /Lead released your reservation/);
+});
+
+test("Reserve at the limit switches — and never moves a claim Command assigned (0.36.2)", () => {
+  const nowMs = NOW * 1000;
+  const free = (st) => cw.warBuildCards(st, null, nowMs).find((c) => c.id === 3).reserve;
+  assert.deepEqual(free(roomState({ limits: { reservationsPerMember: 1 } })), { ok: true, releases: "E1" });
+  assert.deepEqual(free(roomState()), { ok: true }); // under the limit: a plain reserve
+  const ordered = roomState({
+    limits: { reservationsPerMember: 1 },
+    reservations: [{ targetId: 1, targetName: "E1", attackerId: 100, attackerName: "Me", assigned: true, expiresAt: iso(NOW + 200) }],
+  });
+  assert.deepEqual(free(ordered), { ok: false, reason: "Command assigned you E1 — release it first" });
+  assert.equal(cw.warBannerFor(ordered, 3, nowMs).reason, "Command assigned you E1 — release it first");
+  // The oldest own claim goes first; createdAt wins over expiry when the site sends it.
+  assert.deepEqual(cw.warSwitchCheck([
+    { targetId: 5, targetName: "New", assigned: false, createdAt: iso(NOW - 10), expiresAt: iso(NOW + 50) },
+    { targetId: 6, targetName: "Old", assigned: false, createdAt: iso(NOW - 90), expiresAt: iso(NOW + 290) },
+  ]), { ok: true, releases: "Old" });
 });
