@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Chain Watch
 // @namespace    torn-overseer
-// @version      0.36.0
+// @version      0.36.1
 // @description  Watcher-focused chain HUD, docked as an Overseer bar in Torn's sidebar (pop it out for the full panel): zero-lag live drop timer + hits from Torn, opt-in drop/shift alarms (sound/vibrate/flash), active + your-slot highlight, shift signup, and the War Room (reserve targets, claims, war rules) during a war. Read-only — never attacks for you.
 // @author       OverSeerFulgrim, BreadHerring
 // @license      MIT
@@ -43,7 +43,7 @@
   const VERSION =
     (typeof GM_info === "object" && GM_info && GM_info.script && typeof GM_info.script.version === "string"
       ? GM_info.script.version
-      : "") || "0.36.0";
+      : "") || "0.36.1";
   const UPDATE_URL = "https://raw.githubusercontent.com/OverSeerFulgrim/TornOverseerScripts/main/Torn-Overseer-Chain-Watch.user.js";
   // The Overseer web app host — used for the "open the site to publish" deep-link and the
   // manual paste-a-link placeholder in Settings. (The script no longer runs on the site;
@@ -3723,6 +3723,8 @@
     gmSet(STORE.tab, state.tab);
     if (state.tab === "war") {
       state.war.loadedAt = 0; // poll now, not in up to 8s
+      state.war.triedAt = 0;
+      state.war.blockedUntil = 0; // you opened it: ask again even after a refusal
       state.war.scoreAt = 0;
     }
     if (state.tab === "bank") void loadBank(false);
@@ -4364,6 +4366,11 @@
   const WAR_BARS_MS = 60000; // energy / life shared with Command while the tab is open
   const WAR_POLL_TIMEOUT_MS = 15000;
   const WAR_ATTACK_PAGE_MS = 15000; // the claim banner on Torn's attack page
+  // The War Room said no (401/403: not on the faction's roster, no faction, a dead
+  // session): stop asking for a while. Before 0.36.1 a refused peek never stamped a
+  // time, so the 1s loop re-asked every second — one install made 64,000 refused calls
+  // in 15 hours (2026-11-21). Opening the War tab, or a fresh session, asks again.
+  const WAR_REFUSED_BACKOFF_MS = 10 * 60000;
   const WAR_RESERVATION_SECONDS = 300;
   const WAR_ALARM_LEAD_S = 30;
   const FF_TTL_MS = 10 * 60000;
@@ -4905,6 +4912,9 @@
   function freshWarState() {
     return {
       st: null, loading: false, inFlight: false, error: null, notice: null, busy: false, loadedAt: 0, peekAt: 0,
+      // When the last poll of any kind finished (ok or not), and until when to stop
+      // asking after a refusal — so a failing poll waits its turn like a good one.
+      triedAt: 0, blockedUntil: 0,
       score: null, scoreAt: 0, scoreError: null,
       view: readString(STORE.warView, "all") === "priority" ? "priority" : "all",
       dismissedReleased: null, dismissedJump: null, dismissedJumper: null,
@@ -5025,6 +5035,7 @@
   async function warPoll({ peek = false, fresh = false } = {}) {
     const W = state.war;
     if (!hasBank() || (W.inFlight && !fresh)) return;
+    if (Date.now() < W.blockedUntil) return;
     W.inFlight = true;
     let timer = null;
     try {
@@ -5038,9 +5049,11 @@
       W.error = null;
     } catch (error) {
       if (!peek) W.error = error?.message || "Lost contact with the War Room — retrying.";
+      if (error && (error.status === 401 || error.status === 403)) W.blockedUntil = Date.now() + WAR_REFUSED_BACKOFF_MS;
     } finally {
       if (timer) clearTimeout(timer);
       W.inFlight = false;
+      W.triedAt = Date.now();
     }
   }
 
@@ -5239,14 +5252,14 @@
     if (!hasBank() || document.visibilityState !== "visible") return;
     const now = Date.now();
     if (warTabOnScreen() && warRoomOpen()) {
-      if (now - W.loadedAt >= WAR_POLL_MS && !W.inFlight) {
+      if (now - Math.max(W.loadedAt, W.triedAt) >= WAR_POLL_MS && !W.inFlight) {
         void warPoll().then(async () => {
           await Promise.all([warLoadScore(), warLoadFf()]);
           if (warTabOnScreen()) render({ background: true });
         });
       }
       void warShareBars();
-    } else if (now - Math.max(W.peekAt, W.loadedAt) >= WAR_PEEK_MS && !W.inFlight) {
+    } else if (now - Math.max(W.peekAt, W.loadedAt, W.triedAt) >= WAR_PEEK_MS && !W.inFlight) {
       void warPoll({ peek: true }).then(() => {
         if (!state.hidden) render({ background: true });
         updateLauncher();
@@ -7568,6 +7581,8 @@
         state,
         settings,
         gmGet,
+        warPoll,
+        warLoop,
         gmSet,
         STORE,
         toggleTarget,
