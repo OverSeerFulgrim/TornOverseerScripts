@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.19
+// @version      0.8.25
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -80,6 +80,7 @@
     sellMode: "totr_sell_mode",
     stripHeight: "totr_strip_height",
     sellCache: "totr_sell_cache", // 0.8.18: last sell_prices answers (prices only, no secrets)
+    keepOff: "totr_keep_off", // 0.8.25: item ids whose "keep 1" is switched off (Fill lists them all)
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
@@ -263,6 +264,30 @@
   /** A control that already fills the max ("Max", "fill max") — Torn's own or another script's. */
   function isMaxLabel(text) {
     return /^\s*(fill\s+)?max\s*$/i.test(String(text || ""));
+  }
+
+  /**
+   * 0.8.21 (WO-99): Company → Stock, the balanced order. Tops every product up to the same
+   * number of days at today's sales, as far as free storage (and company funds, when known)
+   * allow, so nothing runs out before the rest — the same rule as Overseer's Company → Stock →
+   * Plan order. items: [{ stock, daily, cost }] → { days, qty, units, cost }. Pure.
+   */
+  function balanceStock(items, freeSpace, funds) {
+    const list = (items || []).map((it) => ({ stock: Math.max(0, Number(it.stock) || 0), daily: Math.max(0, Number(it.daily) || 0), cost: Math.max(0, Number(it.cost) || 0) }));
+    const free = Math.max(0, Number(freeSpace) || 0);
+    const cap = funds == null || !Number.isFinite(Number(funds)) ? null : Math.max(0, Number(funds));
+    const need = (d) => list.map((it) => (it.daily > 0 ? Math.max(0, Math.floor(it.daily * d - it.stock)) : 0));
+    const fits = (q) => {
+      let u = 0, c = 0;
+      for (let i = 0; i < q.length; i++) { u += q[i]; c += q[i] * list[i].cost; }
+      return u <= free && (cap == null || c <= cap);
+    };
+    let lo = 0, hi = 365;
+    for (let i = 0; i < 50; i++) { const mid = (lo + hi) / 2; if (fits(need(mid))) lo = mid; else hi = mid; }
+    const qty = need(lo);
+    let days = null;
+    list.forEach((it, i) => { if (it.daily > 0) { const d = (it.stock + qty[i]) / it.daily; days = days == null ? d : Math.min(days, d); } });
+    return { days, qty, units: qty.reduce((a, n) => a + n, 0), cost: qty.reduce((a, n, i) => a + n * list[i].cost, 0) };
   }
 
   /**
@@ -1012,6 +1037,7 @@
    */
   const ITEM_USES = ["oc", "crime", "use", "gear", "set", "none"];
   const USE_LABEL = { oc: "Used in OC", crime: "Crime tool", use: "Use it", gear: "Gear", set: "Set / museum", none: "No use" };
+  const USE_SHORT = { oc: "OC", crime: "crime tool", use: "use it", gear: "gear", set: "set", none: "no use" };
   const USE_HINT = {
     oc: "Torn lists this item for an organized crime role — keep one.",
     crime: "Torn's item text names a crime this helps or unlocks (Burglary, Larceny …) — keep one.",
@@ -1029,6 +1055,22 @@
   function keepQty(held, uses) {
     const n = Number.isFinite(held) && held > 0 ? Math.floor(held) : 0;
     return keepsOne(uses) ? Math.max(0, n - 1) : n;
+  }
+  /** 0.8.25: the "keep 1" switch per item — a saved list of item ids it is switched OFF for. */
+  function keepOffIds(value) { return new Set((Array.isArray(value) ? value : []).map(Number).filter((n) => Number.isSafeInteger(n) && n > 0)); }
+  function toggleKeepOff(value, itemId) {
+    const ids = keepOffIds(value);
+    const id = Number(itemId);
+    if (ids.has(id)) ids.delete(id); else ids.add(id);
+    return [...ids].sort((a, b) => a - b);
+  }
+  /**
+   * 0.8.25: Manage — hide the Fill button and the status pill when the listed price already IS
+   * the sell-list price (Fill would type the same number). Near misses keep their Fill button.
+   */
+  function priceMatches(listed, sellAt) {
+    const a = Number(listed), b = Number(sellAt);
+    return Number.isFinite(a) && Number.isFinite(b) && a > 1 && a === Math.round(b);
   }
   /** Does a row pass the Show filter? `null` = All; rows without data always pass. */
   function matchesUse(uses, filter) { return filter == null || uses == null || usesOf(uses).includes(filter); }
@@ -1461,10 +1503,22 @@
   .totr-total{font-size:24px;font-weight:800;font-variant-numeric:tabular-nums}
   .totr-mv{margin-left:6px;font:600 11px system-ui,sans-serif;color:#9aa7b8;white-space:nowrap}
   .totr-bz{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:6px;font:12px system-ui,sans-serif}
-  .totr-bz--manage{display:inline-grid;grid-template-columns:auto auto auto auto;align-items:center;column-gap:5px;row-gap:1px;margin-left:4px;white-space:nowrap;vertical-align:middle}
-  .totr-bz--manage .totr-mini{height:22px;margin-left:0}
-  .totr-bz--manage .totr-dollar{height:22px;width:22px}
-  .totr-bz--manage .totr-bz-profit{grid-column:1 / -1;font-size:11px;line-height:12px}
+  /* 0.8.20 (WO-86): Manage rows are one fixed two-line block that lines up row to row —
+     [Fill $X] [status] [$] over one muted line (paid · profit · free · uses).
+     No "· floor" word there: the purple Fill border and pink profit already say it. */
+  .totr-bz--manage{display:inline-grid;grid-template-columns:auto auto 22px;grid-template-areas:"fill state dollar" "sub sub sub";justify-content:end;align-items:center;column-gap:5px;row-gap:2px;margin-left:4px;white-space:nowrap;vertical-align:middle;max-width:100%}
+  .totr-bz--manage > .totr-mini,.totr-bz--manage > .totr-muted{grid-area:fill;justify-self:end}
+  .totr-bz--manage .totr-mini{height:20px;margin-left:0}
+  .totr-bz--manage .totr-dollar{grid-area:dollar;height:20px;width:22px}
+  .totr-bz--manage .totr-bz-state{grid-area:state;display:inline-block;width:56px;box-sizing:border-box;text-align:center;font-size:11px;line-height:16px;border:1px solid #3a475b;border-radius:9px}
+  .totr-bz--manage .totr-bz-state:empty{display:none}
+  /* 0.8.25: price already matches → no Fill, no pill; the row shows only $ and the muted line. */
+  .totr-bz [data-totr-fill][hidden]{display:none !important}
+  .totr-bz--manage .totr-bz-state--ok{border-color:#2f6b52}.totr-bz--manage .totr-bz-state--warn{border-color:#7a6431}.totr-bz--manage .totr-bz-state--info{border-color:#2f4f7a}.totr-bz--manage .totr-bz-state--low{border-color:#6b3f7a}
+  .totr-bz-sub{grid-area:sub;justify-self:end;max-width:100%;overflow:hidden;text-overflow:ellipsis;font-size:11px;line-height:12px;color:#8f9aab}
+  .totr-bz-sub .totr-bz-paid{color:#8f9aab}.totr-bz-sub .totr-bz-profit{font-weight:600}.totr-bz-sub .totr-bz-sub--free{color:#6fdc8c}
+  /* Torn's own Details content (weapon stats on temporary weapons) drew over the item name once the block sat there. */
+  [data-totr-details] > :not([data-totr-ui]){display:none !important}
   .totr-mini--floor{border-color:#c77dd8}
   .totr-mini--cached{border-style:dashed;opacity:.85}
   .totr-mini:disabled{opacity:.45;cursor:not-allowed}
@@ -1474,7 +1528,14 @@
   .totr-bz-profit{font-weight:700;color:#5fe0a6;white-space:nowrap}.totr-bz-profit--floor{color:#e2a6ef}.totr-bz-profit--loss{color:#ff8a8a}.totr-bz-paid{color:#c9d2de;white-space:nowrap}
   .totr-maxline{display:block;font-size:11px;color:#9ca3af;margin-top:2px;white-space:nowrap}
   .totr-use{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;white-space:nowrap;background:#262b33;color:#c9d1dc}.totr-use--oc{background:#2a1430;color:#f0a6ff}.totr-use--crime{background:#3a2a0f;color:#f0c674}.totr-use--use{background:#0f3324;color:#5fe0a6}.totr-use--gear{background:#16263f;color:#cfe0ff}.totr-use--set{background:#1d2a2a;color:#8fe3e3}
-  .totr-keep{font-size:11px;font-weight:700;color:#f0c674;white-space:nowrap}
+  .totr-keep{font:700 11px system-ui,sans-serif;color:#f0c674;white-space:nowrap;background:none;border:0;padding:0;cursor:pointer}
+  .totr-keep--off{color:#8f9aab;text-decoration:line-through}
+  /* 0.8.25: what an item is for, as small colour squares; the key is the Show bar up top. */
+  .totr-sq{display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;flex:none;background:#6b7280}
+  .totr-sq--oc{background:#d77ff0}.totr-sq--crime{background:#f0c674}.totr-sq--use{background:#5fe0a6}.totr-sq--gear{background:#6fa3ff}.totr-sq--set{background:#8fe3e3}.totr-sq--none{background:#6b7280}
+  .totr-sqs{display:inline-flex;gap:3px;align-items:center;vertical-align:middle}
+  .totr-under{display:flex;gap:6px;align-items:center;margin-top:1px;font:11px/12px system-ui,sans-serif;white-space:nowrap}
+  .totr-usebar .totr-sq{margin-right:5px}
   .totr-usebar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;font:12px system-ui,sans-serif;color:#9aa7b8}
   .totr-usebar button{font:700 11px system-ui,sans-serif;border-radius:12px;padding:3px 9px;background:#161d28;border:1px solid #3a475b;color:#c9d1dc;cursor:pointer}
   .totr-usebar button[aria-pressed="true"]{background:#16263f;border-color:#4c8dff;color:#cfe0ff}
@@ -2204,15 +2265,18 @@
     function stateFor(r, s) {
       const listed = listedPrice(r.price);
       if (!s || s.sellAt == null || listed == null) return null;
-      if (s.floor != null && listed < s.floor) return { text: "under floor", cls: "low", off: true };
+      if (s.floor != null && listed < s.floor) return { text: "< floor", cls: "low", off: true, hint: "Listed under your floor (cost + %)" };
       const d = driftPct(listed, s.sellAt);
       if (d == null) return null;
-      if (Math.abs(d) < 2) return { text: "✓", cls: "ok", off: false };
-      return { text: `${d > 0 ? "+" : ""}${d}%`, cls: d < 0 ? "info" : "warn", off: true };
+      // 0.8.25: an exact match shows nothing at all (refresh hides Fill too); a near miss says ≈.
+      if (Math.abs(d) < 2) return { text: "≈", cls: "ok", off: false, hint: `Within 2% of your sell-list price (${fmtMoney(s.sellAt)}) — Fill to match it exactly` };
+      return { text: `${d > 0 ? "+" : ""}${d}%`, cls: d < 0 ? "info" : "warn", off: true, hint: `Listed ${Math.abs(d)}% ${d > 0 ? "over" : "under"} your sell-list price (${fmtMoney(s.sellAt)})` };
     }
 
     /** 0.8.14 (WO-93 C): what Add may list — one fewer for OC / crime items, unless `all`. */
-    function listQty(r, all) { return all ? r.held : keepQty(r.held, sell.get(r.itemId) && sell.get(r.itemId).uses); }
+    // 0.8.25: "keep 1" switched off for this item (saved per item) lists every one.
+    function keepOn(itemId) { return !keepOffIds(gmGet(STORE.keepOff, [])).has(Number(itemId)); }
+    function listQty(r, all) { return all || !keepOn(r.itemId) ? r.held : keepQty(r.held, sell.get(r.itemId) && sell.get(r.itemId).uses); }
     function fillRow(r, price, all) {
       const s = sell.get(r.itemId);
       // 0.8.18: an automatic fill never types a sell-list price cached over 10 minutes ago.
@@ -2256,43 +2320,68 @@
       if (r.row.dataset.totr === key) { refresh(r); return; }
       r.row.querySelectorAll("[data-totr-row]").forEach((n) => n.remove());
       r.row.dataset.totr = key;
-      const box = el("span", { class: "totr-bz" + (isManage() ? " totr-bz--manage" : ""), "data-totr-ui": "1", "data-totr-row": "1" });
+      const manage = isManage();
+      const box = el("span", { class: "totr-bz" + (manage ? " totr-bz--manage" : ""), "data-totr-ui": "1", "data-totr-row": "1" });
+      // 0.8.20 (WO-86): on Manage the vs-cheapest pill becomes the status tooltip and Compare
+      // moves into the $ popup, so every row is the same [Fill] [status] [$] + one muted line.
+      let vsTitle = "";
       if (s && s.sellAt != null) {
         const cachedTitle = isCached(s) ? `Last loaded ${agoText(Date.now() - s.cachedAt)} — Overseer didn't answer just now. ` : "";
         box.append(el("button", {
-          class: "totr-mini" + (s.heldAtFloor ? " totr-mini--floor" : "") + (isCached(s) ? " totr-mini--cached" : ""), type: "button", disabled: stale,
+          class: "totr-mini" + (s.heldAtFloor ? " totr-mini--floor" : "") + (isCached(s) ? " totr-mini--cached" : ""), type: "button", disabled: stale, "data-totr-fill": "1",
           title: stale ? `${cachedTitle}Too old to fill — waiting for fresh prices.` : cachedTitle + (s.ruleLabel || ""), onclick: () => fillRow(r),
         }, `Fill ${fmtMoney(s.sellAt)}`));
-        // WO-53 MC-3: the same "vs cheapest" pill as the site's Bazaar tab, beside Fill.
+        // WO-53 MC-3: the same "vs cheapest" pill as the site's Bazaar tab, beside Fill (Add page).
         const vs = vsCheapest(s.sellAt, s.market, Date.now());
-        if (vs.label) box.append(el("span", { class: `totr-vs totr-vs--${vs.band}`, title: vs.title }, vs.label));
+        if (vs.label && !manage) box.append(el("span", { class: `totr-vs totr-vs--${vs.band}`, title: vs.title }, vs.label));
+        else if (vs.label) vsTitle = [`Sell-list price vs the cheapest bazaar: ${vs.label}`, vs.title].filter(Boolean).join(" — ");
       } else {
         box.append(el("span", { class: "totr-muted", title: (s && s.ruleLabel) || "" }, s && s.reason === "unknown_category" ? "Open the Bazaar tab on the site" : "Priced by hand"));
       }
       box.append(el("button", { class: "totr-dollar", type: "button", "aria-label": "Quick prices", onclick: (e) => openPopup(r, e.currentTarget) }, "$"));
-      box.append(el("span", { class: "totr-bz-state", "data-totr-state": "1" }));
-      // 0.7.13: what you paid, right on the Manage row — the reason to Fix or not, without
-      // opening Price check. Ledger cost of the ones you still hold (average when bought at
-      // different prices); nothing when the ledger has no open lot for the item.
-      const paid = paidText(s);
-      if (isManage() && paid) box.append(el("span", { class: "totr-bz-paid", title: "What you paid for the ones you still hold (your ledger's open lots; an average if you bought at different prices)" }, paid));
-      // 0.8.5 (WO-85): stock that cost you nothing (loot, a find, a perk) — what's safe to list
-      // at $1 without losing money. Nothing is priced for you; the pill only says so.
-      const free = isManage() ? freeLabel(s && s.stock) : null;
-      if (free) box.append(el("span", { class: `totr-free totr-free--${free.kind}`, title: free.title }, free.text));
-      // 0.8.14 (WO-93 C): what the item is for, and Keep 1 on OC / crime items (Add page).
-      for (const u of usesOf(s && s.uses)) box.append(el("span", { class: `totr-use totr-use--${u}`, title: USE_HINT[u] }, USE_LABEL[u]));
-      if (!isManage() && s && keepsOne(s.uses)) {
-        const left = keepQty(r.held, s.uses);
-        box.append(el("span", { class: "totr-keep", title: "Fill and FILL QTY leave one of this in your inventory: an OC role or a crime needs it." }, left ? `Keep 1 · lists ${left}` : "Keep 1 · not listed"));
-        box.append(el("button", { class: "totr-mini", type: "button", title: "List every one, including the last", onclick: () => fillRow(r, null, true) }, "List anyway"));
-      }
-      // 0.7.14 (WO-64): your bazaar vs the best trader vs the item market, on Overseer.
-      if (isManage() && r.itemId) box.append(el("a", { class: "totr-linkbtn", href: itemPageUrl(r.itemId, "sell"), target: "_blank", rel: "noopener", title: "Compare your bazaar, the best trader and the item market for this item" }, "Compare"));
+      box.append(el("span", { class: "totr-bz-state", "data-totr-state": "1", "data-totr-vs": vsTitle || null }));
       // 0.7.12: a loss reads red (it used to stay green with only a minus sign).
       const loss = s && s.sellAt != null && s.costEach != null && s.sellAt < s.costEach;
-      box.append(el("span", { class: "totr-bz-profit" + (s && s.heldAtFloor ? " totr-bz-profit--floor" : loss ? " totr-bz-profit--loss" : "") }, s && s.sellAt != null ? `${profitText(s, s.sellAt)}${s.heldAtFloor ? " · floor" : ""}` : ""));
+      const profitEl = () => el("span", { class: "totr-bz-profit" + (s && s.heldAtFloor ? " totr-bz-profit--floor" : loss ? " totr-bz-profit--loss" : "") }, s && s.sellAt != null ? `${profitText(s, s.sellAt)}${s.heldAtFloor && !manage ? " · floor" : ""}` : "");
+      if (manage) {
+        // 0.7.13 paid, profit, 0.8.5 (WO-85) free stock and 0.8.14 (WO-93) uses — as one muted
+        // line of words; the full explanations sit in its tooltip.
+        const parts = [], hints = [];
+        const paid = paidText(s);
+        if (paid) { parts.push(el("span", { class: "totr-bz-paid" }, paid)); hints.push("Paid: what you paid for the ones you still hold (your ledger's open lots; an average if you bought at different prices)."); }
+        if (s && s.sellAt != null && profitText(s, s.sellAt)) parts.push(profitEl());
+        const free = freeLabel(s && s.stock);
+        if (free) { parts.push(el("span", { class: `totr-bz-sub--${free.kind}` }, free.text.toLowerCase())); hints.push(free.title); }
+        // 0.8.25: uses as colour squares (the key is the Show bar up top), not words.
+        const uses = usesOf(s && s.uses);
+        if (uses.length) { parts.push(useSquares(uses)); for (const u of uses) hints.push(`${USE_LABEL[u]}: ${USE_HINT[u]}`); }
+        if (parts.length) box.append(el("span", { class: "totr-bz-sub", title: hints.join("\n") || null }, ...parts.flatMap((p, i) => (i ? [" · ", p] : [p]))));
+      } else {
+        // 0.8.25: what the item is for (colour squares) and the keep 1 switch sit under the item
+        // name, so the Add row stays one short line: [Fill $X] [vs] [$] profit.
+        const uses = usesOf(s && s.uses);
+        const under = el("div", { class: "totr-under", "data-totr-ui": "1", "data-totr-row": "1" });
+        if (uses.length) under.append(useSquares(uses));
+        if (s && keepsOne(s.uses)) {
+          const on = keepOn(r.itemId);
+          const left = keepQty(r.held, s.uses);
+          under.append(el("button", {
+            type: "button", class: "totr-keep" + (on ? "" : " totr-keep--off"), "aria-pressed": String(on),
+            title: on ? "Fill and FILL QTY leave one of this in your inventory (an OC role or a crime needs it). Click to list them all."
+              : "Switched off: Fill lists every one, the last included. Click to keep one back again.",
+            onclick: () => {
+              gmSet(STORE.keepOff, toggleKeepOff(gmGet(STORE.keepOff, []), r.itemId));
+              delete r.row.dataset.totr; // redraw this row with the new state
+              decorate(r);
+            },
+          }, on ? (left ? `keep 1 · lists ${left}` : "keep 1 · not listed") : "keep 1"));
+        }
+        const nameAt = nameNode(r.row);
+        if (under.childNodes.length && nameAt && nameAt.parentElement) nameAt.parentElement.append(under);
+        box.append(profitEl());
+      }
       const spot = placeFor(r);
+      if (spot && manage && spot === detailsCell(r)) spot.setAttribute("data-totr-details", "1");
       if (spot) spot.append(box); else r.price.insertAdjacentElement("afterend", box);
       if (!r.price.dataset.totrListen) { r.price.dataset.totrListen = "1"; r.price.addEventListener("input", () => refresh(r)); }
       refresh(r);
@@ -2301,11 +2390,20 @@
     function refresh(r) {
       const tag = r.row.querySelector("[data-totr-state]");
       if (!tag) return;
-      const st = isManage() ? stateFor(r, sell.get(r.itemId)) : null;
+      const s0 = sell.get(r.itemId);
+      // 0.8.25: on Manage, a price that already matches needs neither Fill nor a ✓.
+      const same = isManage() && !!s0 && priceMatches(listedPrice(r.price), s0.sellAt);
+      const fill = r.row.querySelector("[data-totr-fill]");
+      if (fill && fill.hidden !== same) fill.hidden = same;
+      const st = isManage() && !same ? stateFor(r, s0) : null;
       const text = st ? st.text : "";
       const cls = "totr-bz-state" + (st ? ` totr-bz-state--${st.cls}` : "");
       if (tag.textContent !== text) tag.textContent = text;
       if (tag.className !== cls) tag.className = cls;
+      const title = [st && st.hint, tag.getAttribute("data-totr-vs")].filter(Boolean).join("\n");
+      // 0.8.23: set it only when the text changes. Torn's own tooltip takes the title away while it
+      // shows; putting it back on every refresh made the browser's tooltip pop up as well (two boxes).
+      if (tag.dataset.tip !== title) { tag.dataset.tip = title; tag.title = title; }
     }
 
     // ---- $ popup: pick a price -----------------------------------------------------------
@@ -2337,6 +2435,8 @@
       };
       draw();
       const foot = el("div", { class: "totr-pick-foot" }, el("span", { class: "totr-muted" }, "Click a price to fill it"),
+        // 0.8.20 (WO-86): Compare moved here from the Manage row.
+        isManage() && r.itemId ? el("a", { class: "totr-linkbtn", href: itemPageUrl(r.itemId, "sell"), target: "_blank", rel: "noopener", title: "Compare your bazaar, the best trader and the item market for this item" }, "Compare") : null,
         el("button", { type: "button", class: "totr-linkbtn", onclick: () => { closePopup(); modules.priceCheck.toggle(r.itemId, r.row.closest("li, tr") || r.row, { float: true }); } }, "Full price check"));
       popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, head, list, foot);
       document.body.append(popup);
@@ -2422,19 +2522,56 @@
       const header = headerEl();
       if (header) { header.style.display = "flex"; header.style.alignItems = "center"; box.style.marginLeft = "auto"; header.append(box); }
       else {
-        const parent = list[0] && list[0].row.parentElement;
-        const anchor = parent && (parent.closest("table") || parent);
+        const anchor = listAnchor(list);
         if (anchor) anchor.insertAdjacentElement("beforebegin", el("div", { class: "totr-bar totr", "data-totr-ui": "1" }, el("strong", null, "Overseer"), box));
       }
     }
+    /**
+     * 0.8.22: where the Show chips and the status line go — just above Torn's list. Torn now
+     * lays the rows out absolutely inside a virtualized list, so anything put among the rows
+     * sat underneath row 1 (the faint text under the first item on Manage).
+     */
+    function listAnchor(list) {
+      const parent = list[0] && list[0].row.parentElement;
+      if (!parent) return null;
+      return parent.closest("[data-testid='virtualized-list']") || parent.closest("table") || parent;
+    }
     /** 0.8.14 (WO-93 C): hide rows that don't match the Show chip (FILL ALL then skips them too). */
+    // 0.8.24: Torn now places each row at a fixed spot in a virtualized list (translate: 0px Ypx),
+    // so hiding a row left a gap. Hide the row's whole slot and move the shown rows up; when the
+    // filter is cleared, put each row back on Torn's own spot.
+    function slotOf(r) { return r.row.closest("[data-testid='sortable-item']") || r.row; }
+    function yOf(n) { const m = String(n.style.translate || "").match(/(-?\d+(?:\.\d+)?)px\s*$/); return m ? Number(m[1]) : 0; }
     function applyUseFilter(list) {
       for (const r of list) {
         const s = sell.get(r.itemId);
         const hide = !matchesUse(s ? s.uses : null, useFilter);
-        if (hide && r.row.dataset.totrUseHidden !== "1") { r.row.dataset.totrUseHidden = "1"; r.row.style.display = "none"; }
-        else if (!hide && r.row.dataset.totrUseHidden === "1") { delete r.row.dataset.totrUseHidden; r.row.style.display = ""; }
+        const slot = slotOf(r);
+        if (slot !== r.row && r.row.dataset.totrUseHidden === "1") { delete r.row.dataset.totrUseHidden; r.row.style.display = ""; }
+        if (hide && slot.dataset.totrUseHidden !== "1") { slot.dataset.totrUseHidden = "1"; slot.style.display = "none"; }
+        else if (!hide && slot.dataset.totrUseHidden === "1") { delete slot.dataset.totrUseHidden; slot.style.display = ""; }
       }
+      restack(list);
+    }
+    function restack(list) {
+      const slots = list.map(slotOf).filter((n) => n.dataset && n.dataset.testid === "sortable-item");
+      if (!slots.length) return;
+      for (const n of slots) {
+        // Torn's own spot: read it again unless the row still sits where we put it.
+        if (!n.dataset.totrMoved || n.style.translate !== n.dataset.totrMoved) { n.dataset.totrY = String(yOf(n)); delete n.dataset.totrMoved; }
+      }
+      const ys = [...new Set(slots.map((n) => Number(n.dataset.totrY)))].sort((a, b) => a - b);
+      const step = ys.length > 1 ? ys[1] - ys[0] : (slots[0].offsetHeight || 36);
+      const shown = slots.filter((n) => n.dataset.totrUseHidden !== "1").sort((a, b) => Number(a.dataset.totrY) - Number(b.dataset.totrY));
+      shown.forEach((n, i) => {
+        if (useFilter == null) {
+          if (n.dataset.totrMoved) { n.style.translate = `0px ${n.dataset.totrY}px`; delete n.dataset.totrMoved; }
+          return;
+        }
+        const want = `0px ${i * step}px`;
+        if (n.style.translate !== want) n.style.translate = want;
+        n.dataset.totrMoved = n.style.translate;
+      });
     }
     function useBar(list) {
       const counts = Object.fromEntries(ITEM_USES.map((u) => [u, 0]));
@@ -2452,11 +2589,14 @@
         el("span", null, "Show"),
         el("button", { type: "button", "aria-pressed": String(useFilter == null), onclick: () => pick(null) }, "All"),
         ...ITEM_USES.filter((u) => counts[u] || useFilter === u).map((u) =>
-          el("button", { type: "button", "aria-pressed": String(useFilter === u), title: USE_HINT[u], onclick: () => pick(u) }, `${USE_LABEL[u]} ${counts[u]}`)));
+          el("button", { type: "button", "aria-pressed": String(useFilter === u), title: USE_HINT[u], onclick: () => pick(u) }, el("span", { class: `totr-sq totr-sq--${u}` }), `${USE_LABEL[u]} ${counts[u]}`)));
       if (bar && bar.isConnected) { bar.replaceWith(next); return; }
-      const parent = list[0] && list[0].row.parentElement;
-      const anchor = parent && (parent.closest("table") || parent);
+      const anchor = listAnchor(list);
       if (anchor) anchor.insertAdjacentElement("beforebegin", next);
+    }
+    /** 0.8.25: an item's uses as small colour squares; the Show bar up top is the key. */
+    function useSquares(uses) {
+      return el("span", { class: "totr-sqs", title: uses.map((u) => USE_LABEL[u]).join(" · ") }, ...uses.map((u) => el("span", { class: `totr-sq totr-sq--${u}` })));
     }
     function statusLine(list) {
       let line = document.getElementById("totr-bzline");
@@ -2466,8 +2606,7 @@
       const cachedNote = Number.isFinite(oldest) ? ` · showing prices from ${agoText(Date.now() - oldest)}, refreshing…` : "";
       const text = lastError ? `Overseer: ${lastError}${cachedNote}` : `Overseer prices from your sell list${byHand ? ` · ${byHand} priced by hand` : ""}${stockNote ? ` · ${stockNote}` : ""} · v${VERSION}`;
       if (line && line.isConnected) { if (line.textContent !== text) line.textContent = text; return; }
-      const parent = list[0] && list[0].row.parentElement;
-      const anchor = parent && (parent.closest("table") || parent);
+      const anchor = listAnchor(list);
       if (!anchor) return;
       line = el("div", { id: "totr-bzline", class: "totr-bzline" + (lastError ? " totr-error" : ""), "data-totr-ui": "1" }, text);
       anchor.insertAdjacentElement("beforebegin", line);
@@ -4225,6 +4364,69 @@
   })();
 
   // ---------------------------------------------------------------------------------------
+  // Company stock (0.8.21, WO-99): a "Balanced order" button beside Torn's PLACE ORDER that
+  // fills every Quantity box with the balanced order (balanceStock). It only fills the boxes:
+  // the director checks them and presses PLACE ORDER. Torn's stock page doesn't show company
+  // funds, so here the order is balanced by storage only; Overseer's Company → Stock tab
+  // checks the funds.
+  // ---------------------------------------------------------------------------------------
+
+  modules.companyStock = (() => {
+    let watching = false;
+    const num = (t) => { const n = Number(String(t == null ? "" : t).replace(/[^0-9.]/g, "")); return Number.isFinite(n) ? n : 0; };
+    const lastNum = (node) => (node ? num(String(node.textContent || "").split(":").pop()) : 0);
+    function rows() {
+      return [...document.querySelectorAll(".stock-list-wrap ul.stock-list > li")]
+        .filter((li) => !li.classList.contains("total"))
+        .map((li) => ({
+          stock: lastNum(li.querySelector(".stock")),
+          daily: lastNum(li.querySelector(".sold-daily")),
+          cost: lastNum(li.querySelector(".cost")),
+          input: li.querySelector(".quantity input"),
+        }))
+        .filter((r) => r.input);
+    }
+    function fill(status) {
+      const maxEl = document.querySelector(".storage-capacity .max");
+      const curEl = document.querySelector(".storage-capacity .current");
+      if (!maxEl || !curEl) { status.textContent = "Couldn't read Storage capacity on this page."; return; }
+      const free = num(maxEl.textContent) - num(curEl.getAttribute("data-initial") || curEl.textContent);
+      const list = rows();
+      if (!list.length) { status.textContent = "Couldn't find the stock rows on this page."; return; }
+      const plan = balanceStock(list, free, null);
+      list.forEach((r, i) => {
+        if (plan.qty[i] > 0) setNativeValue(r.input, plan.qty[i]);
+        else if (r.input.value) clearNativeValue(r.input);
+      });
+      status.textContent = plan.units
+        ? `Balanced: ${plan.units.toLocaleString("en-US")} units${plan.cost ? ` · ${fmtMoney(plan.cost)}` : ""} · every product lasts ${plan.days.toFixed(1)} days. Company funds aren't checked here (Overseer's Company → Stock tab does). Check, then press PLACE ORDER.`
+        : "Nothing to order: the storage is full.";
+    }
+    function place() {
+      if (location.pathname !== "/companies.php" || document.getElementById("totr-balance")) return;
+      const clear = document.querySelector(".stock-list-wrap .clear-all") || document.querySelector(".clear-all");
+      if (!clear || !document.querySelector(".stock-list-wrap")) return;
+      const status = el("span", { class: "totr-muted", "data-totr-ui": "1", style: "display:inline-block;margin-left:10px;font:12px system-ui,sans-serif;max-width:520px;vertical-align:middle" });
+      const btn = el("button", {
+        id: "totr-balance", type: "button", class: "totr-mini", "data-totr-ui": "1",
+        title: "Fill every Quantity box so all products last the same number of days, as far as your free storage allows. You press PLACE ORDER.",
+        onclick: (e) => { e.preventDefault(); fill(status); },
+      }, "Balanced order");
+      clear.insertAdjacentElement("afterend", btn);
+      btn.insertAdjacentElement("afterend", status);
+    }
+    /** The stock tab loads after the page (and on tab switches), so look every 1.5s while here. */
+    function scan() {
+      if (location.pathname !== "/companies.php") return;
+      place();
+      if (watching) return;
+      watching = true;
+      setInterval(() => { if (!document.hidden) place(); }, 1500);
+    }
+    return { scan };
+  })();
+
+  // ---------------------------------------------------------------------------------------
   // Boot: route, then re-route on SPA navigation (debounced; ignores our own mutations)
   // ---------------------------------------------------------------------------------------
 
@@ -4235,6 +4437,10 @@
       // 0.8.0: the script now loads on every Torn page for the deal alerts. The trading
       // modules and Price check still run only on the pages they always ran on.
       try { modules.alerts.tick(); } catch (err) { console.warn("[Overseer Trading]", err); }
+      // 0.8.21 (WO-99): the Balanced order button on the company stock page.
+      if (location.pathname === "/companies.php") {
+        try { modules.companyStock.scan(); } catch (err) { console.warn("[Overseer Trading]", err); }
+      }
       if (!isTradingPage(location)) return;
       const name = routeFor(location);
       if (name && modules[name]) {
@@ -4264,7 +4470,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

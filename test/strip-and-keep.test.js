@@ -90,27 +90,67 @@ function addAnswer(body) {
   return { items: [], watched: [], deals: [] };
 }
 
-test("Add page: the last Jemmy is kept; List anyway lists it; Show chips filter rows", async () => {
-  const { doc } = page("https://www.torn.com/bazaar.php#/add", ADD_HTML, addAnswer);
+test("Add page: the last Jemmy is kept; the keep 1 switch lists it; Show chips filter rows", async () => {
+  const { doc, gm } = page("https://www.torn.com/bazaar.php#/add", ADD_HTML, addAnswer);
   await tick(400);
   const [jemmy, weight] = doc.querySelectorAll("li");
-  assert.match(jemmy.textContent, /Keep 1 · not listed/);
-  assert.match(jemmy.textContent, /Crime tool/);
+  // 0.8.25: keep 1 and the colour squares sit under the item name, not in the price row.
+  const under = jemmy.querySelector(".name-wrap .totr-under");
+  assert.ok(under, "keep 1 line under the name");
+  assert.match(under.textContent, /keep 1 · not listed/);
+  assert.equal(under.querySelectorAll(".totr-sq--oc, .totr-sq--crime").length, 2);
+  assert.doesNotMatch(jemmy.textContent, /Crime tool|List anyway/);
   // FILL ALL: the Jemmy stays empty, the Paper Weight is filled.
   [...doc.querySelectorAll("#totr-hlinks button")].find((b) => b.textContent === "FILL ALL").click();
   await tick(250);
   assert.equal(jemmy.querySelector("input[name='amount']").value, "");
   assert.equal(weight.querySelector("input[name='amount']").value, "4");
-  // List anyway is the explicit override.
-  [...jemmy.querySelectorAll("button")].find((b) => b.textContent === "List anyway").click();
+  // Switching keep 1 off strikes it through, is saved per item, and Fill then lists the last one.
+  jemmy.querySelector(".totr-keep").click();
+  const off = jemmy.querySelector(".totr-keep");
+  assert.ok(off.classList.contains("totr-keep--off"));
+  assert.equal(off.textContent, "keep 1");
+  assert.deepEqual([...gm.get("totr_keep_off")], [568]);
+  [...jemmy.querySelectorAll("button")].find((b) => b.textContent.startsWith("Fill")).click();
   await tick(250);
   assert.equal(jemmy.querySelector("input[name='amount']").value, "1");
-  // Show: No use hides the Jemmy row.
+  // Clicking again turns it back on.
+  jemmy.querySelector(".totr-keep").click();
+  assert.deepEqual([...gm.get("totr_keep_off")], []);
+  assert.ok(!jemmy.querySelector(".totr-keep").classList.contains("totr-keep--off"));
+  // Show: the chips carry the colour key; No use hides the Jemmy row.
   const bar = doc.getElementById("totr-usebar");
   assert.ok(bar);
+  assert.ok(bar.querySelector(".totr-sq--crime"), "the key's colour squares are on the chips");
   [...bar.querySelectorAll("button")].find((b) => b.textContent.startsWith("No use")).click();
   assert.equal(jemmy.style.display, "none");
   assert.equal(weight.style.display, "");
   [...doc.getElementById("totr-usebar").querySelectorAll("button")].find((b) => b.textContent === "All").click();
   assert.equal(jemmy.style.display, "");
+});
+
+const MANAGE_HTML = `<div><span>Manage your Bazaar</span></div><ul>
+  <li class="row___a"><img src="/images/items/568/small.png"><div class="name"><span>Jemmy</span></div><div class="details"></div><div class="rrp">$7,100</div><div><input placeholder="Price" class="input-money" value="7000"></div></li>
+  <li class="row___b"><img src="/images/items/10/small.png"><div class="name"><span>Paper Weight</span></div><div class="details"></div><div class="rrp">$310</div><div><input placeholder="Price" class="input-money" value="350"></div></li>
+</ul>`;
+
+test("Manage (0.8.25): a price that already matches hides Fill and the status pill", async () => {
+  const { doc } = page("https://www.torn.com/bazaar.php#/manage", MANAGE_HTML, addAnswer);
+  await tick(400);
+  const [jemmy, weight] = doc.querySelectorAll("li");
+  const fillOf = (li) => li.querySelector("[data-totr-fill]");
+  const stateOf = (li) => li.querySelector("[data-totr-state]");
+  assert.ok(fillOf(jemmy).hidden, "$7,000 listed = sell list: no Fill");
+  assert.equal(stateOf(jemmy).textContent, "");
+  assert.ok(!fillOf(weight).hidden, "$350 listed vs $300: Fill shows");
+  assert.equal(stateOf(weight).textContent, "+17%");
+  // The use squares replace the words on the muted line.
+  assert.ok(jemmy.querySelector(".totr-bz-sub .totr-sq--crime"));
+  assert.doesNotMatch(jemmy.querySelector(".totr-bz-sub").textContent, /crime tool/);
+  // Filling the Paper Weight makes it match: Fill and the pill go away.
+  fillOf(weight).click();
+  await tick(250);
+  assert.equal(weight.querySelector("input").value, "300");
+  assert.ok(fillOf(weight).hidden);
+  assert.equal(stateOf(weight).textContent, "");
 });

@@ -768,3 +768,21 @@ test("keyStatusLabel says which key the script holds, never the whole key", () =
   assert.equal(tr.keyStatusLabel("", ""), "No key saved yet.");
   assert.equal(tr.keyStatusLabel(null, undefined), "No key saved yet.");
 });
+
+// ---- 0.8.25: keep 1 switch + matching Manage rows ------------------------------------------
+
+test("toggleKeepOff / keepOffIds: one saved list of item ids, toggled one at a time", () => {
+  assert.deepEqual(tr.toggleKeepOff(undefined, 568), [568]);
+  assert.deepEqual(tr.toggleKeepOff([568, 10], 568), [10]);
+  assert.deepEqual(tr.toggleKeepOff(["junk", 10], "4"), [4, 10]);
+  assert.equal(tr.keepOffIds([568]).has(568), true);
+  assert.equal(tr.keepOffIds(null).size, 0);
+});
+
+test("priceMatches: only an exact match (Torn's $1 placeholder never counts)", () => {
+  assert.equal(tr.priceMatches(25363, 25363), true);
+  assert.equal(tr.priceMatches(4898, 4855), false);
+  assert.equal(tr.priceMatches(1, 1), false);
+  assert.equal(tr.priceMatches(null, 300), false);
+  assert.equal(tr.priceMatches(300, null), false);
+});
