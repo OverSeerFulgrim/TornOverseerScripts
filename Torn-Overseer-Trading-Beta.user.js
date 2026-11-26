@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.37
+// @version      0.8.38
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -1065,6 +1065,25 @@
   function isTradingPage(loc) {
     const path = String(loc.pathname || "");
     return routeFor(loc) != null || path === "/item.php";
+  }
+
+  // 0.8.38: which page changes are worth a pass. The watcher sees every node Torn adds or
+  // removes; most of that is the sidebar's bars and timers, the chat and the header redrawing
+  // themselves, and none of it holds a listing, a trade or a bazaar row. Our own UI and Chain
+  // Watch's panel (which redraws every second) never counted either.
+  const WATCH_OURS = ".totr, [data-totr-ui], #tocw, [id^='tocw-']";
+  const WATCH_NOISE = "#sidebarroot, #sidebar, #chatRoot, #header-root";
+  /** "ours" | "noise" | "page" for one changed node's parent. A node we can't place is "page". */
+  function changeKind(target) {
+    if (!target || typeof target.closest !== "function") return "page";
+    if (target.closest(WATCH_OURS)) return "ours";
+    if (target.closest(WATCH_NOISE)) return "noise";
+    return "page";
+  }
+  /** True when at least one change happened in the page itself — the only kind that wakes a pass. */
+  function passWorthy(records) {
+    for (const r of records || []) if (changeKind(r && r.target) === "page") return true;
+    return false;
   }
 
   function dealKey(deal) {
@@ -4642,15 +4661,22 @@
       timer = setTimeout(() => { firstChangeAt = 0; run(); }, passDelay(now, firstChangeAt, isTradingPage(location) ? 150 : 1000, PASS_MAX_WAIT_MS));
     };
     window.addEventListener("hashchange", schedule);
-    // Our own UI and Chain Watch's panel (which redraws every second) never wake a re-scan.
-    const ours = (node) => node && node.closest && node.closest(".totr, [data-totr-ui], #tocw, [id^='tocw-']");
+    // 0.8.38: with localStorage.totr_debug = "1" the console says, every 30 s, how many batches
+    // of page changes woke a pass and how many were ignored (ours, sidebar, chat, header).
+    const watchStats = { woke: 0, ignored: 0 };
+    let debugOn = false;
+    try { debugOn = localStorage.getItem("totr_debug") === "1"; } catch { debugOn = false; }
+    if (debugOn && isTradingPage(location)) {
+      setInterval(() => { console.info(`[Overseer Trading] page watcher, last 30 s: ${watchStats.woke} woke a pass, ${watchStats.ignored} ignored`); watchStats.woke = 0; watchStats.ignored = 0; }, 30_000);
+    }
     // 0.8.17 (WO-94 #16): the page-wide watcher only on the trading pages. Elsewhere the
     // script is only there for the deal alerts, whose eye already has its own 2-second check
     // (alerts.start), so watching every node on every Torn page bought nothing but work —
     // on pages whose timers tick every second it re-ran the router about once a second.
     if (isTradingPage(location)) {
       new MutationObserver((records) => {
-        if (records.every((r) => ours(r.target))) return;
+        if (!passWorthy(records)) { watchStats.ignored += 1; return; }
+        watchStats.woke += 1;
         schedule();
       }).observe(document.body, { childList: true, subtree: true });
     }
@@ -4659,7 +4685,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

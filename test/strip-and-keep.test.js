@@ -186,3 +186,31 @@ test("Manage $ popup (0.8.36): the issue and its fix, a trader paying more with 
   assert.equal(weight.querySelector("input.remove").value, "1");
   assert.equal(doc.querySelector(".totr-pick-pop"), null, "the popup closes");
 });
+
+test("0.8.38: only changes in the page itself wake a pass — not the sidebar, chat, header or our own UI", () => {
+  const { JSDOM } = require("jsdom");
+  const tr = require("../Torn-Overseer-Trading-Beta.user.js");
+  const dom = new JSDOM(`<body>
+    <div id="header-root"><span id="clock">12:00</span></div>
+    <div id="sidebarroot"><div class="bar"><p id="energy">150/150</p></div></div>
+    <div id="chatRoot"><div class="msgs"><p id="msg">hi</p></div></div>
+    <div id="mainContainer"><ul id="list"><li id="row" data-testid="item"><span id="chip" data-totr-ui="1">resell</span></li></ul></div>
+    <div id="tocw"><b id="cw">chain</b></div>
+  </body>`);
+  const $ = (id) => dom.window.document.getElementById(id);
+  assert.equal(tr.changeKind($("energy")), "noise");
+  assert.equal(tr.changeKind($("msg")), "noise");
+  assert.equal(tr.changeKind($("clock")), "noise");
+  assert.equal(tr.changeKind($("chip")), "ours");
+  assert.equal(tr.changeKind($("cw")), "ours");
+  assert.equal(tr.changeKind($("row")), "page");
+  assert.equal(tr.changeKind($("list")), "page");
+  // The body itself (Torn swapping a whole region) and anything we can't place still count.
+  assert.equal(tr.changeKind(dom.window.document.body), "page");
+  assert.equal(tr.changeKind(null), "page");
+  // A batch wakes a pass if ANY of its changes is in the page.
+  assert.equal(tr.passWorthy([{ target: $("energy") }, { target: $("msg") }, { target: $("chip") }]), false);
+  assert.equal(tr.passWorthy([{ target: $("energy") }, { target: $("row") }]), true);
+  assert.equal(tr.passWorthy([]), false);
+  dom.window.close();
+});
