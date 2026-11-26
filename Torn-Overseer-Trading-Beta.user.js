@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.26
+// @version      0.8.27
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -3277,16 +3277,19 @@
         const otherMax = [...holder.querySelectorAll("button, a, span, div, label")].some((n) =>
           !n.closest("[data-totr-ui]") && n.children.length === 0 && isMaxLabel(n.textContent));
         if (otherMax) continue;
-        // Torn's quantity/Buy column is too narrow to share, so Max sits under the
+        // Torn's quantity/Buy column is too narrow to share, so Max sits on the
         // "(n in stock)" line on the left of the opened listing — the DEEPEST element holding
         // that text (it is not always a leaf: the number can be its own span). No stock line,
         // no Max: dropped into the narrow column it overlaps Torn's own controls.
+        // 0.8.27: one in stock → nothing to max (the box already says 1), so no button.
+        const inStock = parseStock(holder.textContent);
+        if (inStock != null && inStock <= 1) continue;
         const stockLine = [...holder.querySelectorAll("*")].filter((n) =>
           !n.closest("[data-totr-ui]") && parseStock(n.textContent) != null &&
           ![...n.children].some((c) => parseStock(c.textContent) != null)
         )[0];
         if (!stockLine) continue;
-        const btn = el("button", { class: "totr-mini totr-max", type: "button", "data-totr-ui": "1", title: "Fill in as many as you can afford", style: "display:inline-block;margin:4px 0 0 0" }, "Max");
+        const btn = el("button", { class: "totr-mini totr-max", type: "button", "data-totr-ui": "1", title: "Fill in as many as you can afford", style: "display:inline-block;height:18px;line-height:16px;padding:0 6px;margin:0 0 0 6px;vertical-align:middle" }, "Max");
         btn.addEventListener("click", (e) => {
           e.preventDefault(); e.stopPropagation();
           const card = box.closest("[data-testid='item']") || box;
@@ -3298,7 +3301,9 @@
           if (qty < 1) { btn.textContent = "Can't afford"; setTimeout(() => { btn.textContent = "Max"; }, 1500); return; }
           setNativeValue(input, qty);
         });
-        stockLine.after(btn);
+        // 0.8.27: on the same line as "(n in stock)", not under it — under it, the button fell
+        // off the bottom of the opened listing (half hidden, clicks landing on the next card).
+        stockLine.appendChild(btn);
       }
     }
 
