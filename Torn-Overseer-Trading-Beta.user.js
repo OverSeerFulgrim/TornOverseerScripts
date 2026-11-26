@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.39
+// @version      0.8.40
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -81,6 +81,8 @@
     stripHeight: "totr_strip_height",
     sellCache: "totr_sell_cache", // 0.8.18: last sell_prices answers (prices only, no secrets)
     keepOff: "totr_keep_off", // 0.8.25: item ids whose "keep 1" is switched off (Fill lists them all)
+    quoteCache: "totr_quote_cache", // 0.8.40: light quotes (market value, your buy price, stock) for 5 minutes
+    imLowCache: "totr_im_low_cache", // 0.8.40: item-market lows read with your key, for 30 minutes
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
@@ -503,6 +505,37 @@
   function canFillFrom(s, nowMs) {
     if (!s || s.sellAt == null) return false;
     return !Number.isFinite(s.cachedAt) || nowMs - s.cachedAt <= SELL_CACHE_FILL_MS;
+  }
+
+  /**
+   * 0.8.40: light quotes (market value, your buy price, what you hold) are kept for 5 minutes
+   * across page loads and tabs. They lived in the page's memory only, so every bazaar you opened
+   * asked Overseer again for items it had answered a minute before. Stored with sellCachePut /
+   * read with sellCacheGet (same shape: itemId → { at, item }).
+   */
+  const QUOTE_CACHE_MS = 5 * 60000;
+  const QUOTE_CACHE_CAP = 600;
+  /**
+   * 0.8.40: one cache of item-market lows for every part of the script that reads Torn's item
+   * market with your key (buy-page chips, Price check, deal alerts). Each kept its own answers,
+   * and the chips' were forgotten on every page load. `low` may be null: "asked, nothing listed".
+   */
+  const IM_LOW_CACHE_CAP = 300;
+  function lowCachePut(cache, itemId, low, nowMs, cap = IM_LOW_CACHE_CAP) {
+    const out = { ...(cache && typeof cache === "object" ? cache : {}) };
+    const id = Number(itemId);
+    if (!Number.isInteger(id) || id <= 0) return out;
+    const value = Number(low);
+    out[id] = { at: nowMs, low: Number.isFinite(value) && value > 1 ? value : null };
+    const keys = Object.keys(out);
+    if (keys.length > cap) keys.sort((a, b) => out[a].at - out[b].at).slice(0, keys.length - cap).forEach((k) => delete out[k]);
+    return out;
+  }
+  /** The cached entry ({ at, low }) for one item while it is under `ttlMs` old, else null. */
+  function lowCacheGet(cache, itemId, nowMs, ttlMs) {
+    const hit = cache && cache[itemId];
+    if (!hit || !Number.isFinite(hit.at) || nowMs - hit.at >= ttlMs || nowMs < hit.at - 60000) return null;
+    return { at: hit.at, low: hit.low == null ? null : Number(hit.low) };
   }
 
   function netAfterFee(price) {
@@ -1385,10 +1418,38 @@
   // Every write of the session token goes through here so the PDA mirror stays in step.
   function saveSessionToken(token) {
     const value = String(token || "").trim();
+    // 0.8.40: cached quotes hold one account's buy prices and stock — a new sign-in, a sign-out
+    // or another key starts with none.
+    if (value !== String(gmGet(STORE.sessionToken, "") || "").trim()) quoteShared.set({});
     const ok = gmSet(STORE.sessionToken, value);
     writePdaSession(value, prefs().tornKey);
     return ok;
   }
+
+  // 0.8.40: the two shared caches, read from storage once per page and written back shortly
+  // after a change (one write for a burst of answers).
+  function sharedCache(storeKey) {
+    let mem = null;
+    let timer = null;
+    const all = () => {
+      if (!mem) { const raw = gmGet(storeKey, {}); mem = raw && typeof raw === "object" ? raw : {}; }
+      return mem;
+    };
+    const set = (next) => {
+      mem = next;
+      if (timer || !IS_BROWSER) { if (!IS_BROWSER) gmSet(storeKey, mem); return; }
+      timer = setTimeout(() => { timer = null; gmSet(storeKey, mem); }, 400);
+    };
+    return { all, set };
+  }
+  const quoteShared = sharedCache(STORE.quoteCache);
+  /** Fresh cached light quotes for `ids` (Map itemId → quote). */
+  function cachedQuotes(ids) { return sellCacheGet(quoteShared.all(), ids, Date.now(), QUOTE_CACHE_MS); }
+  function rememberQuotes(items) { quoteShared.set(sellCachePut(quoteShared.all(), items, Date.now(), QUOTE_CACHE_CAP)); }
+  const lowShared = sharedCache(STORE.imLowCache);
+  /** { at, low } for an item-market low read under IM_LOW_TTL_MS ago, by any part of the script. */
+  function cachedImLow(itemId) { return lowCacheGet(lowShared.all(), itemId, Date.now(), IM_LOW_TTL_MS); }
+  function rememberImLow(itemId, listings) { lowShared.set(lowCachePut(lowShared.all(), itemId, itemMarketLowFrom(listings), Date.now())); }
 
   function prefs() {
     const tornKey = String(gmGet(STORE.tornKey, "") || "").trim() || pdaApiKey();
@@ -3154,13 +3215,20 @@
       return out;
     }
     async function loadGrid(list) {
-      const ids = [...new Set(list.map((t) => t.itemId))].filter((id) => !gridQuotes.has(id) && !gridPending.has(id)).slice(0, 100);
-      if (!ids.length) return false;
+      const wanted = [...new Set(list.map((t) => t.itemId))].filter((id) => !gridQuotes.has(id) && !gridPending.has(id)).slice(0, 100);
+      if (!wanted.length) return false;
+      // 0.8.40: answers under 5 minutes old (from any page or tab) are used as they are.
+      const known = cachedQuotes(wanted);
+      for (const [id, q] of known) gridQuotes.set(id, q);
+      const ids = wanted.filter((id) => !known.has(id));
+      if (!ids.length) return true;
       ids.forEach((id) => gridPending.add(id));
       try {
         const res = await callTrader("quote", { itemIds: ids, bazaars: false });
-        for (const q of (res && res.items) || []) gridQuotes.set(q.itemId, q);
-      } catch { /* leave unmarked; retried on the next scan */ ids.forEach((id) => gridPending.delete(id)); return false; }
+        const items = (res && res.items) || [];
+        for (const q of items) gridQuotes.set(q.itemId, q);
+        rememberQuotes(items);
+      } catch { /* leave unmarked; retried on the next scan */ ids.forEach((id) => gridPending.delete(id)); return known.size > 0; }
       for (const id of ids) { if (!gridQuotes.has(id)) gridQuotes.set(id, null); gridPending.delete(id); }
       return true;
     }
@@ -3320,12 +3388,12 @@
     // 0.8.8 (WO-89): live item-market lows for the few listings that are cheap against MV but
     // not yet a verdict — the Funeral Wreath case (bazaar low $200, item market $369). Your key,
     // at most IM_CHECKS_PER_PAGE Torn calls per page load, each answer kept IM_LOW_TTL_MS.
-    const imLows = new Map(); // itemId → { at, low }
+    // 0.8.40: the lows live in the cache every part of the script shares (cachedImLow).
     let imChecked = null;      // location.search the budget was spent on
     let imSpent = 0;
     function imLowOf(itemId) {
-      const hit = imLows.get(itemId);
-      return hit && Date.now() - hit.at < IM_LOW_TTL_MS ? hit.low : null;
+      const hit = cachedImLow(itemId);
+      return hit ? hit.low : null;
     }
     function wantsItemMarketLow(c, q, mode) {
       if (mode !== "bazaar" || !q || c.price == null || c.price <= 1) return false;
@@ -3340,7 +3408,7 @@
       if (!key) return false;
       if (imChecked !== location.search) { imChecked = location.search; imSpent = 0; }
       const mode = prefs().sellMode;
-      const want = list.filter((c) => imLowOf(c.itemId) == null && !imLows.has(c.itemId) && wantsItemMarketLow(c, quotes.get(c.itemId), mode))
+      const want = list.filter((c) => !cachedImLow(c.itemId) && wantsItemMarketLow(c, quotes.get(c.itemId), mode))
         .sort((a, b) => (a.price / quotes.get(a.itemId).marketValue) - (b.price / quotes.get(b.itemId).marketValue));
       let changed = false;
       for (const c of want) {
@@ -3350,7 +3418,7 @@
           const r = await requestJson(`https://api.torn.com/v2/market/${c.itemId}/itemmarket?offset=0&comment=overseer&key=${encodeURIComponent(key)}`);
           if (r && r.error) break; // key problem or rate limit: stop for this page
           const env = (r && r.itemmarket) || r;
-          imLows.set(c.itemId, { at: Date.now(), low: itemMarketLowFrom(env && env.listings) });
+          rememberImLow(c.itemId, env && env.listings);
           changed = true;
         } catch { break; }
       }
@@ -3358,7 +3426,12 @@
     }
 
     async function loadDeals(list) {
-      const ids = [...new Set(list.map((c) => c.itemId))].filter((id) => !quotes.has(id) && !pending.has(id)).slice(0, 50);
+      const wanted = [...new Set(list.map((c) => c.itemId))].filter((id) => !quotes.has(id) && !pending.has(id)).slice(0, 50);
+      if (!wanted.length) return;
+      // 0.8.40: answers under 5 minutes old (from any page or tab) are used as they are.
+      const known = cachedQuotes(wanted);
+      for (const [id, q] of known) quotes.set(id, q);
+      const ids = wanted.filter((id) => !known.has(id));
       if (!ids.length) return;
       ids.forEach((id) => pending.add(id));
       try {
@@ -3366,6 +3439,7 @@
         // an older server answers what it can and defers the rest, which we simply skip).
         const res = await callTrader("quote", { itemIds: ids, bazaars: false });
         for (const q of (res && res.items) || []) quotes.set(q.itemId, q);
+        rememberQuotes((res && res.items) || []);
         for (const id of ids) if (!quotes.has(id)) quotes.set(id, null);
       } catch { for (const id of ids) quotes.set(id, null); }
       ids.forEach((id) => pending.delete(id));
@@ -3531,6 +3605,7 @@
         if (res && res.error) return { itemMarket: null, itemMarketError: `Torn: ${res.error.error || "error " + res.error.code}` };
         const env = (res && res.itemmarket) || res;
         if (!env || !Array.isArray(env.listings)) return { itemMarket: null, itemMarketError: "Torn answered in a shape this script does not recognise." };
+        rememberImLow(itemId, env.listings); // 0.8.40: the buy-page chips can use this answer too
         // Only what the server reads: price + amount, capped — never the whole response.
         const listings = env.listings.slice(0, 100).map((l) => ({ price: Number(l.price), amount: Number(l.amount ?? l.quantity) }));
         return { itemMarket: { itemmarket: { listings } }, itemMarketError: null };
@@ -4332,6 +4407,7 @@
               const env = (r && r.itemmarket) || r;
               if (r && r.error) break; // key problem or rate limit: stop for this poll
               s.market[item.itemId] = { at: now, deal: itemMarketDealFor(item, env && env.listings) };
+              rememberImLow(item.itemId, env && env.listings); // 0.8.40: shared with the buy-page chips
             } catch { break; }
           }
           // Forget items that left the list.
@@ -4716,7 +4792,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

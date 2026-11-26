@@ -884,3 +884,35 @@ test("0.8.39: the deals panel opens beside the sidebar eye, not over the chat co
   assert.equal(tr.sheetSpot({ ...eye, width: 0, height: 0 }, 1920, 1000, 360), null);
   assert.equal(tr.sheetSpot(eye, 420, 800, 360), null);
 });
+
+test("0.8.40: light quotes are reused for 5 minutes, then asked for again", () => {
+  const now = 1_800_000_000_000;
+  const q = { itemId: 206, marketValue: 850000, buyPrice: 800000 };
+  const cache = tr.sellCachePut({}, [q, { itemId: 0 }, null], now, 600);
+  assert.deepEqual(Object.keys(cache), ["206"]);
+  // 4 minutes later: still good, and the quote comes back as it was stored.
+  const hit = tr.sellCacheGet(cache, [206, 207], now + 4 * 60_000, tr.QUOTE_CACHE_MS);
+  assert.equal(hit.size, 1);
+  assert.equal(hit.get(206).buyPrice, 800000);
+  // Past 5 minutes: not used.
+  assert.equal(tr.sellCacheGet(cache, [206], now + tr.QUOTE_CACHE_MS + 1, tr.QUOTE_CACHE_MS).size, 0);
+});
+
+test("0.8.40: one item-market low cache, shared by chips, Price check and deal alerts", () => {
+  const now = 1_800_000_000_000;
+  const TTL = 30 * 60_000;
+  let cache = tr.lowCachePut({}, 180, 22278, now);
+  // "Asked, nothing listed" is remembered too, so it isn't asked again at once.
+  cache = tr.lowCachePut(cache, 181, null, now);
+  cache = tr.lowCachePut(cache, "x", 5, now); // junk id ignored
+  assert.deepEqual(tr.lowCacheGet(cache, 180, now + 60_000, TTL), { at: now, low: 22278 });
+  assert.deepEqual(tr.lowCacheGet(cache, 181, now + 60_000, TTL), { at: now, low: null });
+  assert.equal(tr.lowCacheGet(cache, 999, now, TTL), null);
+  assert.equal(tr.lowCacheGet(cache, 180, now + TTL, TTL), null); // 30 minutes → ask again
+  // A $1 display listing is not a low.
+  assert.equal(tr.lowCacheGet(tr.lowCachePut({}, 5, 1, now), 5, now, TTL).low, null);
+  // The cap drops the oldest entries first.
+  let big = {};
+  for (let i = 1; i <= 5; i += 1) big = tr.lowCachePut(big, i, 100 + i, now + i, 3);
+  assert.deepEqual(Object.keys(big).map(Number).sort((a, b) => a - b), [3, 4, 5]);
+});
