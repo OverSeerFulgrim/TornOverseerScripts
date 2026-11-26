@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.27
+// @version      0.8.29
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -639,17 +639,17 @@
   /**
    * 0.7.15 (WO-80), reworked 0.8.8 (WO-89): what a buy page says about a listing at `ask`, after
    * "under your buy" (which the caller decides first). In order:
-   *  - "hold": you already hold it and none sold in 30 days (`notSellingLine`) — amber, whatever the
-   *    resale says; the resale (if any) goes in the tooltip. The strongest reason not to buy more.
+   *  - nothing: you already hold it and none sold in 30 days (`notSellingLine`) — no green resale
+   *    on stuck stock. (0.8.28: was an amber HOLD chip; buy pages now only point at deals.)
    *  - "resale": green. Bazaar mode: your sell-list price when it is within 10% of the cheapest
    *    bazaar, otherwise what the MARKET says you could get (`realisticResale`: the cheapest bazaar
    *    matched, or the item-market low after fee) — so a stale target can no longer hide a real
    *    deal. Item Market mode: resale at MV after the fee, as before.
    *  - "below_cost": green — you hold this and the listing is under your average cost (`belowCost`),
    *    a prompt to buy and lower the average. Bazaar mode.
-   *  - "target_high": amber — bazaar mode, your sell-list price is >10% over the cheapest bazaar
-   *    (WO-53's line) and nothing above applies. The label names the BAZAAR LOW, never "market",
-   *    because on Torn "market" reads as market value.
+   *  - nothing: bazaar mode, your sell-list price is >10% over the cheapest bazaar (WO-53's line)
+   *    and nothing above applies. (0.8.28: was an amber "TARGET +X% vs bazaar low" chip — a sell
+   *    price problem, which Overseer's Sell tab and the auto-repricer handle, not a deal.)
    * `market` is the MC-3 snapshot carried by `sell_prices`; `stock` the quote's holding; `quote`
    * the light quote (avgCost/avgCostQty); `itemMarketLow` a live Torn item-market low or null. Pure.
    */
@@ -659,10 +659,7 @@
     const vsLine = vs && vs.label ? `your sell-list price ${fmtMoney(sellAt)} ${vs.label} ${vs.title}` : (mode === "bazaar" && Number(sellAt) > 0 ? `your sell-list price ${fmtMoney(sellAt)} · cheapest listing unchecked` : "");
     const resaleLine = resale ? (resale.via === "bazaar" ? `${resaleLabel(resale)} at your sell-list price ${fmtMoney(sellAt)} (no fee in a bazaar)` : `${resaleLabel(resale)} resold at market value ${fmtMoney(marketValue)} after Torn's 5% fee`) : "";
     const stuck = notSellingLine(stock, nowMs);
-    if (stuck) {
-      const onHand = Number(stock.onHand).toLocaleString("en-US");
-      return { kind: "hold", label: `HOLD ${onHand} · NOT SELLING`, title: [stuck, vsLine, resaleLine].filter(Boolean).join(" · "), resale, vs };
-    }
+    if (stuck) return null;
     const targetHigh = Boolean(vs && vs.band === "far_above");
     if (resale && !targetHigh) return { kind: "resale", label: resaleLabel(resale), title: [resaleLine, vsLine].filter(Boolean).join(" · "), resale, vs };
     if (mode === "bazaar") {
@@ -676,9 +673,6 @@
       }
       const cost = belowCost(ask, quote);
       if (cost) return { kind: "below_cost", label: cost.label, title: [cost.title, vsLine].filter(Boolean).join(" · "), resale: null, vs, cost };
-    }
-    if (targetHigh) {
-      return { kind: "target_high", label: `TARGET ${vs.gapPct > 0 ? "+" : ""}${Math.round(vs.gapPct)}% vs bazaar low`, title: `${vsLine} · your target is above what bazaars sell at — lower it on Overseer's Sell tab`, resale, vs };
     }
     return null;
   }
@@ -1546,9 +1540,7 @@
   .totr-hlink--ok{color:#8bc34a}.totr-hlink--qty{color:#7fb2ff}.totr-hlink--warn{color:#f0c674}.totr-hlink--clear{color:#e57373}
   li.totr-deal{position:relative;outline:2px solid #4c8dff;outline-offset:-2px}
   li.totr-flip{position:relative;outline:2px dashed #5fe0a6;outline-offset:-2px}
-  li.totr-hold{position:relative;outline:2px dashed #e0a23b;outline-offset:-2px}
   .totr-dealchip--flip{color:#082217;background:#5fe0a6;border-color:#5fe0a6}
-  .totr-dealchip--hold{color:#2a1a05;background:#e0a23b;border-color:#e0a23b}
   .totr-dealchip{position:absolute;top:4px;left:4px;z-index:2;font:700 10px/1.5 system-ui,sans-serif;color:#cfe0ff;background:#16263f;border:1px solid #4c8dff;border-radius:4px;padding:0 5px;pointer-events:none;white-space:nowrap}.totr-hlink:disabled{color:#777;cursor:default}
   .totr-bzline{font:12px system-ui,sans-serif;color:#9aa7b8;margin:6px 0}
   .totr-pick-pop{position:absolute;z-index:99999;width:380px;margin:0;box-shadow:0 18px 44px rgba(0,0,0,.65)}
@@ -2930,7 +2922,7 @@
         return el("span", { class: "totr-chip " + cls, title }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`);
       }
       const v = resaleVerdict({ mode, ask: b.price, marketValue: d.marketValue, sellAt: sellAtOf(current.itemId), market: sellMarketOf(current.itemId), stock: d.stock, quote: d }, Date.now());
-      return v ? el("span", { class: "totr-chip " + (verdictIsGreen(v) ? "totr-chip--ok" : "totr-chip--warn"), title: v.title }, v.label) : null;
+      return v ? el("span", { class: "totr-chip totr-chip--ok", title: v.title }, v.label) : null;
     }
 
     async function load(itemId) {
@@ -2993,8 +2985,7 @@
         // Buy-list deals win; otherwise a flip if reselling at MV clears the 5% fee. t.price is
         // read off the tile on every scan, so a listing that sold never leaves a stale chip.
         const mode = prefs().sellMode;
-        // 0.7.15 (WO-80): the verdict checks your sell-list price against the cheapest bazaar and
-        // turns amber on stock you hold that isn't selling, instead of a green flip with a footnote.
+        // 0.8.28: only deals are marked — a high sell-list target or stuck stock gets no outline.
         // 0.8.8 (WO-89): the tile price IS the item-market low, so no item-market resale here; the
         // bazaar low and "below your cost" still apply.
         const v = deal ? null : resaleVerdict({ mode, ask: t.price, marketValue: q && q.marketValue, sellAt: sellAtOf(t.itemId), market: sellMarketOf(t.itemId), stock: q && q.stock, quote: q }, Date.now());
@@ -3003,7 +2994,6 @@
         t.li.dataset.totrDeal = sig;
         t.li.classList.toggle("totr-deal", deal);
         t.li.classList.toggle("totr-flip", verdictIsGreen(v));
-        t.li.classList.toggle("totr-hold", Boolean(v && !verdictIsGreen(v)));
         t.li.querySelector(".totr-dealchip")?.remove();
         const stuckNote = notSellingLine(q && q.stock, Date.now());
         const stuckTail = stuckNote ? `\n${stuckNote}` : "";
@@ -3015,7 +3005,7 @@
           const why = v.kind === "resale" && v.resale.via === "market"
             ? `Cheapest listing ${fmtMoney(t.price)} · market value ${fmtMoney(q.marketValue)} · resold at MV it nets ${fmtMoney(netAfterFee(q.marketValue))} after Torn's 5% fee. MV is an average, not a promised sale.`
             : `Cheapest listing ${fmtMoney(t.price)} · ${v.title}`;
-          t.li.append(el("span", { class: "totr-dealchip " + (verdictIsGreen(v) ? "totr-dealchip--flip" : "totr-dealchip--hold"), "data-totr-ui": "1", title: why }, v.label));
+          t.li.append(el("span", { class: "totr-dealchip totr-dealchip--flip", "data-totr-ui": "1", title: why }, v.label));
         }
       }
     }
@@ -3219,19 +3209,17 @@
         if (c.price <= 1) continue; // $1 listings are display/locked items, not deals
         let label = null; let cls = null;
         const mode = prefs().sellMode;
-        // 0.7.15 (WO-80): in bazaar mode the verdict checks your sell-list price against the cheapest
-        // bazaar (amber TARGET … OVER MARKET when it is >10% over) and goes amber HOLD n · NOT SELLING
-        // on stock you already hold that hasn't sold in 30 days — in every sell mode.
+        // 0.8.28: buy pages only point at deals — blue under your buy, green resale / below your cost.
+        // A high sell-list target or stuck stock shows nothing here (fix those on Overseer).
         const v = resaleVerdict({ mode, ask: c.price, marketValue: q.marketValue, sellAt: sellAtOf(c.itemId), market: sellMarketOf(c.itemId), stock: q.stock, quote: q, itemMarketLow: imLowOf(c.itemId) }, Date.now());
         let title = null;
         // 0.7.12: under your buy is BLUE on every page (it was green here, blue on the grid).
         if (q.buyPrice != null && c.price < q.buyPrice) { label = "UNDER YOUR BUY"; cls = "buy"; title = notSellingLine(q.stock, Date.now()) || null; }
-        else if (v && !verdictIsGreen(v)) { label = v.label; cls = "warn"; title = v.title; }
         else if (v && v.kind === "below_cost") { label = v.label; cls = "ok"; title = v.title; }
         else if (v && mode === "bazaar") { label = `RESELL +${fmtMoney(v.resale.profit)}`; cls = "ok"; title = v.title; }
-        else if (showsMarketPct(mode) && q.marketValue && c.price <= q.marketValue * dealPct / 100 && !hasQuality(c.card)) { label = `${Math.round((c.price / q.marketValue) * 100)}% OF MARKET`; cls = "warn"; }
+        else if (showsMarketPct(mode) && q.marketValue && c.price <= q.marketValue * dealPct / 100 && !hasQuality(c.card)) { label = `${Math.round((c.price / q.marketValue) * 100)}% OF MARKET`; cls = "ok"; }
         if (!label) continue;
-        c.card.style.boxShadow = cls === "buy" ? "inset 0 0 0 3px #4c8dff" : cls === "ok" ? "inset 0 0 0 3px #5fe0a6" : "inset 0 0 0 3px #e0a23b";
+        c.card.style.boxShadow = cls === "buy" ? "inset 0 0 0 3px #4c8dff" : "inset 0 0 0 3px #5fe0a6";
         c.card.querySelector("[data-testid='price']")?.after(el("span", { class: `totr-chip totr-chip--${cls}`, "data-totr-ui": "1", title: title || undefined }, label));
       }
     }
@@ -3263,8 +3251,12 @@
         // listing opens — once, only while empty; a number you type is never overwritten.
         if (!input.dataset.totrPrefilled) {
           input.dataset.totrPrefilled = "1";
-          const price = moneyIn(holder.querySelector("[data-testid='price']") || holder);
-          const pre = price ? prefillQty(price.value, parseStock(holder.textContent), walletNow(), input.value) : null;
+          // 0.8.29: the opened listing's price is "buy-item-price"; the closed card's is "price".
+          const price = moneyIn(holder.querySelector("[data-testid='buy-item-price'], [data-testid='price']") || holder);
+          // 0.8.29: Torn opens the box already holding 1 — that is its default, not something
+          // the player typed (this runs once, as the listing opens), so 1 still gets the max.
+          const current = /^\s*[01]?\s*$/.test(input.value) ? "" : input.value;
+          const pre = price ? prefillQty(price.value, parseStock(holder.textContent), walletNow(), current) : null;
           if (pre) {
             if (pre.qty > 0) setNativeValue(input, pre.qty);
             const where = input.closest("label") || input.parentElement || box;
@@ -3289,11 +3281,14 @@
           ![...n.children].some((c) => parseStock(c.textContent) != null)
         )[0];
         if (!stockLine) continue;
-        const btn = el("button", { class: "totr-mini totr-max", type: "button", "data-totr-ui": "1", title: "Fill in as many as you can afford", style: "display:inline-block;height:18px;line-height:16px;padding:0 6px;margin:0 0 0 6px;vertical-align:middle" }, "Max");
+        // 0.8.29: not a <button> — Torn styles buttons inside the "(n in stock)" line as its own
+        // "?" help icon, so a real button there showed "?" instead of Max.
+        const btn = el("totr-btn", { class: "totr-mini totr-max", role: "button", tabindex: "0", "data-totr-ui": "1", title: "Fill in as many as you can afford", style: "display:inline-block;box-sizing:border-box;height:18px;line-height:16px;padding:0 6px;margin:0 0 0 6px;vertical-align:middle;font-size:11px" }, "Max");
+        btn.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); btn.click(); } });
         btn.addEventListener("click", (e) => {
           e.preventDefault(); e.stopPropagation();
           const card = box.closest("[data-testid='item']") || box;
-          const price = moneyIn(card.querySelector("[data-testid='price']") || card);
+          const price = moneyIn(card.querySelector("[data-testid='buy-item-price'], [data-testid='price']") || card);
           const stock = parseStock(card.textContent);
           const money = walletNow();
           if (!price || money == null) { btn.textContent = "?"; btn.title = "Couldn't read the price or your money on this page."; return; }
