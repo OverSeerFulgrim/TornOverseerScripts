@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.35
+// @version      0.8.37
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -1026,6 +1026,29 @@
 
   /** How often the deal list is asked for (the server also rotates its live checks per 5 min). */
   const DEALS_POLL_MS = 5 * 60_000;
+  /** 0.8.37: a tab that is asking right now marks the shared copy; other tabs wait this long. */
+  const DEALS_CLAIM_MS = 45_000;
+  /**
+   * 0.8.37: may this tab ask for deals now? `shared` is the copy every Torn tab shares
+   * ({ at, claimAt, locked }), read fresh — each tab used to go by its own memory, so two open
+   * tabs each polled every 5 minutes, and both could start at the same moment.
+   */
+  function dealsPollDue(shared, now, force, lockedRecheckMs) {
+    if (force) return true;
+    const st = shared || {};
+    if (now - (Number(st.claimAt) || 0) < DEALS_CLAIM_MS) return false; // another tab is asking
+    const every = st.locked ? lockedRecheckMs : DEALS_POLL_MS;
+    return now - (Number(st.at) || 0) >= every;
+  }
+  /**
+   * 0.8.37: how long the page watcher waits before the next pass. `wait` after the latest page
+   * change, but never more than `maxWait` after the FIRST change still waiting — on a page that
+   * keeps changing, the plain delay restarted for ever and the pass (and its chips) never ran.
+   */
+  function passDelay(now, firstChangeAt, wait, maxWait) {
+    const left = firstChangeAt + maxWait - now;
+    return Math.max(0, Math.min(wait, left));
+  }
   /** Item-market reads per poll, with the player's own key (~1 Torn call a minute). */
   const MARKET_CHECKS_PER_POLL = 4;
   /**
@@ -1621,6 +1644,9 @@
   .totr-pick--main{background:#0f2a1f;border-color:#2f6b4f}.totr-pick:disabled{opacity:.6;cursor:default}
   .totr-pick-label{flex:1}.totr-pick-profit{min-width:56px;text-align:right;font-weight:700;color:#5fe0a6}.totr-pick-profit--floor{color:#e2a6ef}
   .totr-pick-trader{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 12px 8px;padding:8px 10px;border-radius:7px;border:1px solid #2f6b4f;background:#0f2a1f;font-size:12px;color:#c9d2de}.totr-pick-trader strong{color:#5fe0a6}.totr-pick-trader[hidden]{display:none}
+  .totr-dollar--alert{color:#fff;background:#b3261e;border-color:#e23b3b;box-shadow:0 0 0 1px #e23b3b}
+  .totr-pick-issue{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 12px 0;padding:8px 10px;border-radius:7px;border:1px solid #7a3a35;background:#2a1215;font-size:12px;color:#e6ebf2}.totr-pick-issue strong{color:#ff8a80}
+  .totr-pick-trader a{color:#5fe0a6}.totr-pick-trader-actions{display:inline-flex;gap:8px;align-items:center;margin-left:auto}
   .totr-pick-foot{display:flex;align-items:center;gap:8px;padding:8px 12px 10px;border-top:1px solid #232c3a}
   .totr-pick-foot .totr-muted{flex:1}
   .totr-linkbtn{font:12px system-ui,sans-serif;color:#8ab8ff;background:transparent;border:0;cursor:pointer;padding:0}
@@ -2458,14 +2484,22 @@
       const fill = r.row.querySelector("[data-totr-fill]");
       if (fill && fill.hidden !== same) fill.hidden = same;
       const st = isManage() && !same ? stateFor(r, s0) : null;
-      const text = st ? st.text : "";
-      const cls = "totr-bz-state" + (st ? ` totr-bz-state--${st.cls}` : "");
-      if (tag.textContent !== text) tag.textContent = text;
-      if (tag.className !== cls) tag.className = cls;
-      const title = [st && st.hint, tag.getAttribute("data-totr-vs")].filter(Boolean).join("\n");
+      // 0.8.36: no status pill on Manage any more — the $ turns red when the listed price is off
+      // (off target / under floor) and its popup says what's wrong and what to do.
+      if (tag.textContent !== "") tag.textContent = "";
+      if (tag.className !== "totr-bz-state") tag.className = "totr-bz-state";
+      const dollar = r.row.querySelector(".totr-dollar");
+      const alert = Boolean(st && st.off);
+      if (dollar && dollar.classList.contains("totr-dollar--alert") !== alert) dollar.classList.toggle("totr-dollar--alert", alert);
+      const title = alert ? `${st.hint} — click for what to do` : "Quick prices";
       // 0.8.23: set it only when the text changes. Torn's own tooltip takes the title away while it
       // shows; putting it back on every refresh made the browser's tooltip pop up as well (two boxes).
-      if (tag.dataset.tip !== title) { tag.dataset.tip = title; tag.title = title; }
+      if (dollar && dollar.dataset.tip !== title) { dollar.dataset.tip = title; dollar.title = title; }
+    }
+
+    /** 0.8.36: Manage — the Remove column's box on a row (the row's other number input). VERIFY on live Torn. */
+    function removeInputOf(r) {
+      return [...r.row.querySelectorAll("input")].find((x) => x !== r.price && !x.closest("[data-totr-ui]") && x.type !== "hidden" && x.type !== "checkbox" && !x.disabled) || null;
     }
 
     // ---- $ popup: pick a price -----------------------------------------------------------
@@ -2502,7 +2536,15 @@
         el("button", { type: "button", class: "totr-linkbtn", onclick: () => { closePopup(); modules.priceCheck.toggle(r.itemId, r.row.closest("li, tr") || r.row, { float: true }); } }, "Full price check"));
       // 0.8.34: a trader paying more than your sell price — sell to them by trade instead.
       const trader = el("div", { class: "totr-pick-trader", hidden: true });
-      popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, head, list, trader, foot);
+      // 0.8.36: what the red $ is about — the listed price is off — and the one-click fix.
+      const st = isManage() ? stateFor(r, sell.get(r.itemId)) : null;
+      const issue = st && st.off && s.sellAt != null
+        ? el("div", { class: "totr-pick-issue" },
+          el("span", null, el("strong", null, st.cls === "low" ? "Under your floor." : "Off your sell-list price."), ` ${st.hint}.`,
+            r.row.querySelector("[data-totr-vs]") ? ` ${r.row.querySelector("[data-totr-vs]").getAttribute("data-totr-vs")}.` : ""),
+          el("button", { type: "button", class: "totr-mini", onclick: () => { fillRow(r, s.sellAt); closePopup(); } }, `Fix: fill ${fmtMoney(s.sellAt)}`))
+        : null;
+      popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, ...[head, issue, list, trader, foot].filter(Boolean));
       document.body.append(popup);
       const rect = anchor.getBoundingClientRect();
       popup.style.top = `${Math.round(window.scrollY + rect.bottom + 6)}px`;
@@ -2519,9 +2561,20 @@
           if (!t || !trader.isConnected) return;
           const who = t.buyer.name || "A trader";
           const paid = s.costEach != null ? ` · ${profitText(s, t.buyer.price)} each vs what you paid` : "";
-          trader.replaceChildren(
-            el("span", null, el("strong", null, `${who} pays ${fmtMoney(t.buyer.price)}`), ` (${t.source === "te" ? "Torn Exchange" : t.source === "overseer" ? "Overseer trader" : "TornW3B"}) — ${fmtMoney(t.gap)} more than your sell price${paid}`),
-            t.buyer.playerId ? el("a", { class: "totr-linkbtn", href: `https://www.torn.com/trade.php#step=start&userID=${t.buyer.playerId}`, target: "_blank", rel: "noopener" }, "Start trade") : null);
+          // 0.8.36: Manage — "Remove from bazaar" fills Torn's Remove box with what's listed; you
+          // still press Save Changes. Native replaceChildren() prints a null as "null", so filter.
+          const removeBox = isManage() ? removeInputOf(r) : null;
+          const listedQty = r.count || r.held || 1;
+          const who2 = t.buyer.playerId
+            ? el("a", { href: `https://www.torn.com/profiles.php?XID=${t.buyer.playerId}`, target: "_blank", rel: "noopener" }, el("strong", null, who))
+            : el("strong", null, who);
+          trader.replaceChildren(...[
+            el("span", null, who2, el("strong", null, ` pays ${fmtMoney(t.buyer.price)}`), ` (${t.source === "te" ? "Torn Exchange" : t.source === "overseer" ? "Overseer trader" : "TornW3B"}) — ${fmtMoney(t.gap)} more than your sell price${paid}`),
+            el("span", { class: "totr-pick-trader-actions" }, ...[
+              removeBox ? el("button", { type: "button", class: "totr-mini", title: `Types ${listedQty} into Torn's Remove box — press Save Changes to take them out, then trade them`, onclick: () => { setNativeValue(removeBox, listedQty); closePopup(); } }, "Remove from bazaar") : null,
+              t.buyer.playerId ? el("a", { class: "totr-linkbtn", href: `https://www.torn.com/trade.php#step=start&userID=${t.buyer.playerId}`, target: "_blank", rel: "noopener" }, "Start trade") : null,
+            ].filter(Boolean)),
+          ]);
           trader.hidden = false;
         }).catch(() => { /* no buyers line — the rest of the popup still works */ });
       }
@@ -2773,7 +2826,7 @@
     async function run() {
       const list = rows();
       if (!list.length) return;
-      if (!prefs().tornKey && !prefs().sessionToken) {
+      if (!hasKey()) {
         lastError = "connect first: pick \"Set Torn API key\" in the Tampermonkey menu and paste your Torn key.";
         statusLine(list);
         return;
@@ -2821,7 +2874,7 @@
   /** 0.7.14: no choice on this device yet? Take the one saved to the account (once per page load). */
   let modePulled = false;
   function pullSellMode() {
-    if (modePulled || prefs().sellMode || (!prefs().tornKey && !prefs().sessionToken)) return;
+    if (modePulled || prefs().sellMode || (!hasKey())) return;
     modePulled = true;
     callTrader("sell_mode").then((res) => {
       const m = sellModeOf(res && res.mode);
@@ -2918,7 +2971,7 @@
       // Inside Torn's seller list at the top: as its sibling it became a narrow flex column.
       if (!strip) { strip = el("div", { id: "totr-strip", class: "totr", style: "width:100%;flex-basis:100%;box-sizing:border-box;margin-bottom:8px" }); a.prepend(strip); }
       const d = current.data;
-      const mode = prefs().sellMode;
+      const { sellMode: mode, dealPct: stripDealPct } = prefs();
       placeSellModeBar(strip);
       const head = el("div", { class: "totr-head" }, el("strong", null, "Bazaars"));
       // 0.8.14 (WO-93 A): the strip keeps its height while it loads — Full page / Price check are
@@ -2981,7 +3034,7 @@
               el("span", { class: "totr-card-name" }, b.name || "Bazaar"),
               el("strong", null, fmtMoney(b.price)),
               el("span", { class: "totr-muted" }, `× ${b.qty}`)),
-            stripChip(b, under, pct, mode, d)));
+            stripChip(b, under, pct, mode, d, stripDealPct)));
         }
         if (cards.hidden) body.append(el("button", { class: "totr-mini totr-mini--more", type: "button", onclick: () => { showAll = true; render(); } }, `+${cards.hidden} more`));
         else if (showAll && total > STRIP_SHOW) body.append(el("button", { class: "totr-mini totr-mini--more", type: "button", onclick: () => { showAll = false; render(); } }, "Show fewer"));
@@ -2995,13 +3048,13 @@
     }
 
     /** One chip per strip card: blue under your buy, else what fits the sell mode. */
-    function stripChip(b, under, pct, mode, d) {
+    function stripChip(b, under, pct, mode, d, dealPct) {
       if (under) return el("span", { class: "totr-chip totr-chip--buy" }, "Under your buy");
       if (showsMarketPct(mode)) {
         // 0.8.10: green only at or under your deal % of MV (−10% or better at the default 90) —
         // a −0.6% listing used to glow the same green as −17%, and read as a deal.
         if (pct == null) return null;
-        const { cls, title } = stripPctLook(pct, prefs().dealPct, d && d.stock, Date.now());
+        const { cls, title } = stripPctLook(pct, dealPct, d && d.stock, Date.now());
         return el("span", { class: "totr-chip " + cls, title }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`);
       }
       // 0.8.31: judged against the live floor on this page — the other bazaars in this strip and
@@ -3077,13 +3130,13 @@
       return true;
     }
     function markGrid(list) {
+      const mode = prefs().sellMode; // 0.8.37: once per pass, not once per tile
       for (const t of list) {
         const q = gridQuotes.get(t.itemId);
         const buyAt = q && q.buyPrice != null ? q.buyPrice : null;
         const deal = buyAt != null && t.price <= buyAt;
         // Buy-list deals win; otherwise a flip if reselling at MV clears the 5% fee. t.price is
         // read off the tile on every scan, so a listing that sold never leaves a stale chip.
-        const mode = prefs().sellMode;
         // 0.8.28: only deals are marked — a high sell-list target or stuck stock gets no outline.
         // 0.8.8 (WO-89): the tile price IS the item-market low, so no item-market resale here; the
         // bazaar low and "below your cost" still apply.
@@ -3168,7 +3221,7 @@
 
     return {
       onRoute() {
-        if (!prefs().tornKey && !prefs().sessionToken) return; // trade panel handles first sign-in
+        if (!hasKey()) return; // trade panel handles first sign-in
         grid();
         const id = itemIdNow();
         if (!id) return;
@@ -3294,20 +3347,21 @@
     }
 
     function markDeals(list) {
-      const dealPct = prefs().dealPct;
+      // 0.8.37: settings are read once per pass. They were read three times per listing, each
+      // read pulling every stored setting and rebuilding the ignore list.
+      const { dealPct, sellMode: mode, ignored } = prefs();
       for (const c of list) {
         const q = quotes.get(c.itemId);
         if (q === undefined || c.price == null) continue;
         // 0.8.8: re-marked when the price or a late item-market low changes, never twice for the same.
-        const sig = `${c.price}:${q ? imLowOf(c.itemId) : "x"}:${prefs().sellMode}`;
+        const sig = `${c.price}:${q ? imLowOf(c.itemId) : "x"}:${mode}`;
         if (c.card.dataset.totrDeal === sig) continue;
         c.card.dataset.totrDeal = sig;
         c.card.querySelector(".totr-chip[data-totr-ui]")?.remove();
         c.card.style.boxShadow = "";
-        if (!q || prefs().ignored.has(c.itemId)) continue;
+        if (!q || ignored.has(c.itemId)) continue;
         if (c.price <= 1) continue; // $1 listings are display/locked items, not deals
         let label = null; let cls = null;
-        const mode = prefs().sellMode;
         // 0.8.28: buy pages only point at deals — blue under your buy, green resale / below your cost.
         // A high sell-list target or stuck stock shows nothing here (fix those on Overseer).
         const v = resaleVerdict({ mode, ask: c.price, marketValue: q.marketValue, sellAt: sellAtOf(c.itemId), market: sellMarketOf(c.itemId), stock: q.stock, quote: q, itemMarketLow: imLowOf(c.itemId) }, Date.now());
@@ -3407,7 +3461,7 @@
         const list = cards();
         if (!list.length) return;
         showArrival(list);
-        if (!prefs().tornKey && !prefs().sessionToken) return;
+        if (!hasKey()) return;
         const key = location.search;
         if (dealsFor !== key) { dealsFor = key; quotes = new Map(); }
         placeSellModeBar(document.querySelector("[data-testid='bazaar-items']"));
@@ -3501,7 +3555,10 @@
       if (b.w3bRows) {
         b.w3bRows.forEach((r, i) => kids.push(el("div", { class: "totr-pc-row" + (r.isYou ? " totr-pc-row--you" : "") },
           el("span", { class: "totr-muted" }, `#${i + 1}`),
-          el("span", { class: "grow" }, r.isYou ? "You" : (r.name || (r.playerId ? `#${r.playerId}` : "Trader"))),
+          // 0.8.36: names open the trader's Torn profile.
+          el("span", { class: "grow" }, r.isYou ? "You" : r.playerId
+            ? el("a", { href: `https://www.torn.com/profiles.php?XID=${r.playerId}`, target: "_blank", rel: "noopener" }, r.name || `#${r.playerId}`)
+            : (r.name || "Trader")),
           el("strong", { class: "totr-num" }, money(r.price)))));
         if (!b.w3bRows.length) kids.push(el("div", { class: "totr-muted" }, "Nobody on W3b is buying this."));
         const where = b.w3bRank != null
@@ -3511,6 +3568,16 @@
       } else if (b.w3bError) kids.push(el("div", { class: "totr-error" }, `W3b: ${b.w3bError}`));
       const te = teLine(b.te);
       if (te) kids.push(el("div", { class: "totr-muted" }, te));
+      // 0.8.36: Torn Exchange's top buyers and other Overseer traders, the Sell card's sources.
+      const others = Array.isArray(b.otherBuyers) ? b.otherBuyers.slice(0, 6) : [];
+      for (const o of others) {
+        kids.push(el("div", { class: "totr-pc-row" },
+          el("span", { class: "totr-src" + (o.source === "te" ? " totr-src--market" : "") }, o.source === "te" ? "TE" : "OVERSEER"),
+          el("span", { class: "grow" }, o.playerId
+            ? el("a", { href: `https://www.torn.com/profiles.php?XID=${o.playerId}`, target: "_blank", rel: "noopener" }, o.name || `#${o.playerId}`)
+            : (o.name || "Trader")),
+          el("strong", { class: "totr-num" }, money(o.price))));
+      }
       return sec("Buying now", ...kids);
     }
 
@@ -4175,6 +4242,13 @@
     function save() {
       try { localStorage.setItem(ALERTS_STORE, JSON.stringify(state)); } catch { /* storage off: just re-asks */ }
     }
+    /** 0.8.37: drop this tab's copy so the next load() reads what another tab saved. */
+    function reload() {
+      let raw = null;
+      try { raw = localStorage.getItem(ALERTS_STORE); } catch { raw = null; }
+      if (raw) state = null; // storage off or empty: keep what this tab has in memory
+      return load();
+    }
 
     function allDeals() {
       const s = load();
@@ -4192,11 +4266,18 @@
     async function poll(force) {
       if (busy || !hasKey()) return;
       if (typeof document !== "undefined" && document.hidden && !force) return;
-      const s = load();
+      // 0.8.37: go by the copy all tabs share, not this tab's memory — and show what another tab
+      // already fetched instead of asking again.
+      const before = load().at || 0;
+      const s = reload();
       const now = Date.now();
-      if (s.locked && !force && now - (s.at || 0) < LOCKED_RECHECK_MS) return;
-      if (!s.locked && !force && now - (s.at || 0) < DEALS_POLL_MS) return;
+      if (!dealsPollDue(s, now, force, LOCKED_RECHECK_MS)) {
+        if ((s.at || 0) !== before) render();
+        return;
+      }
       busy = true;
+      s.claimAt = now; // tell the other tabs this one is asking
+      save();
       if (open) render(); // the header's ↻ spins while we ask
       try {
         const res = await callTrader("deals");
@@ -4227,6 +4308,7 @@
         else s.error = String((err && err.message) || err).replace(/key=[^&\s)]+/gi, "key=…");
       } finally {
         s.at = now;
+        s.claimAt = 0;
         busy = false;
         save();
         render();
@@ -4550,7 +4632,15 @@
     };
     rerunPage = run;
     registerMenu();
-    const schedule = () => { clearTimeout(timer); timer = setTimeout(run, isTradingPage(location) ? 150 : 1000); };
+    // 0.8.37: at most PASS_MAX_WAIT_MS after the first change still waiting (passDelay).
+    const PASS_MAX_WAIT_MS = 1000;
+    let firstChangeAt = 0;
+    const schedule = () => {
+      const now = Date.now();
+      if (!firstChangeAt) firstChangeAt = now;
+      clearTimeout(timer);
+      timer = setTimeout(() => { firstChangeAt = 0; run(); }, passDelay(now, firstChangeAt, isTradingPage(location) ? 150 : 1000, PASS_MAX_WAIT_MS));
+    };
     window.addEventListener("hashchange", schedule);
     // Our own UI and Chain Watch's panel (which redraws every second) never wake a re-scan.
     const ours = (node) => node && node.closest && node.closest(".totr, [data-totr-ui], #tocw, [id^='tocw-']");
@@ -4569,7 +4659,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

@@ -134,7 +134,7 @@ const MANAGE_HTML = `<div><span>Manage your Bazaar</span></div><ul>
   <li class="row___b"><img src="/images/items/10/small.png"><div class="name"><span>Paper Weight</span></div><div class="details"></div><div class="rrp">$310</div><div><input placeholder="Price" class="input-money" value="350"></div></li>
 </ul>`;
 
-test("Manage (0.8.25): a price that already matches hides Fill and the status pill", async () => {
+test("Manage (0.8.25, 0.8.36): a price that already matches hides Fill; an off price turns the $ red", async () => {
   const { doc } = page("https://www.torn.com/bazaar.php#/manage", MANAGE_HTML, addAnswer);
   await tick(400);
   const [jemmy, weight] = doc.querySelectorAll("li");
@@ -143,7 +143,11 @@ test("Manage (0.8.25): a price that already matches hides Fill and the status pi
   assert.ok(fillOf(jemmy).hidden, "$7,000 listed = sell list: no Fill");
   assert.equal(stateOf(jemmy).textContent, "");
   assert.ok(!fillOf(weight).hidden, "$350 listed vs $300: Fill shows");
-  assert.equal(stateOf(weight).textContent, "+17%");
+  assert.equal(stateOf(weight).textContent, "", "0.8.36: no status pill on Manage");
+  const dollarOf = (li) => li.querySelector(".totr-dollar");
+  assert.ok(dollarOf(weight).classList.contains("totr-dollar--alert"), "$350 vs $300: the $ is red");
+  assert.match(dollarOf(weight).title, /17% over/);
+  assert.ok(!dollarOf(jemmy).classList.contains("totr-dollar--alert"));
   // The use squares replace the words on the muted line.
   assert.ok(jemmy.querySelector(".totr-bz-sub .totr-sq--crime"));
   assert.doesNotMatch(jemmy.querySelector(".totr-bz-sub").textContent, /crime tool/);
@@ -153,4 +157,32 @@ test("Manage (0.8.25): a price that already matches hides Fill and the status pi
   assert.equal(weight.querySelector("input").value, "300");
   assert.ok(fillOf(weight).hidden);
   assert.equal(stateOf(weight).textContent, "");
+  assert.ok(!dollarOf(weight).classList.contains("totr-dollar--alert"), "fixed: the $ goes back to normal");
+});
+
+test("Manage $ popup (0.8.36): the issue and its fix, a trader paying more with a profile link and Remove from bazaar — no stray \"null\"", async () => {
+  const html = MANAGE_HTML.replace('<div class="rrp">$310</div>', '<div class="rrp">$310</div><div><input class="remove" value=""></div>');
+  const answer = (body) => {
+    if (body.action === "price_check") {
+      return { buyingNow: { w3bRows: [{ name: "w", playerId: 5, price: 320, isYou: false }], otherBuyers: [{ name: "Masime", playerId: null, price: 340, source: "te" }, { name: "Old", playerId: 9, price: 330, source: "overseer" }] } };
+    }
+    return addAnswer(body);
+  };
+  const { doc } = page("https://www.torn.com/bazaar.php#/manage", html, answer);
+  await tick(400);
+  const weight = doc.querySelectorAll("li")[1];
+  weight.querySelector(".totr-dollar").click();
+  await tick(50);
+  const pop = doc.querySelector(".totr-pick-pop");
+  assert.match(pop.querySelector(".totr-pick-issue").textContent, /Off your sell-list price/);
+  const line = pop.querySelector(".totr-pick-trader");
+  assert.ok(!line.hidden);
+  assert.match(line.textContent, /Masime pays \$340 \(Torn Exchange\) — \$40 more than your sell price/);
+  assert.doesNotMatch(line.textContent, /null/);
+  // No Torn id for the TE name: no profile link and no Start trade — but Remove from bazaar still offered.
+  assert.equal(line.querySelector("a[href*='profiles.php']"), null);
+  const removeBtn = [...line.querySelectorAll("button")].find((b) => /Remove from bazaar/.test(b.textContent));
+  removeBtn.click();
+  assert.equal(weight.querySelector("input.remove").value, "1");
+  assert.equal(doc.querySelector(".totr-pick-pop"), null, "the popup closes");
 });

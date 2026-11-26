@@ -842,3 +842,30 @@ test("traderOver (0.8.35): TE and Overseer traders count too", () => {
   assert.equal(tr.traderOver(null, 2217, [{ name: "B", playerId: 2, price: 2300, source: "overseer" }]).source, "overseer");
   assert.equal(tr.traderOver([{ name: "W", playerId: 1, price: 2300, isYou: false }], 2217, null).source, "w3b");
 });
+
+test("0.8.37: a deal check is skipped when another tab just did one, or is doing one", () => {
+  const now = 1_800_000_000_000;
+  const LOCKED = 6 * 3600_000;
+  // Never checked → due. Checked 4 minutes ago by any tab → not yet. 5 minutes → due.
+  assert.equal(tr.dealsPollDue({}, now, false, LOCKED), true);
+  assert.equal(tr.dealsPollDue({ at: now - 4 * 60_000 }, now, false, LOCKED), false);
+  assert.equal(tr.dealsPollDue({ at: now - 5 * 60_000 }, now, false, LOCKED), true);
+  // Another tab started asking 10 s ago → wait; a claim left behind by a closed tab expires.
+  assert.equal(tr.dealsPollDue({ at: now - 10 * 60_000, claimAt: now - 10_000 }, now, false, LOCKED), false);
+  assert.equal(tr.dealsPollDue({ at: now - 10 * 60_000, claimAt: now - tr.DEALS_CLAIM_MS }, now, false, LOCKED), true);
+  // Locked accounts re-check every 6 hours; the ↻ button always asks.
+  assert.equal(tr.dealsPollDue({ locked: true, at: now - 3600_000 }, now, false, LOCKED), false);
+  assert.equal(tr.dealsPollDue({ locked: true, at: now - LOCKED }, now, false, LOCKED), true);
+  assert.equal(tr.dealsPollDue({ at: now - 1000, claimAt: now - 1000 }, now, true, LOCKED), true);
+});
+
+test("0.8.37: the page watcher waits 150 ms after a change, but never more than 1 s in all", () => {
+  // A single change: the usual wait.
+  assert.equal(tr.passDelay(1000, 1000, 150, 1000), 150);
+  // Changes keep coming: 900 ms after the first, only 100 ms is left.
+  assert.equal(tr.passDelay(1900, 1000, 150, 1000), 100);
+  // Past the cap → run now, never a negative delay.
+  assert.equal(tr.passDelay(2400, 1000, 150, 1000), 0);
+  // Off the trading pages the wait is 1 s, which the cap leaves alone for the first change.
+  assert.equal(tr.passDelay(5000, 5000, 1000, 1000), 1000);
+});
