@@ -419,15 +419,12 @@ test("resaleFor: market = flip after the 5% fee; bazaar = your sell-list price, 
   assert.equal(tr.resaleFor("trade", 100, 1000, 1000), null);
 });
 
-test("resaleVerdict (WO-80): a sell-list price far over the cheapest bazaar is not a resale", () => {
+test("resaleVerdict (WO-80, 0.8.28): a sell-list price far over the cheapest bazaar is not a resale — and no chip", () => {
   // Spray Paint : Red, 2026-11-07: ask $399, sell list $510, cheapest bazaar $369.
   const now = Date.parse("2026-11-07T23:00:00Z");
   const market = { cheapest: 369, bazaarAverage: 380, listings: 12, capturedAt: "2026-11-07T22:40:00Z", weekCheapest: 372, yesterdayCheapest: 370 };
   const v = tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: 510, market, stock: null }, now);
-  assert.equal(v.kind, "target_high");
-  assert.equal(v.label, "TARGET +38% vs bazaar low");
-  assert.match(v.title, /sell-list price \$510/);
-  assert.match(v.title, /Sell tab/);
+  assert.equal(v, null);
   // Within 10% of the cheapest: the green resale stays.
   const near = tr.resaleVerdict({ mode: "bazaar", ask: 340, marketValue: 383, sellAt: 395, market, stock: null }, now);
   assert.equal(near.kind, "resale");
@@ -444,20 +441,16 @@ test("resaleVerdict (WO-80): a sell-list price far over the cheapest bazaar is n
   assert.equal(tr.resaleVerdict({ mode: "trade", ask: 300, marketValue: 383, sellAt: 510, market, stock: null }, now), null);
 });
 
-test("resaleVerdict (WO-80): stock you hold that isn't selling beats any resale, in every mode", () => {
+test("resaleVerdict (WO-80, 0.8.28): stock you hold that isn't selling gets no chip, in every mode", () => {
   const now = Date.parse("2026-11-07T23:00:00Z");
   const ago = (d) => new Date(now - d * 86400000).toISOString();
   const stuck = { onHand: 28, oldestLotAt: ago(54), sold30d: 0 };
   const market = { cheapest: 369, bazaarAverage: 380, listings: 12, capturedAt: "2026-11-07T22:40:00Z", weekCheapest: 372, yesterdayCheapest: 370 };
   const v = tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: 510, market, stock: stuck }, now);
-  assert.equal(v.kind, "hold");
-  assert.equal(v.label, "HOLD 28 · NOT SELLING");
-  assert.match(v.title, /^You already hold 28 · none sold in 30 days/);
-  assert.match(v.title, /sell-list price \$510/);
-  // Even with a real resale on offer.
-  const m = tr.resaleVerdict({ mode: "market", ask: 300, marketValue: 383, sellAt: null, market: null, stock: stuck }, now);
-  assert.equal(m.kind, "hold");
-  assert.match(m.title, /flip \+\$63/);
+  assert.equal(v, null);
+  // Even with a real resale on offer: no green on stuck stock.
+  assert.equal(tr.resaleVerdict({ mode: "market", ask: 300, marketValue: 383, sellAt: null, market: null, stock: stuck }, now), null);
+  assert.equal(tr.resaleVerdict({ mode: "market", ask: 300, marketValue: 383, sellAt: null, market: null, stock: null }, now).kind, "resale");
   // Recently bought or still selling: no hold.
   assert.equal(tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: null, market: null, stock: { onHand: 28, oldestLotAt: ago(54), sold30d: 3 } }, now), null);
   assert.equal(tr.resaleVerdict({ mode: "bazaar", ask: 399, marketValue: 383, sellAt: null, market: null, stock: { onHand: 28, oldestLotAt: ago(5), sold30d: 0 } }, now), null);
@@ -599,11 +592,8 @@ test("realisticResale (WO-89): the market's own exits, not your target", () => {
 test("resaleVerdict (WO-89): a stale high target no longer hides a real resale; below-cost prompts a buy", () => {
   const now = Date.parse("2026-11-08T22:00:00Z");
   const market = { cheapest: 250, bazaarAverage: 270, listings: 10, capturedAt: "2026-11-08T21:50:00Z", weekCheapest: 255, yesterdayCheapest: 252 };
-  // Roses: target $280 is +12% over the $250 low and no market exit beats $255 → amber, named plainly.
-  const roses = tr.resaleVerdict({ mode: "bazaar", ask: 255, marketValue: 286, sellAt: 280, market, stock: null, quote: { avgCost: null, avgCostQty: 0 } }, now);
-  assert.equal(roses.kind, "target_high");
-  assert.equal(roses.label, "TARGET +12% vs bazaar low");
-  assert.doesNotMatch(roses.label, /market$/);
+  // Roses: target $280 is +12% over the $250 low and no market exit beats $255 → no chip (0.8.28).
+  assert.equal(tr.resaleVerdict({ mode: "bazaar", ask: 255, marketValue: 286, sellAt: 280, market, stock: null, quote: { avgCost: null, avgCostQty: 0 } }, now), null);
   // Wreath: same stale target, but the item market pays $350 after fee → green, says where.
   const wreath = tr.resaleVerdict({ mode: "bazaar", ask: 200, marketValue: 246, sellAt: 240, market: { ...market, cheapest: 200, weekCheapest: 205, yesterdayCheapest: 203 }, stock: null, quote: null, itemMarketLow: 369 }, now);
   assert.equal(wreath.kind, "resale");
@@ -617,11 +607,9 @@ test("resaleVerdict (WO-89): a stale high target no longer hides a real resale; 
   assert.equal(cost.label, "BELOW YOUR COST $265");
   assert.match(cost.title, /average down to \$248/);
   assert.equal(tr.verdictIsGreen(cost), true);
-  // …but HOLD still wins over everything.
+  // …but stuck stock still beats everything: no chip at all.
   const stuck = { onHand: 12, oldestLotAt: "2026-09-01T00:00:00Z", sold30d: 0 };
-  const hold = tr.resaleVerdict({ mode: "bazaar", ask: 230, marketValue: 286, sellAt: 300, market, stock: stuck, quote: { avgCost: 265, avgCostQty: 12 }, itemMarketLow: 500 }, now);
-  assert.equal(hold.kind, "hold");
-  assert.equal(tr.verdictIsGreen(hold), false);
+  assert.equal(tr.resaleVerdict({ mode: "bazaar", ask: 230, marketValue: 286, sellAt: 300, market, stock: stuck, quote: { avgCost: 265, avgCostQty: 12 }, itemMarketLow: 500 }, now), null);
   // A realistic resale clears before below-cost does.
   const both = tr.resaleVerdict({ mode: "bazaar", ask: 200, marketValue: 286, sellAt: 300, market, stock: null, quote: { avgCost: 265, avgCostQty: 12 } }, now);
   assert.equal(both.kind, "resale");
@@ -785,4 +773,52 @@ test("priceMatches: only an exact match (Torn's $1 placeholder never counts)", (
   assert.equal(tr.priceMatches(1, 1), false);
   assert.equal(tr.priceMatches(null, 300), false);
   assert.equal(tr.priceMatches(300, null), false);
+});
+
+test("resaleVerdict (0.8.31): a bazaar resale is judged against the live floor, not only the snapshot", () => {
+  // Hydrogen Tank, 2026-11-26: bazaar $23,000, snapshot cheapest $26,984, item market low $22,278,
+  // sell list $22,650. Used to read "resell +$3,984 (17.3%)".
+  const now = Date.parse("2026-11-26T12:20:00Z");
+  const market = { cheapest: 26984, bazaarAverage: 28000, listings: 20, capturedAt: "2026-11-26T11:00:00Z", weekCheapest: 26500, yesterdayCheapest: 26800 };
+  const base = { mode: "bazaar", ask: 23000, marketValue: 22278, sellAt: 22650, market, stock: null, quote: null };
+  assert.equal(tr.resaleVerdict(base, now).kind, "resale"); // snapshot alone: the old answer
+  assert.equal(tr.resaleVerdict({ ...base, itemMarketLow: 22278, bazaarLow: 27200 }, now), null);
+  // The cap: a bazaar exit never sits above the item-market low.
+  const r = tr.realisticResale(20000, { market, itemMarketLow: 22278, bazaarLow: 27200 }, now);
+  assert.equal(r.via, "bazaar_low");
+  assert.equal(r.at, 22278);
+  assert.equal(r.capped, "item_market");
+  // A live bazaar cheaper than the snapshot wins too.
+  assert.equal(tr.realisticResale(20000, { market, bazaarLow: 24000 }, now).at, 24000);
+  // A sell-list price >10% over the live item-market low is no resale either.
+  assert.equal(tr.resaleVerdict({ ...base, ask: 20000, sellAt: 26000, market: null, itemMarketLow: 22278 }, now).label, "resell +$1,164 (5.8%)"); // the item market after fee, not $26,000
+  assert.match(tr.resaleVerdict({ ...base, ask: 20000, sellAt: 26000, market: null, itemMarketLow: 22278 }, now).title, /item market at its low \$22,278/);
+});
+
+test("0.8.32: Item Market sellers get no green % OF MARKET mark on stock that isn't selling", () => {
+  const now = Date.parse("2026-11-26T12:00:00Z");
+  const stuck = { onHand: 12, oldestLotAt: "2026-09-01T00:00:00Z", sold30d: 0 };
+  const selling = { onHand: 12, oldestLotAt: "2026-09-01T00:00:00Z", sold30d: 3 };
+  // $850 on a $1,000 item with a 90% deal line → 85% OF MARKET.
+  assert.equal(tr.marketPctDeal("market", 850, 1000, 90, null, now), 85);
+  assert.equal(tr.marketPctDeal("market", 850, 1000, 90, selling, now), 85);
+  assert.equal(tr.marketPctDeal("market", 850, 1000, 90, stuck, now), null);
+  // Not a deal, a $1 display listing, or a sell mode that doesn't use this mark → nothing.
+  assert.equal(tr.marketPctDeal("market", 950, 1000, 90, null, now), null);
+  assert.equal(tr.marketPctDeal("market", 1, 1000, 90, null, now), null);
+  assert.equal(tr.marketPctDeal("bazaar", 850, 1000, 90, null, now), null);
+  assert.equal(tr.marketPctDeal("trade", 850, 1000, 90, null, now), null);
+});
+
+test("0.8.33: the Bazaars strip's % vs MV chip stays grey on stock that isn't selling", () => {
+  const now = Date.parse("2026-11-26T12:00:00Z");
+  const stuck = { onHand: 12, oldestLotAt: "2026-09-01T00:00:00Z", sold30d: 0 };
+  assert.deepEqual(tr.stripPctLook(-15, 90, null, now), { cls: "totr-chip--ok", title: "At or under your deal line (90% of MV)" });
+  const grey = tr.stripPctLook(-15, 90, stuck, now);
+  assert.equal(grey.cls, "totr-chip--dim");
+  assert.match(grey.title, /You already hold 12 · none sold in 30 days/);
+  // Unchanged: under MV but not a deal is grey, over MV is amber — stuck or not.
+  assert.equal(tr.stripPctLook(-0.6, 90, null, now).cls, "totr-chip--dim");
+  assert.match(tr.stripPctLook(-0.6, 90, stuck, now).title, /not by your deal %/);
+  assert.equal(tr.stripPctLook(4, 90, stuck, now).cls, "totr-chip--warn");
 });

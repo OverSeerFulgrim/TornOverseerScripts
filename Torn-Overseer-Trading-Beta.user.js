@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.30
+// @version      0.8.33
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -539,6 +539,31 @@
   function sellModeOf(raw) { return SELL_MODES.includes(raw) ? raw : null; }
   /** Whether the amber "% of market value" marks belong on this mode's pages. */
   function showsMarketPct(mode) { return mode !== "bazaar" && mode !== "trade"; }
+  /**
+   * 0.8.32: the item-market grid's green "X% OF MARKET" mark for Item Market sellers — the whole
+   * percent to show, or null for no mark. No mark on stock you already hold that hasn't sold in
+   * 30 days: until 0.8.28 the amber HOLD chip took that slot, and once it was gone a cheap
+   * listing of stuck stock turned green.
+   */
+  /**
+   * 0.8.33: colour + tooltip of the Bazaars strip's "% vs MV" chip (Item Market sellers). Green
+   * only at or under your deal line — and, like the grid mark above, never on stock you already
+   * hold that hasn't sold in 30 days: that listing stays grey and the tooltip says why.
+   */
+  function stripPctLook(pct, dealPct, stock, nowMs) {
+    const dealLine = -(100 - dealPct);
+    if (pct > 0) return { cls: "totr-chip--warn", title: "Over market value" };
+    if (pct > dealLine) return { cls: "totr-chip--dim", title: `Under MV, but not by your deal % (${dealPct}% of MV = ${dealLine}%)` };
+    const stuck = notSellingLine(stock, nowMs);
+    if (stuck) return { cls: "totr-chip--dim", title: stuck };
+    return { cls: "totr-chip--ok", title: `At or under your deal line (${dealPct}% of MV)` };
+  }
+  function marketPctDeal(mode, price, marketValue, dealPct, stock, nowMs) {
+    if (!showsMarketPct(mode) || !(Number(marketValue) > 0) || !(Number(price) > 1)) return null;
+    if (price > marketValue * dealPct / 100) return null;
+    if (notSellingLine(stock, nowMs)) return null;
+    return Math.round((price / marketValue) * 100);
+  }
   /** The resale chip for a listing at `askPrice`, or null when there is none worth showing. */
   function resaleFor(mode, askPrice, marketValue, sellAt) {
     if (mode === "trade") return null;
@@ -563,22 +588,34 @@
    * item-market low after Torn's 5% fee (`itemMarketLow`, read live for a few listings). Your
    * sell-list target does not enter into it. Returns the better of the two as
    * { via, at, net, profit, pct } when it clears MIN_REALISTIC_PCT of the ask, else null. Pure.
+   *
+   * 0.8.31: the bazaar exit is the market's FLOOR, not the snapshot alone. `bazaarLow` is a live
+   * cheapest bazaar listing (the strip's own cards, minus the one being judged) and caps a snapshot
+   * that is up to 3 h old; and nobody pays a bazaar more than the item market is asking, so a known
+   * `itemMarketLow` caps it too (`capped: "item_market"`). A $23,000 bazaar listing with the item
+   * market at $22,278 used to read "resell +$3,984" off a $26,984 snapshot.
    */
-  function realisticResale(ask, { market, itemMarketLow }, nowMs) {
+  function realisticResale(ask, { market, itemMarketLow, bazaarLow }, nowMs) {
     const a = Number(ask);
     if (!Number.isFinite(a) || a <= 1) return null;
     const out = [];
+    const low = Number(itemMarketLow);
+    const imKnown = Number.isFinite(low) && low > 1;
+    let base = null;
     if (market) {
       const at = Date.parse(market.capturedAt || "");
       const cheapest = Number(market.cheapest);
       const avg = Number(market.bazaarAverage);
       const display = avg > 0 && Number(market.listings) >= 20 && cheapest < avg * 0.5;
-      if (Number.isFinite(at) && nowMs - at <= VS_STALE_MS && cheapest > 1 && market.listings !== 0 && !display) {
-        out.push({ via: "bazaar_low", at: cheapest, net: cheapest, profit: cheapest - a });
-      }
+      if (Number.isFinite(at) && nowMs - at <= VS_STALE_MS && cheapest > 1 && market.listings !== 0 && !display) base = cheapest;
     }
-    const low = Number(itemMarketLow);
-    if (Number.isFinite(low) && low > 1) {
+    const live = Number(bazaarLow);
+    if (Number.isFinite(live) && live > 1) base = base == null ? live : Math.min(base, live);
+    if (base != null) {
+      const at = imKnown ? Math.min(base, low) : base;
+      out.push({ via: "bazaar_low", at, net: at, profit: at - a, capped: imKnown && low < base ? "item_market" : null });
+    }
+    if (imKnown) {
       const net = netAfterFee(low);
       if (net != null) out.push({ via: "item_market", at: low, net, profit: net - a });
     }
@@ -664,20 +701,24 @@
    * `market` is the MC-3 snapshot carried by `sell_prices`; `stock` the quote's holding; `quote`
    * the light quote (avgCost/avgCostQty); `itemMarketLow` a live Torn item-market low or null. Pure.
    */
-  function resaleVerdict({ mode, ask, marketValue, sellAt, market, stock, quote, itemMarketLow }, nowMs) {
+  function resaleVerdict({ mode, ask, marketValue, sellAt, market, stock, quote, itemMarketLow, bazaarLow }, nowMs) {
     const resale = resaleFor(mode, ask, marketValue, sellAt);
     const vs = mode === "bazaar" ? vsCheapest(sellAt, market, nowMs) : null;
     const vsLine = vs && vs.label ? `your sell-list price ${fmtMoney(sellAt)} ${vs.label} ${vs.title}` : (mode === "bazaar" && Number(sellAt) > 0 ? `your sell-list price ${fmtMoney(sellAt)} · cheapest listing unchecked` : "");
     const resaleLine = resale ? (resale.via === "bazaar" ? `${resaleLabel(resale)} at your sell-list price ${fmtMoney(sellAt)} (no fee in a bazaar)` : `${resaleLabel(resale)} resold at market value ${fmtMoney(marketValue)} after Torn's 5% fee`) : "";
     const stuck = notSellingLine(stock, nowMs);
     if (stuck) return null;
-    const targetHigh = Boolean(vs && vs.band === "far_above");
+    // 0.8.31: a live floor (the item-market low, or a live bazaar listing) more than 10% under your
+    // sell-list price makes that price unrealistic too, whatever the bazaar snapshot says.
+    const liveFloor = [itemMarketLow, bazaarLow].map(Number).filter((n) => Number.isFinite(n) && n > 1);
+    const floorLow = mode === "bazaar" && liveFloor.length && Number(sellAt) > 0 && Number(sellAt) > Math.min(...liveFloor) * (1 + VS_FAR_ABOVE_PCT / 100);
+    const targetHigh = Boolean(vs && vs.band === "far_above") || floorLow;
     if (resale && !targetHigh) return { kind: "resale", label: resaleLabel(resale), title: [resaleLine, vsLine].filter(Boolean).join(" · "), resale, vs };
     if (mode === "bazaar") {
-      const real = realisticResale(ask, { market, itemMarketLow }, nowMs);
+      const real = realisticResale(ask, { market, itemMarketLow, bazaarLow }, nowMs);
       if (real) {
         const where = real.via === "bazaar_low"
-          ? `matching the cheapest bazaar ${fmtMoney(real.at)} (no fee)`
+          ? (real.capped === "item_market" ? `in your bazaar at the item-market low ${fmtMoney(real.at)} (no fee)` : `matching the cheapest bazaar ${fmtMoney(real.at)} (no fee)`)
           : `on the item market at its low ${fmtMoney(real.at)} → ${fmtMoney(real.net)} after Torn's 5% fee`;
         const r = { profit: real.profit, pct: real.pct, via: "bazaar", real };
         return { kind: "resale", label: resaleLabel(r), title: [`${resaleLabel(r)} ${where}`, targetHigh ? vsLine : ""].filter(Boolean).join(" · "), resale: r, vs };
@@ -2927,13 +2968,27 @@
         // 0.8.10: green only at or under your deal % of MV (−10% or better at the default 90) —
         // a −0.6% listing used to glow the same green as −17%, and read as a deal.
         if (pct == null) return null;
-        const dealLine = -(100 - prefs().dealPct);
-        const cls = pct <= dealLine ? "totr-chip--ok" : pct <= 0 ? "totr-chip--dim" : "totr-chip--warn";
-        const title = pct <= dealLine ? `At or under your deal line (${prefs().dealPct}% of MV)` : pct <= 0 ? `Under MV, but not by your deal % (${prefs().dealPct}% of MV = ${dealLine}%)` : "Over market value";
+        const { cls, title } = stripPctLook(pct, prefs().dealPct, d && d.stock, Date.now());
         return el("span", { class: "totr-chip " + cls, title }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`);
       }
-      const v = resaleVerdict({ mode, ask: b.price, marketValue: d.marketValue, sellAt: sellAtOf(current.itemId), market: sellMarketOf(current.itemId), stock: d.stock, quote: d }, Date.now());
+      // 0.8.31: judged against the live floor on this page — the other bazaars in this strip and
+      // the item market's cheapest listing — not only the (up to 3 h old) bazaar snapshot.
+      const others = (d.bazaars || []).filter((x) => x !== b && Number(x.price) > 1).map((x) => Number(x.price));
+      const v = resaleVerdict({ mode, ask: b.price, marketValue: d.marketValue, sellAt: sellAtOf(current.itemId), market: sellMarketOf(current.itemId), stock: d.stock, quote: d,
+        bazaarLow: others.length ? Math.min(...others) : null, itemMarketLow: itemMarketLowOnPage() }, Date.now());
       return v ? el("span", { class: "totr-chip totr-chip--ok", title: v.title }, v.label) : null;
+    }
+
+    /** The item market's cheapest listing for the open item, read off this page: its grid tile
+     *  (Torn shows the item-market low there), else the cheapest seller row. Null if neither. */
+    function itemMarketLowOnPage() {
+      try {
+        const tile = gridTiles().find((t) => t.itemId === current.itemId);
+        if (tile && tile.price > 1) return tile.price;
+        const a = anchor();
+        const prices = a ? sellerRows(a).map((r) => r.price).filter((p) => p > 1) : [];
+        return prices.length ? Math.min(...prices) : null;
+      } catch { return null; }
     }
 
     async function load(itemId) {
@@ -3228,7 +3283,7 @@
         if (q.buyPrice != null && c.price < q.buyPrice) { label = "UNDER YOUR BUY"; cls = "buy"; title = notSellingLine(q.stock, Date.now()) || null; }
         else if (v && v.kind === "below_cost") { label = v.label; cls = "ok"; title = v.title; }
         else if (v && mode === "bazaar") { label = `RESELL +${fmtMoney(v.resale.profit)}`; cls = "ok"; title = v.title; }
-        else if (showsMarketPct(mode) && q.marketValue && c.price <= q.marketValue * dealPct / 100 && !hasQuality(c.card)) { label = `${Math.round((c.price / q.marketValue) * 100)}% OF MARKET`; cls = "ok"; }
+        else if (!hasQuality(c.card) && marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now()) != null) { label = `${marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now())}% OF MARKET`; cls = "ok"; }
         if (!label) continue;
         c.card.style.boxShadow = cls === "buy" ? "inset 0 0 0 3px #4c8dff" : "inset 0 0 0 3px #5fe0a6";
         c.card.querySelector("[data-testid='price']")?.after(el("span", { class: `totr-chip totr-chip--${cls}`, "data-totr-ui": "1", title: title || undefined }, label));
@@ -4481,7 +4536,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
