@@ -179,8 +179,10 @@ test("Manage $ popup (0.8.36): the issue and its fix, a trader paying more with 
   assert.ok(!line.hidden);
   assert.match(line.textContent, /Masime pays \$340 \(Torn Exchange\) — \$40 more than your sell price/);
   assert.doesNotMatch(line.textContent, /null/);
-  // No Torn id for the TE name: no profile link and no Start trade — but Remove from bazaar still offered.
-  assert.equal(line.querySelector("a[href*='profiles.php']"), null);
+  // 0.8.41: no Torn id for the TE name → the name still links, to Torn's look-up-by-name profile.
+  // Start trade needs the id, so it is not offered — but Remove from bazaar still is.
+  assert.equal(line.querySelector("a[href*='profiles.php']").getAttribute("href"), "https://www.torn.com/profiles.php?NID=Masime");
+  assert.equal(line.querySelector("a[href*='trade.php']"), null);
   const removeBtn = [...line.querySelectorAll("button")].find((b) => /Remove from bazaar/.test(b.textContent));
   removeBtn.click();
   assert.equal(weight.querySelector("input.remove").value, "1");

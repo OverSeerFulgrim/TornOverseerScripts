@@ -916,3 +916,35 @@ test("0.8.40: one item-market low cache, shared by chips, Price check and deal a
   for (let i = 1; i <= 5; i += 1) big = tr.lowCachePut(big, i, 100 + i, now + i, 3);
   assert.deepEqual(Object.keys(big).map(Number).sort((a, b) => a - b), [3, 4, 5]);
 });
+
+test("0.8.41: a trader's name always links to a Torn profile — by id, or by name without one", () => {
+  assert.equal(tr.traderProfileUrl({ playerId: 4353249, name: "VintageTorno" }), "https://www.torn.com/profiles.php?XID=4353249");
+  // No id (the server has never seen this Torn Exchange trader): look them up by name.
+  assert.equal(tr.traderProfileUrl({ playerId: null, name: "VintageTorno" }), "https://www.torn.com/profiles.php?NID=VintageTorno");
+  assert.equal(tr.traderProfileUrl({ name: " Old_Goat-2 " }), "https://www.torn.com/profiles.php?NID=Old_Goat-2");
+  // Nothing usable → no link, and nothing odd is ever put in a URL.
+  assert.equal(tr.traderProfileUrl({ name: "" }), null);
+  assert.equal(tr.traderProfileUrl({ name: "a b&c=d" }), null);
+  assert.equal(tr.traderProfileUrl(null), null);
+});
+
+test("0.8.42: no \"fix\" down to a sell-list price the market is well above", () => {
+  const now = Date.parse("2026-11-26T19:30:00Z");
+  const market = { cheapest: 700, listings: 20, bazaarAverage: 760, weekCheapest: 400, capturedAt: "2026-11-26T19:00:00Z" };
+  const s = { sellAt: 463, floor: 463, market };
+  // Listed $999, sell list $463, cheapest bazaar $700 → fill $699, not $463.
+  assert.deepEqual(tr.undersellAdvice(999, s, now), { cheapest: 700, target: 699 });
+  // Listed $650: over the sell list but under the cheapest → same answer; the popup says "nothing to fix".
+  assert.deepEqual(tr.undersellAdvice(650, s, now), { cheapest: 700, target: 699 });
+  // Listed at or under the sell-list price → the ordinary fix (it raises the price).
+  assert.equal(tr.undersellAdvice(463, s, now), null);
+  assert.equal(tr.undersellAdvice(400, s, now), null);
+  // The cheapest bazaar is not meaningfully above the sell list → ordinary fix.
+  assert.equal(tr.undersellAdvice(999, { ...s, market: { ...market, cheapest: 470 } }, now), null);
+  // Scan too old, nobody listing, or no market data → ordinary fix.
+  assert.equal(tr.undersellAdvice(999, { ...s, market: { ...market, capturedAt: "2026-11-26T10:00:00Z" } }, now), null);
+  assert.equal(tr.undersellAdvice(999, { ...s, market: { ...market, listings: 0 } }, now), null);
+  assert.equal(tr.undersellAdvice(999, { sellAt: 463, floor: 463, market: null }, now), null);
+  // Never under your floor.
+  assert.equal(tr.undersellAdvice(999, { ...s, floor: 800 }, now), null);
+});

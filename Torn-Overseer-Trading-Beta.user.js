@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.40
+// @version      0.8.42
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -768,6 +768,38 @@
    * the Sell card's other sources; the caller is already left out). Null when nobody beats it or
    * there is no sell price. Pure.
    */
+  /**
+   * 0.8.42: when "fix it to your sell-list price" would be the wrong advice. On Manage the red $
+   * flags a listed price that is off the sell-list price and offered to fill that price — even
+   * when every other bazaar asks far more (a $999 listing was told to "fix" to $463 with the
+   * cheapest bazaar at $700). Returns { cheapest, target } when the listed price is ABOVE the
+   * sell-list price and the cheapest bazaar we trust (fresh, not a display price) is at least 2%
+   * above it too: `target` is $1 under that cheapest, never under your floor. Null otherwise —
+   * the ordinary fix stands.
+   */
+  function undersellAdvice(listed, s, nowMs) {
+    const sellAt = Number(s && s.sellAt);
+    const have = Number(listed);
+    if (!(sellAt > 0) || !(have > sellAt)) return null;
+    const vs = vsCheapest(sellAt, s.market, nowMs);
+    if (vs.gapPct == null) return null; // none / stale / nobody / unclear
+    const cheapest = Number(s.market && s.market.cheapest);
+    const target = cheapest - 1;
+    if (!(target >= sellAt * 1.02)) return null;
+    if (s.floor != null && target < Number(s.floor)) return null;
+    return { cheapest, target };
+  }
+  /**
+   * 0.8.41: where a trader's name links. Their Torn id when we have it; otherwise Torn's
+   * look-up-by-name profile link — a Torn Exchange seller name is the player's Torn name, and
+   * the server has no id for a trader it has never seen. Null with neither.
+   */
+  function traderProfileUrl(buyer) {
+    const id = Number(buyer && buyer.playerId);
+    if (Number.isInteger(id) && id > 0) return `https://www.torn.com/profiles.php?XID=${id}`;
+    const name = String((buyer && buyer.name) || "").trim();
+    return /^[A-Za-z0-9_-]{1,20}$/.test(name) ? `https://www.torn.com/profiles.php?NID=${encodeURIComponent(name)}` : null;
+  }
   function traderOver(buyers, sellAt, otherBuyers) {
     const sell = Number(sellAt);
     if (!(sell > 0)) return null;
@@ -1739,9 +1771,10 @@
   .totr-pick{display:flex;align-items:center;gap:10px;text-align:left;font:13px system-ui,sans-serif;color:#e6ebf2;background:#161d28;border:1px solid #2f3b4d;border-radius:7px;padding:0 12px;min-height:40px;cursor:pointer}
   .totr-pick--main{background:#0f2a1f;border-color:#2f6b4f}.totr-pick:disabled{opacity:.6;cursor:default}
   .totr-pick-label{flex:1}.totr-pick-profit{min-width:56px;text-align:right;font-weight:700;color:#5fe0a6}.totr-pick-profit--floor{color:#e2a6ef}
-  .totr-pick-trader{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 12px 8px;padding:8px 10px;border-radius:7px;border:1px solid #2f6b4f;background:#0f2a1f;font-size:12px;color:#c9d2de}.totr-pick-trader strong{color:#5fe0a6}.totr-pick-trader[hidden]{display:none}
+  .totr-pick-trader{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 12px 0;padding:8px 10px;border-radius:7px;border:1px solid #2f6b4f;background:#0f2a1f;font-size:12px;color:#c9d2de}.totr-pick-trader strong{color:#5fe0a6}.totr-pick-trader[hidden]{display:none}
   .totr-dollar--alert{color:#fff;background:#b3261e;border-color:#e23b3b;box-shadow:0 0 0 1px #e23b3b}
   .totr-pick-issue{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 12px 0;padding:8px 10px;border-radius:7px;border:1px solid #7a3a35;background:#2a1215;font-size:12px;color:#e6ebf2}.totr-pick-issue strong{color:#ff8a80}
+  .totr-pick-issue--fine{border-color:#2f4f7a;background:#101a2b}.totr-pick-issue--fine strong{color:#8ab8ff}
   .totr-pick-trader a{color:#5fe0a6}.totr-pick-trader-actions{display:inline-flex;gap:8px;align-items:center;margin-left:auto}
   .totr-pick-foot{display:flex;align-items:center;gap:8px;padding:8px 12px 10px;border-top:1px solid #232c3a}
   .totr-pick-foot .totr-muted{flex:1}
@@ -2634,13 +2667,27 @@
       const trader = el("div", { class: "totr-pick-trader", hidden: true });
       // 0.8.36: what the red $ is about — the listed price is off — and the one-click fix.
       const st = isManage() ? stateFor(r, sell.get(r.itemId)) : null;
-      const issue = st && st.off && s.sellAt != null
-        ? el("div", { class: "totr-pick-issue" },
+      // 0.8.42: never offer a "fix" DOWN to a sell-list price the market is well above.
+      const listedNow = listedPrice(r.price);
+      const adv = st && st.off && st.cls !== "low" ? undersellAdvice(listedNow, s, Date.now()) : null;
+      let issue = null;
+      if (adv && listedNow > adv.target) {
+        issue = el("div", { class: "totr-pick-issue" },
+          el("span", null, el("strong", null, "Listed over the cheapest bazaar."),
+            ` The cheapest other bazaar asks ${fmtMoney(adv.cheapest)}. Your sell-list price (${fmtMoney(s.sellAt)}) is ${fmtMoney(adv.target - s.sellAt)} under that, so filling it would undersell.`),
+          el("button", { type: "button", class: "totr-mini", title: "$1 under the cheapest other bazaar", onclick: () => { fillRow(r, adv.target); closePopup(); } }, `Fill ${fmtMoney(adv.target)}`));
+      } else if (adv) {
+        issue = el("div", { class: "totr-pick-issue totr-pick-issue--fine" },
+          el("span", null, el("strong", null, "Nothing to fix."),
+            ` Listed over your sell-list price (${fmtMoney(s.sellAt)}) but still under the cheapest other bazaar (${fmtMoney(adv.cheapest)}).`));
+      } else if (st && st.off && s.sellAt != null) {
+        issue = el("div", { class: "totr-pick-issue" },
           el("span", null, el("strong", null, st.cls === "low" ? "Under your floor." : "Off your sell-list price."), ` ${st.hint}.`,
             r.row.querySelector("[data-totr-vs]") ? ` ${r.row.querySelector("[data-totr-vs]").getAttribute("data-totr-vs")}.` : ""),
-          el("button", { type: "button", class: "totr-mini", onclick: () => { fillRow(r, s.sellAt); closePopup(); } }, `Fix: fill ${fmtMoney(s.sellAt)}`))
-        : null;
-      popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, ...[head, issue, list, trader, foot].filter(Boolean));
+          el("button", { type: "button", class: "totr-mini", onclick: () => { fillRow(r, s.sellAt); closePopup(); } }, `Fix: fill ${fmtMoney(s.sellAt)}`));
+      }
+      // 0.8.42: a trader paying more is the best option on the card, so it leads.
+      popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, ...[head, trader, issue, list, foot].filter(Boolean));
       document.body.append(popup);
       const rect = anchor.getBoundingClientRect();
       popup.style.top = `${Math.round(window.scrollY + rect.bottom + 6)}px`;
@@ -2661,8 +2708,9 @@
           // still press Save Changes. Native replaceChildren() prints a null as "null", so filter.
           const removeBox = isManage() ? removeInputOf(r) : null;
           const listedQty = r.count || r.held || 1;
-          const who2 = t.buyer.playerId
-            ? el("a", { href: `https://www.torn.com/profiles.php?XID=${t.buyer.playerId}`, target: "_blank", rel: "noopener" }, el("strong", null, who))
+          const profile = traderProfileUrl(t.buyer);
+          const who2 = profile
+            ? el("a", { href: profile, target: "_blank", rel: "noopener", title: "Open their Torn profile" }, el("strong", null, who))
             : el("strong", null, who);
           trader.replaceChildren(...[
             el("span", null, who2, el("strong", null, ` pays ${fmtMoney(t.buyer.price)}`), ` (${t.source === "te" ? "Torn Exchange" : t.source === "overseer" ? "Overseer trader" : "TornW3B"}) — ${fmtMoney(t.gap)} more than your sell price${paid}`),
@@ -4792,7 +4840,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
