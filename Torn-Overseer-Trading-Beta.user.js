@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.33
+// @version      0.8.35
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -727,6 +727,23 @@
       if (cost) return { kind: "below_cost", label: cost.label, title: [cost.title, vsLine].filter(Boolean).join(" · "), resale: null, vs, cost };
     }
     return null;
+  }
+
+  /**
+   * 0.8.34: the best trader (not you) paying MORE than your sell-list price — Price check's W3B
+   * buyers (`buyingNow.w3bRows`) and, 0.8.35, its TE + Overseer traders (`buyingNow.otherBuyers`,
+   * the Sell card's other sources; the caller is already left out). Null when nobody beats it or
+   * there is no sell price. Pure.
+   */
+  function traderOver(buyers, sellAt, otherBuyers) {
+    const sell = Number(sellAt);
+    if (!(sell > 0)) return null;
+    const all = [
+      ...(Array.isArray(buyers) ? buyers : []).filter((b) => b && !b.isYou).map((b) => ({ ...b, source: "w3b" })),
+      ...(Array.isArray(otherBuyers) ? otherBuyers : []).filter(Boolean),
+    ];
+    const top = all.filter((b) => Number(b.price) > 0).sort((a, b) => b.price - a.price)[0];
+    return top && top.price > sell ? { buyer: top, gap: top.price - sell, source: top.source || "w3b" } : null;
   }
 
   /** 0.8.8: which chip colour a verdict gets — green for the two "buy" kinds, amber for the warnings. */
@@ -1603,6 +1620,7 @@
   .totr-pick{display:flex;align-items:center;gap:10px;text-align:left;font:13px system-ui,sans-serif;color:#e6ebf2;background:#161d28;border:1px solid #2f3b4d;border-radius:7px;padding:0 12px;min-height:40px;cursor:pointer}
   .totr-pick--main{background:#0f2a1f;border-color:#2f6b4f}.totr-pick:disabled{opacity:.6;cursor:default}
   .totr-pick-label{flex:1}.totr-pick-profit{min-width:56px;text-align:right;font-weight:700;color:#5fe0a6}.totr-pick-profit--floor{color:#e2a6ef}
+  .totr-pick-trader{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 12px 8px;padding:8px 10px;border-radius:7px;border:1px solid #2f6b4f;background:#0f2a1f;font-size:12px;color:#c9d2de}.totr-pick-trader strong{color:#5fe0a6}.totr-pick-trader[hidden]{display:none}
   .totr-pick-foot{display:flex;align-items:center;gap:8px;padding:8px 12px 10px;border-top:1px solid #232c3a}
   .totr-pick-foot .totr-muted{flex:1}
   .totr-linkbtn{font:12px system-ui,sans-serif;color:#8ab8ff;background:transparent;border:0;cursor:pointer;padding:0}
@@ -2482,7 +2500,9 @@
         // 0.8.20 (WO-86): Compare moved here from the Manage row.
         isManage() && r.itemId ? el("a", { class: "totr-linkbtn", href: itemPageUrl(r.itemId, "sell"), target: "_blank", rel: "noopener", title: "Compare your bazaar, the best trader and the item market for this item" }, "Compare") : null,
         el("button", { type: "button", class: "totr-linkbtn", onclick: () => { closePopup(); modules.priceCheck.toggle(r.itemId, r.row.closest("li, tr") || r.row, { float: true }); } }, "Full price check"));
-      popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, head, list, foot);
+      // 0.8.34: a trader paying more than your sell price — sell to them by trade instead.
+      const trader = el("div", { class: "totr-pick-trader", hidden: true });
+      popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, head, list, trader, foot);
       document.body.append(popup);
       const rect = anchor.getBoundingClientRect();
       popup.style.top = `${Math.round(window.scrollY + rect.bottom + 6)}px`;
@@ -2492,6 +2512,19 @@
         const low = q && Array.isArray(q.bazaars) && q.bazaars.length ? Math.min(...q.bazaars.map((b) => b.price)) : null;
         cheapest.price = low; cheapest.loading = false; if (popup) draw();
       }).catch(() => { cheapest.loading = false; if (popup) draw(); });
+      // Buyers only: no item-market read, so this costs no Torn call.
+      if (s.sellAt != null) {
+        callTrader("price_check", { itemId: r.itemId, itemMarket: null, itemMarketError: "not read for the $ popup" }).then((d) => {
+          const t = traderOver(d && d.buyingNow && d.buyingNow.w3bRows, s.sellAt, d && d.buyingNow && d.buyingNow.otherBuyers);
+          if (!t || !trader.isConnected) return;
+          const who = t.buyer.name || "A trader";
+          const paid = s.costEach != null ? ` · ${profitText(s, t.buyer.price)} each vs what you paid` : "";
+          trader.replaceChildren(
+            el("span", null, el("strong", null, `${who} pays ${fmtMoney(t.buyer.price)}`), ` (${t.source === "te" ? "Torn Exchange" : t.source === "overseer" ? "Overseer trader" : "TornW3B"}) — ${fmtMoney(t.gap)} more than your sell price${paid}`),
+            t.buyer.playerId ? el("a", { class: "totr-linkbtn", href: `https://www.torn.com/trade.php#step=start&userID=${t.buyer.playerId}`, target: "_blank", rel: "noopener" }, "Start trade") : null);
+          trader.hidden = false;
+        }).catch(() => { /* no buyers line — the rest of the popup still works */ });
+      }
     }
 
     // ---- header links + status line -------------------------------------------------------
@@ -4536,7 +4569,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

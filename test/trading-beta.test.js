@@ -822,3 +822,23 @@ test("0.8.33: the Bazaars strip's % vs MV chip stays grey on stock that isn't se
   assert.match(tr.stripPctLook(-0.6, 90, stuck, now).title, /not by your deal %/);
   assert.equal(tr.stripPctLook(4, 90, stuck, now).cls, "totr-chip--warn");
 });
+
+test("traderOver (0.8.34): the best other trader paying more than your sell price", () => {
+  const b = (price, extra = {}) => ({ name: "T", playerId: 7, price, isYou: false, lastTradeAt: null, ...extra });
+  const t = tr.traderOver([b(2250, { name: "A" }), b(2300, { name: "B" }), b(9999, { isYou: true })], 2217);
+  assert.equal(t.buyer.name, "B");
+  assert.equal(t.gap, 83);
+  assert.equal(tr.traderOver([b(2200)], 2217), null);
+  assert.equal(tr.traderOver([b(2217)], 2217), null);
+  assert.equal(tr.traderOver([b(3000)], null), null);
+  assert.equal(tr.traderOver(null, 2217), null);
+});
+
+test("traderOver (0.8.35): TE and Overseer traders count too", () => {
+  const t = tr.traderOver([{ name: "W", playerId: 1, price: 2250, isYou: false }], 2217, [{ name: "OldGoat", playerId: 11, price: 2400, source: "te" }]);
+  assert.equal(t.buyer.name, "OldGoat");
+  assert.equal(t.source, "te");
+  assert.equal(t.gap, 183);
+  assert.equal(tr.traderOver(null, 2217, [{ name: "B", playerId: 2, price: 2300, source: "overseer" }]).source, "overseer");
+  assert.equal(tr.traderOver([{ name: "W", playerId: 1, price: 2300, isYou: false }], 2217, null).source, "w3b");
+});
