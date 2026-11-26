@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.38
+// @version      0.8.39
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -1026,6 +1026,22 @@
 
   /** How often the deal list is asked for (the server also rotates its live checks per 5 min). */
   const DEALS_POLL_MS = 5 * 60_000;
+  /**
+   * 0.8.39: where the deals panel opens — beside the sidebar eye you clicked, not pinned to the
+   * top-right corner where Torn stacks its chat windows (it covered an open chat). `eye` is the
+   * eye's box on screen ({ left, top, right, bottom, width, height }), `vw`/`vh` the window,
+   * `w` the panel width. Null (keep the stylesheet's spot) when the eye isn't on screen or the
+   * window is phone-sized, where the panel is a bottom sheet.
+   */
+  function sheetSpot(eye, vw, vh, w) {
+    if (!eye || !(eye.width > 0) || !(eye.height > 0) || !(vw > 600)) return null;
+    const gap = 8;
+    let left = eye.right + gap;
+    if (left + w > vw - gap) left = eye.left - gap - w; // no room on the right: open to the left
+    left = Math.max(gap, Math.min(left, vw - gap - w));
+    const top = Math.max(gap, Math.min(eye.top, vh - 200)); // keep at least the header on screen
+    return { left: Math.round(left), top: Math.round(top), maxHeight: Math.round(vh - top - gap) };
+  }
   /** 0.8.37: a tab that is asking right now marks the shared copy; other tabs wait this long. */
   const DEALS_CLAIM_MS = 45_000;
   /**
@@ -4381,9 +4397,18 @@
     }
 
     // ---- floating "$" button: only while there is something new --------------------------
+    /** 0.8.39: the eye's box when it is really on screen (a hidden sidebar has no box). */
+    function eyeBox() {
+      const eye = document.getElementById("totr-eye");
+      if (!eye || !eye.isConnected || typeof eye.getBoundingClientRect !== "function") return null;
+      const r = eye.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 ? r : null;
+    }
     function ensureFab(count) {
       let fab = document.getElementById("totr-fab");
-      if (count <= 0) { fab?.remove(); return; }
+      // 0.8.39: with the eye on screen the "$" only repeated it (and floated in the page margin
+      // since Chain Watch's launcher moved into the sidebar). It stays for phone layouts.
+      if (count <= 0 || eyeBox()) { fab?.remove(); return; }
       if (!fab) {
         fab = el("button", { id: "totr-fab", type: "button", class: "totr-fab", "data-totr-ui": "1", onclick: () => toggle(true) }, "$");
         document.body.append(fab);
@@ -4523,6 +4548,12 @@
           el("a", { href: `${SITE_URL}/trading/buy-list`, target: "_blank", rel: "noopener" }, "Edit buy list")));
       }
       sheet.replaceChildren(...parts);
+      // 0.8.39: beside the eye on desktop; the stylesheet's spot otherwise.
+      const spot = sheetSpot(eyeBox(), window.innerWidth, window.innerHeight, 360);
+      sheet.style.left = spot ? `${spot.left}px` : "";
+      sheet.style.top = spot ? `${spot.top}px` : "";
+      sheet.style.right = spot ? "auto" : "";
+      sheet.style.maxHeight = spot ? `${spot.maxHeight}px` : "";
     }
 
     function render() {
@@ -4538,7 +4569,7 @@
     /** Torn redraws the sidebar: put the eye back (cheap — an id lookup first). */
     function tick() {
       if (!started) { start(); return; }
-      if (!document.getElementById("totr-eye") || (unseen().length > 0 && !document.getElementById("totr-fab"))) render();
+      if (!document.getElementById("totr-eye") || (unseen().length > 0 && !eyeBox() && !document.getElementById("totr-fab"))) render();
     }
     function start() {
       if (started || !hasKey()) return;
@@ -4685,7 +4716,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

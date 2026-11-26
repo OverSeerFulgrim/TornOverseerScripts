@@ -869,3 +869,18 @@ test("0.8.37: the page watcher waits 150 ms after a change, but never more than 
   // Off the trading pages the wait is 1 s, which the cap leaves alone for the first change.
   assert.equal(tr.passDelay(5000, 5000, 1000, 1000), 1000);
 });
+
+test("0.8.39: the deals panel opens beside the sidebar eye, not over the chat corner", () => {
+  const eye = { left: 540, top: 310, right: 558, bottom: 328, width: 18, height: 18 };
+  // Desktop: just right of the eye, level with it, and never taller than the window.
+  assert.deepEqual(tr.sheetSpot(eye, 1920, 1000, 360), { left: 566, top: 310, maxHeight: 682 });
+  // No room on the right → opens to the left of the eye.
+  assert.equal(tr.sheetSpot({ ...eye, left: 1700, right: 1718 }, 1920, 1000, 360).left, 1332);
+  // An eye near the bottom still leaves the panel's header on screen.
+  assert.equal(tr.sheetSpot({ ...eye, top: 950, bottom: 968 }, 1920, 1000, 360).top, 800);
+  // Eye not on screen (hidden sidebar, or no layout at all), or a phone-sized window →
+  // keep the stylesheet's spot (top-right, or the bottom sheet on phones).
+  assert.equal(tr.sheetSpot(null, 1920, 1000, 360), null);
+  assert.equal(tr.sheetSpot({ ...eye, width: 0, height: 0 }, 1920, 1000, 360), null);
+  assert.equal(tr.sheetSpot(eye, 420, 800, 360), null);
+});
