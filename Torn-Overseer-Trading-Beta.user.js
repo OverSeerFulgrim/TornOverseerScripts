@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.29
+// @version      0.8.30
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -224,10 +224,21 @@
   function moneyIn(node) {
     if (!node) return null;
     const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    const seen = new Set();
     for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-      if (n.parentElement && n.parentElement.closest("input, .totr-chip, .totr-mini, [data-totr-ui]")) continue;
+      const parent = n.parentElement;
+      if (parent && parent.closest("input, .totr-chip, .totr-mini, [data-totr-ui]")) continue;
       const v = parseMoney(n.textContent);
       if (v != null) return { value: v, node: n };
+      // 0.8.30: React renders `$${price}` as TWO text nodes ("$" and "212,000") — Torn's opened
+      // bazaar listing does — so also read the parent's own text nodes joined (still not its
+      // child elements, so another script's badge is never glued on).
+      if (parent && !seen.has(parent)) {
+        seen.add(parent);
+        const own = [...parent.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent).join("");
+        const joined = parseMoney(own);
+        if (joined != null) return { value: joined, node: n };
+      }
     }
     return null;
   }
