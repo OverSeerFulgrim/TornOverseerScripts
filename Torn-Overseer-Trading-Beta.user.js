@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.44
-// @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
+// @version      0.8.45
+// @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
 // @supportURL   https://github.com/OverSeerFulgrim/TornOverseerScripts/issues
@@ -71,7 +71,6 @@
   const STORE = {
     tornKey: "totr_torn_key",
     sessionToken: "totr_session_token",
-    fillPct: "totr_fill_pct",
     dealPct: "totr_deal_pct",
     dealMin: "totr_deal_min",
     ignored: "totr_ignored",
@@ -86,13 +85,9 @@
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
-  const DEFAULT_FILL_PCT = 0;
   const DEFAULT_DEAL_PCT = 90;
   /** 0.8.13: the Deals panel's "at least X% under your price" choices. 0 = every deal (default). */
   const DEAL_MIN_OPTIONS = [0, 5, 10, 20];
-  const MAX_FILL_PCT = 100;
-  /** Fill can go under market value, but not absurdly: a fat-fingered -95 would give stock away. */
-  const MIN_FILL_PCT = -50;
   /** Torn's item market sales tax, paid by the seller at the moment of sale (wiki: 5% since
    *  2025-06-22; an anonymous listing pays a further 10%, which we don't assume). */
   const MARKET_FEE_RATE = 0.05;
@@ -257,14 +252,6 @@
     return Math.min(max, Math.max(min, n));
   }
 
-  /** Bazaar fill target = market value × (1 + pct/100), whole dollars. Null without an MV. */
-  function fillTarget(marketValue, pct) {
-    const mv = Number(marketValue);
-    if (!Number.isFinite(mv) || mv <= 0) return null;
-    const p = clampPct(pct, DEFAULT_FILL_PCT, MAX_FILL_PCT, MIN_FILL_PCT);
-    return Math.max(1, Math.round(mv * (1 + p / 100)));
-  }
-
   /** How far a listed price sits from the fill target, in whole percent (+ = above). */
   /** "(11 in stock)" → 11. Null when the text has no stock count. */
   function parseStock(text) {
@@ -416,6 +403,55 @@
     const against = ref === cheapest ? `vs cheapest bazaar ${fmtMoney(cheapest)}` : `vs the week's cheapest ${fmtMoney(ref)}`;
     return { band, gapPct, label, title: `${against}${listings} · checked ${checked}${trend}` };
   }
+  /**
+   * 0.8.45 (plan step 8, rulebook F16): when a Manage row's $ turns red. Red means the listing
+   * is costing you: under your floor, more than {@link MANAGE_OFF_PCT}% over the cheapest bazaar
+   * (it won't sell), or more than {@link MANAGE_OFF_PCT}% under your sell-list price (money left
+   * on the table). Anything else is gold, with the gap in the hint. Until 0.8.44 any listing 2%
+   * off target either way went red, so hourly market moves turned most rows red. Unrounded.
+   */
+  const MANAGE_OFF_PCT = 10;
+  function manageVerdict(listed, s, market, nowMs) {
+    if (!s || !(Number(s.sellAt) > 0) || !(Number(listed) > 0)) return null;
+    const sellAt = Number(s.sellAt);
+    if (s.floor != null && listed < s.floor) return { text: "< floor", cls: "low", off: true, hint: `Listed under your floor (${fmtMoney(s.floor)}: what you paid + your %)` };
+    const d = ((listed - sellAt) / sellAt) * 100;
+    // Compared unrounded; shown in whole percent.
+    const pct = (n) => `${Math.round(Math.abs(n))}%`;
+    const vs = vsCheapest(listed, market, nowMs);
+    if (vs.band === "far_above" && vs.gapPct != null) {
+      return { text: `+${pct(vs.gapPct)}`, cls: "warn", off: true, hint: `Listed ${pct(vs.gapPct)} over the cheapest bazaar, so it is unlikely to sell` };
+    }
+    // No usable market read (none, stale, nobody listing, a display price): far over your own
+    // sell-list price is the only signal left that it won't sell.
+    const marketKnown = vs.band === "competitive" || vs.band === "above" || vs.band === "far_above";
+    if (!marketKnown && d > MANAGE_OFF_PCT) {
+      return { text: `+${pct(d)}`, cls: "warn", off: true, hint: `Listed ${pct(d)} over your sell-list price (${fmtMoney(sellAt)}), and there is no fresh cheapest-bazaar price to compare` };
+    }
+    if (d < -MANAGE_OFF_PCT) {
+      return { text: `−${pct(d)}`, cls: "info", off: true, hint: `Listed ${pct(d)} under your sell-list price (${fmtMoney(sellAt)}), so you are leaving money on the table` };
+    }
+    if (Math.abs(d) < 2) return { text: "≈", cls: "ok", off: false, hint: `Within 2% of your sell-list price (${fmtMoney(sellAt)}) — Fill to match it exactly` };
+    return { text: `${d > 0 ? "+" : "−"}${pct(d)}`, cls: "ok", off: false, hint: `Listed ${pct(d)} ${d > 0 ? "over" : "under"} your sell-list price (${fmtMoney(sellAt)}); fine to leave` };
+  }
+
+  /**
+   * 0.8.45: the price FIX N fills. Your sell-list price, but never more than the cheapest bazaar
+   * + {@link VS_COMPETITIVE_PCT}% when that is known and fresh (FIX used to list a Microwave 45%
+   * over the market), and never under your floor.
+   */
+  function fixPrice(s, market, nowMs) {
+    if (!s || !(Number(s.sellAt) > 0)) return null;
+    let price = Number(s.sellAt);
+    const vs = vsCheapest(price, market, nowMs);
+    if (vs.band === "above" || vs.band === "far_above") {
+      const ref = price / (1 + vs.gapPct / 100);
+      price = Math.min(price, Math.round(ref * (1 + VS_COMPETITIVE_PCT / 100)));
+    }
+    if (s.floor != null && price < s.floor) price = Number(s.floor);
+    return Math.max(1, Math.round(price));
+  }
+
 
   /** What a sale at `price` puts in your pocket after Torn's item market fee. Null without a price. */
   /**
@@ -1504,7 +1540,6 @@
     return {
       tornKey,
       sessionToken: String(gmGet(STORE.sessionToken, "") || "").trim() || readPdaSession(tornKey),
-      fillPct: clampPct(gmGet(STORE.fillPct, DEFAULT_FILL_PCT), DEFAULT_FILL_PCT, MAX_FILL_PCT, MIN_FILL_PCT),
       dealPct: clampPct(gmGet(STORE.dealPct, DEFAULT_DEAL_PCT), DEFAULT_DEAL_PCT, 100),
       dealMin: dealMinOf(gmGet(STORE.dealMin, 0)),
       ignored: new Set((gmGet(STORE.ignored, []) || []).map(Number).filter(Number.isSafeInteger)),
@@ -2496,15 +2531,10 @@
 
     /** Manage only: how the listed price sits against the sell-list price. */
     function stateFor(r, s) {
-      const listed = listedPrice(r.price);
-      if (!s || s.sellAt == null || listed == null) return null;
-      if (s.floor != null && listed < s.floor) return { text: "< floor", cls: "low", off: true, hint: "Listed under your floor (cost + %)" };
-      const d = driftPct(listed, s.sellAt);
-      if (d == null) return null;
-      // 0.8.25: an exact match shows nothing at all (refresh hides Fill too); a near miss says ≈.
-      if (Math.abs(d) < 2) return { text: "≈", cls: "ok", off: false, hint: `Within 2% of your sell-list price (${fmtMoney(s.sellAt)}) — Fill to match it exactly` };
-      return { text: `${d > 0 ? "+" : ""}${d}%`, cls: d < 0 ? "info" : "warn", off: true, hint: `Listed ${Math.abs(d)}% ${d > 0 ? "over" : "under"} your sell-list price (${fmtMoney(s.sellAt)})` };
+      // 0.8.45: one rule, shared with the tests (manageVerdict).
+      return manageVerdict(listedPrice(r.price), s, s && s.market, Date.now());
     }
+
 
     /** 0.8.14 (WO-93 C): what Add may list — one fewer for OC / crime items, unless `all`. */
     // 0.8.25: "keep 1" switched off for this item (saved per item) lists every one.
@@ -2809,7 +2839,7 @@
       if (box && box.isConnected && box.dataset.sig === sig) return;
       if (box) box.remove();
       const links = manage
-        ? [el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, onclick: () => off.filter(shownRow).forEach((r) => fillRow(r)) }, off.length ? `FIX ${off.length} OFF TARGET` : "ALL ON TARGET")]
+        ? [el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, onclick: () => off.filter(shownRow).forEach((r) => { const s = sell.get(r.itemId); if (canFillFrom(s, Date.now())) fillRow(r, fixPrice(s, s && s.market, Date.now())); }) }, off.length ? `FIX ${off.length} OFF TARGET` : "ALL ON TARGET")]
         : [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", onclick: () => rows().filter(shownRow).forEach((r) => { if (!listedPrice(r.price)) fillRow(r); else if (r.qty && !r.qty.value && listQty(r, false)) setNativeValue(r.qty, listQty(r, false)); }) }, "FILL ALL"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--qty", onclick: () => rows().filter(shownRow).forEach(fillQty) }, "FILL QTY"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
@@ -4872,7 +4902,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

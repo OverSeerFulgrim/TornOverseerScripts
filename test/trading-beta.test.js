@@ -38,14 +38,38 @@ test("parseMoney reads Torn money text", () => {
   assert.equal(tr.parseMoney("no money"), null);
 });
 
-test("fillTarget is market value plus a markup that may go below MV, within limits", () => {
-  assert.equal(tr.fillTarget(828000, 0), 828000);
-  assert.equal(tr.fillTarget(828000, 2), 844560);
-  assert.equal(tr.fillTarget(828000, -5), 786600, "negative fill sits under market value");
-  assert.equal(tr.fillTarget(828000, -95), 414000, "floored at -50% so a typo can't give stock away");
-  assert.equal(tr.fillTarget(828000, 500), 1656000, "capped at +100%");
-  assert.equal(tr.fillTarget(null, 2), null);
-  assert.equal(tr.fillTarget(0, 2), null);
+test("0.8.45 manageVerdict: red only when the listing costs you (plan step 8)", () => {
+  const now = Date.parse("2026-11-27T20:00:00Z");
+  const fresh = (cheapest) => ({ cheapest, listings: 30, bazaarAverage: cheapest, capturedAt: "2026-11-27T19:30:00Z" });
+  // RS232 Cable: −1.97% is not red (0.8.44 rounded it to −2 and went red).
+  assert.equal(tr.manageVerdict(298, { sellAt: 304 }, fresh(300), now).off, false);
+  // Fertilizer: +7.8% over target, under the market's far band → gold.
+  assert.equal(tr.manageVerdict(3233, { sellAt: 2998 }, fresh(3200), now).off, false);
+  // Silver Coin: +12% over target AND >10% over the cheapest bazaar → red.
+  const coin = tr.manageVerdict(36432, { sellAt: 32499 }, fresh(32000), now);
+  assert.equal(coin.off, true);
+  assert.match(coin.hint, /over the cheapest bazaar/);
+  // Chopsticks: 14.3% under the sell-list price → red.
+  assert.equal(tr.manageVerdict(25699, { sellAt: 29999 }, fresh(26000), now).off, true);
+  // Under the floor is always red.
+  assert.equal(tr.manageVerdict(900, { sellAt: 1000, floor: 950 }, null, now).off, true);
+  // Within 2% → ≈, not red.
+  assert.equal(tr.manageVerdict(1975, { sellAt: 1955 }, null, now).text, "≈");
+  // No market read: >10% over your own sell price is still red.
+  assert.equal(tr.manageVerdict(350, { sellAt: 300 }, null, now).off, true);
+  assert.equal(tr.manageVerdict(320, { sellAt: 300 }, null, now).off, false);
+  assert.equal(tr.MANAGE_OFF_PCT, 10);
+});
+
+test("0.8.45 fixPrice: never fills above the cheapest bazaar + 2%, never under the floor", () => {
+  const now = Date.parse("2026-11-27T20:00:00Z");
+  const market = { cheapest: 1530, listings: 72, bazaarAverage: 1987, capturedAt: "2026-11-27T19:30:00Z" };
+  // Microwave: sell list $2,224 vs cheapest $1,530 → filled at 1,561, not 2,224.
+  assert.equal(tr.fixPrice({ sellAt: 2224 }, market, now), 1561);
+  assert.equal(tr.fixPrice({ sellAt: 2224, floor: 1600 }, market, now), 1600);
+  assert.equal(tr.fixPrice({ sellAt: 1500 }, market, now), 1500);
+  assert.equal(tr.fixPrice({ sellAt: 2224 }, null, now), 2224);
+  assert.equal(tr.fixPrice(null, market, now), null);
 });
 
 test("driftPct measures distance from the target", () => {
