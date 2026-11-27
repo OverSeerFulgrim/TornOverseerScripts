@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.43
+// @version      0.8.44
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -1244,9 +1244,19 @@
   }
   function keepsOne(uses) { return usesOf(uses).some((u) => u === "oc" || u === "crime"); }
   /** How many of `held` the Add page may list: one fewer for OC / crime items. */
-  function keepQty(held, uses) {
+  function keepQty(held, uses, reserve) {
     const n = Number.isFinite(held) && held > 0 ? Math.floor(held) : 0;
-    return keepsOne(uses) ? Math.max(0, n - 1) : n;
+    return Math.min(keepsOne(uses) ? Math.max(0, n - 1) : n, reserveQty(n, reserve));
+  }
+  /**
+   * 0.8.44 (WO-106): a "keep" count saved on the site's Sell list (e.g. the insurance
+   * reserve) — Fill and FILL QTY never list below it, "List anyway" included. Only what
+   * you hold above it is listed.
+   */
+  function reserveQty(held, reserve) {
+    const n = Number.isFinite(held) && held > 0 ? Math.floor(held) : 0;
+    const k = Number.isFinite(Number(reserve)) && Number(reserve) > 0 ? Math.floor(Number(reserve)) : 0;
+    return Math.max(0, n - k);
   }
   /** 0.8.25: the "keep 1" switch per item — a saved list of item ids it is switched OFF for. */
   function keepOffIds(value) { return new Set((Array.isArray(value) ? value : []).map(Number).filter((n) => Number.isSafeInteger(n) && n > 0)); }
@@ -2499,7 +2509,10 @@
     /** 0.8.14 (WO-93 C): what Add may list — one fewer for OC / crime items, unless `all`. */
     // 0.8.25: "keep 1" switched off for this item (saved per item) lists every one.
     function keepOn(itemId) { return !keepOffIds(gmGet(STORE.keepOff, [])).has(Number(itemId)); }
-    function listQty(r, all) { return all || !keepOn(r.itemId) ? r.held : keepQty(r.held, sell.get(r.itemId) && sell.get(r.itemId).uses); }
+    function listQty(r, all) {
+      const s = sell.get(r.itemId);
+      return all || !keepOn(r.itemId) ? reserveQty(r.held, s && s.keep) : keepQty(r.held, s && s.uses, s && s.keep);
+    }
     function fillRow(r, price, all) {
       const s = sell.get(r.itemId);
       // 0.8.18: an automatic fill never types a sell-list price cached over 10 minutes ago.
@@ -2587,7 +2600,7 @@
         if (uses.length) under.append(useSquares(uses));
         if (s && keepsOne(s.uses)) {
           const on = keepOn(r.itemId);
-          const left = keepQty(r.held, s.uses);
+          const left = keepQty(r.held, s.uses, s.keep);
           under.append(el("button", {
             type: "button", class: "totr-keep" + (on ? "" : " totr-keep--off"), "aria-pressed": String(on),
             title: on ? "Fill and FILL QTY leave one of this in your inventory (an OC role or a crime needs it). Click to list them all."
@@ -2598,6 +2611,12 @@
               decorate(r);
             },
           }, on ? (left ? `keep 1 · lists ${left}` : "keep 1 · not listed") : "keep 1"));
+        }
+        // 0.8.44: a keep count from the site's Sell list (the insurance reserve).
+        if (s && Number(s.keep) > 0) {
+          const left = reserveQty(r.held, s.keep);
+          under.append(el("span", { class: "totr-keep", title: "Set on your Sell list on tornoverseer.com: Fill never lists below this many." },
+            left ? `keeps ${Number(s.keep).toLocaleString()} · lists ${left.toLocaleString()}` : `keeps ${Number(s.keep).toLocaleString()} · not listed`));
         }
         const nameAt = nameNode(r.row);
         if (under.childNodes.length && nameAt && nameAt.parentElement) nameAt.parentElement.append(under);
@@ -4853,7 +4872,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, fillTarget, driftPct, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

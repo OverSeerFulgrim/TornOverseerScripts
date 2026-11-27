@@ -740,6 +740,13 @@ test("WO-93 C keep 1: OC and crime items list one fewer on Add", () => {
   assert.equal(tr.keepQty(3, ["oc"]), 2);
   assert.equal(tr.keepQty(12, ["use"]), 12);
   assert.equal(tr.keepQty(5, undefined), 5);
+  // 0.8.44 (WO-106): a Sell-list keep count (the insurance reserve) caps what is listed.
+  assert.equal(tr.keepQty(322, ["use"], 300), 22);
+  assert.equal(tr.keepQty(250, ["use"], 300), 0);
+  assert.equal(tr.keepQty(3, ["oc"], 1), 2);
+  assert.equal(tr.reserveQty(322, 300), 22);
+  assert.equal(tr.reserveQty(322, null), 322);
+  assert.equal(tr.reserveQty(10, "x"), 10);
 });
 
 test("WO-93 C matchesUse: All, a tag, and rows still loading", () => {
