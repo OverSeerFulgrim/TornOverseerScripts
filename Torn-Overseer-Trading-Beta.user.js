@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.42
+// @version      0.8.43
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar at market value +%, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -767,6 +767,12 @@
    * buyers (`buyingNow.w3bRows`) and, 0.8.35, its TE + Overseer traders (`buyingNow.otherBuyers`,
    * the Sell card's other sources; the caller is already left out). Null when nobody beats it or
    * there is no sell price. Pure.
+   */
+  /**
+   * 0.8.43: Price check on the item market — section titles were h4s, which Torn's item market
+   * blows up into huge grey headings; and the panel opened inside Torn's fixed-height item info
+   * box, which cut it off after a few lines. Titles are plain divs now, and a panel whose spot
+   * sits inside anything that clips floats above the page instead.
    */
   /**
    * 0.8.42: when "fix it to your sell-list price" would be the wrong advice. On Manage the red $
@@ -1785,7 +1791,7 @@
   .totr-pcbar{display:flex;justify-content:flex-end;padding:6px 8px 0}
   .totr-pc{margin:8px}
   .totr-pc--float{position:absolute;z-index:99998;margin:0;max-height:70vh;overflow:auto;box-shadow:0 18px 44px rgba(0,0,0,.65)}
-  .totr-pc h4{margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#66738a}
+  .totr .totr-pc-h{margin:0 0 6px;padding:0;font:700 11px/1.3 Arial,Helvetica,sans-serif;letter-spacing:.07em;text-transform:uppercase;color:#66738a}
   .totr-pc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
   .totr-pc-sec{background:#161d28;border:1px solid #232c3a;border-radius:8px;padding:10px}
   .totr-pc-row{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-bottom:1px solid #1b2330;font-size:12px}
@@ -3672,7 +3678,8 @@
     }
 
     const money = (n) => (n == null ? "—" : fmtMoney(n));
-    const sec = (title, ...kids) => el("div", { class: "totr-pc-sec" }, el("h4", null, title), ...kids);
+    // 0.8.43: a div, not an h4 — Torn's item market styles headings (huge grey titles).
+    const sec = (title, ...kids) => el("div", { class: "totr-pc-sec" }, el("div", { class: "totr-pc-h" }, title), ...kids);
     const stat = (label, value) => el("div", null, el("span", { class: "totr-muted" }, label), el("strong", null, value));
 
     function sellingBlock(s) {
@@ -3817,6 +3824,12 @@
       for (let n = anchor, i = 0; n && n !== document.body && i < 4; n = n.parentElement, i++) {
         const cs = getComputedStyle(n);
         if (cs.position === "absolute" || cs.position === "fixed" || cs.transform !== "none") return true;
+      }
+      // 0.8.43: the item market's info box is a fixed-height, clipped panel — a panel inside it
+      // was cut off after a few lines. Any clipping ancestor (overflow not visible) → float.
+      for (let n = anchor.parentElement, i = 0; n && n !== document.body && n !== document.documentElement && i < 10; n = n.parentElement, i++) {
+        const cs = getComputedStyle(n);
+        if (/(hidden|auto|scroll|clip)/.test(cs.overflowY + " " + cs.overflowX)) return true;
       }
       return false;
     }
