@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.53
+// @version      0.8.54
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -2984,7 +2984,16 @@
       if (manage) links.unshift(el("span", { id: "totr-hworth", class: "totr-hlink totr-hage", "data-totr-ui": "1" }));
       box = el("span", { id: "totr-hlinks", "data-totr-ui": "1", "data-sig": sig }, ...links);
       const header = headerEl();
-      if (header) { header.style.display = "flex"; header.style.alignItems = "center"; box.style.marginLeft = "auto"; header.append(box); }
+      if (header) {
+        // 0.8.54: with PRICE FILL / FIX / UNDO FILL the links outgrew a narrow window, the title
+        // wrapped to two lines and "Manage your" rode up out of the bar. The title now stays on one
+        // line and the links wrap onto a second row inside a bar that grows to fit.
+        header.style.display = "flex"; header.style.alignItems = "center"; header.style.height = "auto";
+        header.style.minHeight = "34px"; header.style.paddingTop = "4px"; header.style.paddingBottom = "4px";
+        header.style.whiteSpace = "nowrap"; // the title is a bare text node: it inherits this
+        Object.assign(box.style, { whiteSpace: "normal", marginLeft: "auto", display: "flex", flexWrap: "wrap", justifyContent: "flex-end", alignItems: "center", rowGap: "4px", minWidth: "0", lineHeight: "22px" });
+        header.append(box);
+      }
       else {
         const anchor = listAnchor(list);
         if (anchor) anchor.insertAdjacentElement("beforebegin", el("div", { class: "totr-bar totr", "data-totr-ui": "1" }, el("strong", null, "Overseer"), box));
