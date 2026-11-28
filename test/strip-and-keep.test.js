@@ -255,4 +255,9 @@ test("Manage (0.8.52): PRICE FILL button, green box, UNDO FILL; red box and red 
   await tick(250);
   assert.equal(input(weight).value, "350", "undo puts the old price back");
   assert.ok(!btn(/UNDO FILL/));
+  // 0.8.53: FIX takes the red row to $1 under the cheapest bazaar, and the click does something.
+  btn(/FIX 1 OFF TARGET/).click();
+  await tick(250);
+  assert.equal(input(weight).value, "279");
+  assert.ok(btn(/ALL ON TARGET/));
 });

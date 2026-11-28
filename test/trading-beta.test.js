@@ -1022,3 +1022,18 @@ test("0.8.51 autoFillPicks: fresh, shown, not typed yet, once per visit", () => 
   ];
   assert.deepEqual(tr.autoFillPicks(rows, new Map([[6, {}]])), [1, 7]);
 });
+
+test("0.8.53 fixTarget: $1 under the cheapest when over it, never under the floor, never a no-op", () => {
+  const now = Date.parse("2026-11-28T10:00:00Z");
+  const mk = (cheapest) => ({ cheapest, listings: 5, bazaarAverage: cheapest, capturedAt: new Date(now - 10 * 60000).toISOString() });
+  // Bank Statement: listed $17,156, cheapest $17,000 → $16,999.
+  assert.deepEqual(tr.fixTarget(17156, { sellAt: 17156, floor: 16900 }, mk(17000), now, false), { price: 16999, stuck: false });
+  // Opium: the floor is the listed price → nothing to do, held by the floor.
+  assert.deepEqual(tr.fixTarget(26023, { sellAt: 26023, floor: 26023 }, mk(25338), now, true), { price: null, stuck: true });
+  // Floor between the cheapest and the listed price → down to the floor.
+  assert.deepEqual(tr.fixTarget(26500, { sellAt: 26023, floor: 26023 }, mk(25338), now, true), { price: 26023, stuck: false });
+  // Not over, not off → nothing.
+  assert.deepEqual(tr.fixTarget(25000, { sellAt: 25000 }, mk(25338), now, false), { price: null, stuck: false });
+  // Off (under the sell list), no fresh market → the sell-list price.
+  assert.deepEqual(tr.fixTarget(20000, { sellAt: 25000 }, null, now, true), { price: 25000, stuck: false });
+});

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.52
+// @version      0.8.53
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -445,6 +445,24 @@
     const vs = vsCheapest(listed, market, nowMs);
     if (vs.gapPct == null || !(vs.gapPct > 0)) return null;
     return { gapPct: vs.gapPct, ref: Math.round(Number(listed) / (1 + vs.gapPct / 100)), title: `More than other bazaars, so it probably won't sell — ${vs.title}` };
+  }
+  /**
+   * 0.8.53: what FIX types into a red row ({ price }), or price null when nothing can be done.
+   * Over the cheapest other bazaar → $1 under it; otherwise off target → fixPrice. Never under the
+   * floor, never the price already listed: 0.8.52 counted a row held at its floor (Opium) in
+   * FIX N and the click silently did nothing. `stuck` says the floor is what stops it.
+   */
+  function fixTarget(listed, s, market, nowMs, off) {
+    const none = { price: null, stuck: false };
+    if (!s || !(Number(listed) > 0)) return none;
+    const over = overCheapest(listed, market, nowMs);
+    let price = over ? over.ref - 1 : off ? fixPrice(s, market, nowMs) : null;
+    if (price == null) return none;
+    let stuck = false;
+    if (s.floor != null && price < Number(s.floor)) { price = Number(s.floor); stuck = true; }
+    price = Math.max(1, Math.round(price));
+    if (price === Number(listed) || (over && price > Number(listed))) return { price: null, stuck };
+    return { price, stuck: false };
   }
   /**
    * 0.8.52: which Manage rows PRICE FILL types into: rows on screen with a FRESH sell-list price
@@ -2926,28 +2944,33 @@
     }
     function headerLinks(list) {
       const manage = isManage();
-      const isOff = (r) => { const st = stateFor(r, sell.get(r.itemId)); return !!(st && st.off); };
-      const off = manage ? list.filter(isOff) : [];
+      // 0.8.53: FIX N counts only the red rows a click can actually change (red $ = off target or
+      // over the cheapest bazaar); rows the floor holds up are named in the tooltip instead.
+      const fixFor = (r) => {
+        const s = sell.get(r.itemId);
+        if (!s || !canFillFrom(s, Date.now())) return { price: null, stuck: false };
+        const st = stateFor(r, s);
+        return fixTarget(listedPrice(r.price), s, s.market, Date.now(), !!(st && st.off));
+      };
+      const off = manage ? list.filter((r) => fixFor(r).price != null) : [];
+      const stuck = manage ? list.filter((r) => fixFor(r).stuck) : [];
       // 0.8.49: FILL ALL on Manage — every row whose Fill button shows (listed ≠ your sell-list
       // price), filled exactly as its own Fill would. Rows are looked up at click time.
       const needsFill = (r) => { const s = sell.get(r.itemId); return !!(s && s.sellAt != null && canFillFrom(s, Date.now()) && !priceMatches(listedPrice(r.price), s.sellAt)); };
       const fillable = manage ? list.filter(needsFill) : [];
-      const sig = manage ? `m${off.length}:${off.map((r) => r.itemId).join(",")}:f${fillable.length}:u${undoable()}` : "a";
+      const sig = manage ? `m${off.length}:${off.map((r) => r.itemId).join(",")}:s${stuck.map((r) => r.itemId).join(",")}:f${fillable.length}:u${undoable()}` : "a";
       // 0.8.47: FIX N looked the rows up when the header was DRAWN, and the header is only redrawn
       // when the count changes. Torn redraws its (virtualized) rows under us, so a click typed into
       // inputs no longer on the page and nothing happened. It now finds the off rows at click time.
-      const fixOff = () => rows().filter((r) => shownRow(r) && isOff(r)).forEach((r) => {
-        const s = sell.get(r.itemId);
-        if (!canFillFrom(s, Date.now())) return;
-        const p = fixPrice(s, s && s.market, Date.now());
-        if (p != null && p !== listedPrice(r.price)) fillRow(r, p);
-      });
+      const fixOff = () => { rows().filter((r) => shownRow(r)).forEach((r) => { const p = fixFor(r).price; if (p != null) fillRow(r, p); }); headerLinks(rows()); };
+      const nameOf = (r) => { const s = sell.get(r.itemId); return (s && s.name) || ((r.row.textContent || "").trim().split(/\s+x\d/)[0].slice(0, 40)) || `#${r.itemId}`; };
+      const stuckNote = stuck.length ? `At your floor, can't go lower: ${stuck.map(nameOf).join(", ")}` : "";
       let box = document.getElementById("totr-hlinks");
       if (box && box.isConnected && box.dataset.sig === sig) return;
       if (box) box.remove();
       const links = manage
         ? [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", disabled: !fillable.length, title: "Type your sell-list price into every row that's off it. Nothing is live until you press Save Changes; UNDO FILL puts the old prices back.", onclick: () => { autoFilled.forEach((a, id) => { if (a.undone) autoFilled.delete(id); }); autoFill(rows()); headerLinks(rows()); } }, fillable.length ? `PRICE FILL ${fillable.length}` : "PRICE FILL"),
-           el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, title: off.length ? `Off target: ${off.map((r) => { const s = sell.get(r.itemId); return (s && s.name) || ((r.row.textContent || "").trim().split(/\s+x\d/)[0].slice(0, 40)) || `#${r.itemId}`; }).join(", ")}` : undefined, onclick: fixOff }, off.length ? `FIX ${off.length} OFF TARGET` : "ALL ON TARGET")]
+           el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, title: [off.length ? `Off target: ${off.map(nameOf).join(", ")}` : "", stuckNote].filter(Boolean).join("\n") || undefined, onclick: fixOff }, off.length ? `FIX ${off.length} OFF TARGET` : stuck.length ? `${stuck.length} AT FLOOR` : "ALL ON TARGET")]
         : [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", onclick: () => rows().filter(shownRow).forEach((r) => { if (!listedPrice(r.price)) fillRow(r); else if (r.qty && !r.qty.value && listQty(r, false)) setNativeValue(r.qty, listQty(r, false)); }) }, "FILL ALL"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--qty", onclick: () => rows().filter(shownRow).forEach(fillQty) }, "FILL QTY"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
@@ -5054,7 +5077,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { mvName, pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, overCheapest, autoFillPicks, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { mvName, pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, fixTarget, overCheapest, autoFillPicks, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
