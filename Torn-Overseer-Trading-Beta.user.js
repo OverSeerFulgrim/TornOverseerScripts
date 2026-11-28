@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.46
+// @version      0.8.47
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -2841,13 +2841,23 @@
     }
     function headerLinks(list) {
       const manage = isManage();
-      const off = manage ? list.filter((r) => { const st = stateFor(r, sell.get(r.itemId)); return st && st.off; }) : [];
-      const sig = manage ? `m${off.length}` : "a";
+      const isOff = (r) => { const st = stateFor(r, sell.get(r.itemId)); return !!(st && st.off); };
+      const off = manage ? list.filter(isOff) : [];
+      const sig = manage ? `m${off.length}:${off.map((r) => r.itemId).join(",")}` : "a";
+      // 0.8.47: FIX N looked the rows up when the header was DRAWN, and the header is only redrawn
+      // when the count changes. Torn redraws its (virtualized) rows under us, so a click typed into
+      // inputs no longer on the page and nothing happened. It now finds the off rows at click time.
+      const fixOff = () => rows().filter((r) => shownRow(r) && isOff(r)).forEach((r) => {
+        const s = sell.get(r.itemId);
+        if (!canFillFrom(s, Date.now())) return;
+        const p = fixPrice(s, s && s.market, Date.now());
+        if (p != null && p !== listedPrice(r.price)) fillRow(r, p);
+      });
       let box = document.getElementById("totr-hlinks");
       if (box && box.isConnected && box.dataset.sig === sig) return;
       if (box) box.remove();
       const links = manage
-        ? [el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, onclick: () => off.filter(shownRow).forEach((r) => { const s = sell.get(r.itemId); if (canFillFrom(s, Date.now())) fillRow(r, fixPrice(s, s && s.market, Date.now())); }) }, off.length ? `FIX ${off.length} OFF TARGET` : "ALL ON TARGET")]
+        ? [el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, title: off.length ? `Off target: ${off.map((r) => { const s = sell.get(r.itemId); return (s && s.name) || ((r.row.textContent || "").trim().split(/\s+x\d/)[0].slice(0, 40)) || `#${r.itemId}`; }).join(", ")}` : undefined, onclick: fixOff }, off.length ? `FIX ${off.length} OFF TARGET` : "ALL ON TARGET")]
         : [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", onclick: () => rows().filter(shownRow).forEach((r) => { if (!listedPrice(r.price)) fillRow(r); else if (r.qty && !r.qty.value && listQty(r, false)) setNativeValue(r.qty, listQty(r, false)); }) }, "FILL ALL"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--qty", onclick: () => rows().filter(shownRow).forEach(fillQty) }, "FILL QTY"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
