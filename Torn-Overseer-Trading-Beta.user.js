@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.45
+// @version      0.8.46
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -619,13 +619,21 @@
    * only at or under your deal line — and, like the grid mark above, never on stock you already
    * hold that hasn't sold in 30 days: that listing stays grey and the tooltip says why.
    */
+  /**
+   * 0.8.46 (plan step 14, rulebook F2/F4): one short format for every "% of market value" chip,
+   * "85% MV", with the full sentence in the tooltip — and the tooltip names WHICH market value
+   * (these chips use Torn's, the site's Pricelist defaults to TE's). Replaces "85% OF MARKET"
+   * and "−15.0% vs MV".
+   */
+  function pctMvLabel(pct) { return `${Math.round(100 + pct)}% MV`; }
   function stripPctLook(pct, dealPct, stock, nowMs) {
     const dealLine = -(100 - dealPct);
-    if (pct > 0) return { cls: "totr-chip--warn", title: "Over market value" };
-    if (pct > dealLine) return { cls: "totr-chip--dim", title: `Under MV, but not by your deal % (${dealPct}% of MV = ${dealLine}%)` };
+    const of = `${Math.round(100 + pct)}% of Torn's market value`;
+    if (pct > 0) return { cls: "totr-chip--warn", title: `${of}: over it` };
+    if (pct > dealLine) return { cls: "totr-chip--dim", title: `${of}: under it, but not at your deal line (${dealPct}%)` };
     const stuck = notSellingLine(stock, nowMs);
     if (stuck) return { cls: "totr-chip--dim", title: stuck };
-    return { cls: "totr-chip--ok", title: `At or under your deal line (${dealPct}% of MV)` };
+    return { cls: "totr-chip--ok", title: `${of}: at or under your deal line (${dealPct}%)` };
   }
   function marketPctDeal(mode, price, marketValue, dealPct, stock, nowMs) {
     if (!showsMarketPct(mode) || !(Number(marketValue) > 0) || !(Number(price) > 1)) return null;
@@ -3080,6 +3088,20 @@
       if (m && !prefs().sellMode) { gmSet(STORE.sellMode, m); location.reload(); }
     }).catch(() => { /* older server or offline: the chooser still asks */ });
   }
+  /**
+   * 0.8.46 (plan step 16, F7): the deal line lives on the site (Watchlist → Deal line), one
+   * per account. Pulled once per page load into local storage; the local value is only the
+   * fallback for when Overseer can't be reached (or nobody saved one: 90%).
+   */
+  let dealPulled = false;
+  function pullDealLine() {
+    if (dealPulled || !hasKey()) return;
+    dealPulled = true;
+    callTrader("deal_line").then((res) => {
+      const pct = Number(res && res.pct);
+      if (Number.isInteger(pct) && pct >= 1 && pct <= 100 && pct !== prefs().dealPct) gmSet(STORE.dealPct, pct);
+    }).catch(() => { /* older server or offline: keep the local deal line */ });
+  }
   /** The site's Item page for one item (WO-64). */
   function itemPageUrl(itemId, tab) {
     return `${SITE_URL}/trading/items/${itemId}${tab ? `?tab=${tab}` : ""}`;
@@ -3094,6 +3116,7 @@
   /** Put the chooser before `anchor` when it is wanted and not already there. */
   function placeSellModeBar(anchor) {
     pullSellMode();
+    pullDealLine();
     const want = !prefs().sellMode || modeChooserOpen;
     const bar = document.getElementById("totr-mode-bar");
     if (!want) { bar?.remove(); return; }
@@ -3254,7 +3277,7 @@
         // a −0.6% listing used to glow the same green as −17%, and read as a deal.
         if (pct == null) return null;
         const { cls, title } = stripPctLook(pct, dealPct, d && d.stock, Date.now());
-        return el("span", { class: "totr-chip " + cls, title }, `${pct > 0 ? "+" : ""}${pct.toFixed(1)}% vs MV`);
+        return el("span", { class: "totr-chip " + cls, title }, pctMvLabel(pct));
       }
       // 0.8.31: judged against the live floor on this page — the other bazaars in this strip and
       // the item market's cheapest listing — not only the (up to 3 h old) bazaar snapshot.
@@ -3582,7 +3605,10 @@
         if (q.buyPrice != null && c.price < q.buyPrice) { label = "UNDER YOUR BUY"; cls = "buy"; title = notSellingLine(q.stock, Date.now()) || null; }
         else if (v && v.kind === "below_cost") { label = v.label; cls = "ok"; title = v.title; }
         else if (v && mode === "bazaar") { label = `RESELL +${fmtMoney(v.resale.profit)}`; cls = "ok"; title = v.title; }
-        else if (!hasQuality(c.card) && marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now()) != null) { label = `${marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now())}% OF MARKET`; cls = "ok"; }
+        else if (!hasQuality(c.card) && marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now()) != null) {
+          const n = marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now());
+          label = `${n}% MV`; cls = "ok"; title = `${n}% of Torn's market value: at or under your deal line (${dealPct}%)`;
+        }
         if (!label) continue;
         c.card.style.boxShadow = cls === "buy" ? "inset 0 0 0 3px #4c8dff" : "inset 0 0 0 3px #5fe0a6";
         c.card.querySelector("[data-testid='price']")?.after(el("span", { class: `totr-chip totr-chip--${cls}`, "data-totr-ui": "1", title: title || undefined }, label));
@@ -4902,7 +4928,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

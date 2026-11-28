@@ -844,13 +844,13 @@ test("0.8.32: Item Market sellers get no green % OF MARKET mark on stock that is
 test("0.8.33: the Bazaars strip's % vs MV chip stays grey on stock that isn't selling", () => {
   const now = Date.parse("2026-11-26T12:00:00Z");
   const stuck = { onHand: 12, oldestLotAt: "2026-09-01T00:00:00Z", sold30d: 0 };
-  assert.deepEqual(tr.stripPctLook(-15, 90, null, now), { cls: "totr-chip--ok", title: "At or under your deal line (90% of MV)" });
+  assert.deepEqual(tr.stripPctLook(-15, 90, null, now), { cls: "totr-chip--ok", title: "85% of Torn's market value: at or under your deal line (90%)" });
   const grey = tr.stripPctLook(-15, 90, stuck, now);
   assert.equal(grey.cls, "totr-chip--dim");
   assert.match(grey.title, /You already hold 12 · none sold in 30 days/);
   // Unchanged: under MV but not a deal is grey, over MV is amber — stuck or not.
   assert.equal(tr.stripPctLook(-0.6, 90, null, now).cls, "totr-chip--dim");
-  assert.match(tr.stripPctLook(-0.6, 90, stuck, now).title, /not by your deal %/);
+  assert.match(tr.stripPctLook(-0.6, 90, stuck, now).title, /not at your deal line/);
   assert.equal(tr.stripPctLook(4, 90, stuck, now).cls, "totr-chip--warn");
 });
 
@@ -978,4 +978,13 @@ test("0.8.42: no \"fix\" down to a sell-list price the market is well above", ()
   assert.equal(tr.undersellAdvice(999, { sellAt: 463, floor: 463, market: null }, now), null);
   // Never under your floor.
   assert.equal(tr.undersellAdvice(999, { ...s, floor: 800 }, now), null);
+});
+
+test("0.8.46: every % of market value chip reads \"85% MV\", and its tooltip names Torn's market value (plan step 14)", () => {
+  const now = Date.parse("2026-11-27T12:00:00Z");
+  assert.equal(tr.pctMvLabel(-15), "85% MV");
+  assert.equal(tr.pctMvLabel(-0.6), "99% MV");
+  assert.equal(tr.pctMvLabel(4.2), "104% MV");
+  assert.match(tr.stripPctLook(4, 90, null, now).title, /^104% of Torn's market value: over it$/);
+  assert.match(tr.stripPctLook(-5, 90, null, now).title, /95% of Torn's market value: under it, but not at your deal line \(90%\)/);
 });
