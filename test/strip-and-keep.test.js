@@ -217,7 +217,7 @@ test("0.8.38: only changes in the page itself wake a pass — not the sidebar, c
   dom.window.close();
 });
 
-test("Manage (0.8.51): auto-fill on open, green box, UNDO FILL, red box over the cheapest bazaar", async () => {
+test("Manage (0.8.52): PRICE FILL button, green box, UNDO FILL; red box and red $ over the cheapest bazaar", async () => {
   const at = new Date(Date.now() - 10 * 60000).toISOString();
   const answer = (body) => {
     if (body.action === "sell_prices") {
@@ -228,26 +228,31 @@ test("Manage (0.8.51): auto-fill on open, green box, UNDO FILL, red box over the
     }
     return { items: [], watched: [], deals: [] };
   };
-  const { doc, gm } = page("https://www.torn.com/bazaar.php#/manage", MANAGE_HTML, answer);
+  const { doc } = page("https://www.torn.com/bazaar.php#/manage", MANAGE_HTML, answer);
   await tick(400);
   const [jemmy, weight] = doc.querySelectorAll("li");
   const input = (li) => li.querySelector("input");
-  assert.equal(input(weight).value, "300", "the off price was filled on open");
+  const btn = (re) => [...doc.querySelectorAll("#totr-hlinks button")].find((b) => re.test(b.textContent));
+  assert.equal(input(weight).value, "350", "nothing is filled until the button is pressed");
+  assert.ok(!btn(/AUTO-FILL/), "no auto-fill switch");
+  btn(/PRICE FILL 1/).click();
+  await tick(250);
+  assert.equal(input(weight).value, "300");
   assert.equal(input(jemmy).value, "7000", "already right: untouched");
   assert.equal(input(jemmy).dataset.totrPrice, undefined);
-  // $300 is still over the $280 cheapest: red wins over green.
+  assert.ok(!jemmy.querySelector(".totr-dollar").classList.contains("totr-dollar--alert"));
+  // $300 is still over the $280 cheapest: red box (wins over green) and a red $.
   assert.equal(input(weight).dataset.totrPrice, "over");
   assert.match(input(weight).title, /probably won't sell/);
-  const undo = [...doc.querySelectorAll("#totr-hlinks button")].find((b) => /UNDO FILL 1/.test(b.textContent));
-  assert.ok(undo, "UNDO FILL 1 in the header");
-  undo.click();
+  assert.ok(weight.querySelector(".totr-dollar").classList.contains("totr-dollar--alert"));
+  weight.querySelector(".totr-dollar").click();
+  await tick(50);
+  const issue = doc.querySelector(".totr-pick-pop .totr-pick-issue");
+  assert.match(issue.textContent, /More than other bazaars\. The cheapest other bazaar asks \$280/);
+  assert.match(issue.querySelector("button").textContent, /Fill \$279/);
+  doc.querySelector(".totr-pick-x").click();
+  btn(/UNDO FILL 1/).click();
   await tick(250);
   assert.equal(input(weight).value, "350", "undo puts the old price back");
-  assert.ok(![...doc.querySelectorAll("#totr-hlinks button")].some((b) => /UNDO FILL/.test(b.textContent)));
-  // The switch turns it off (saved).
-  const sw = [...doc.querySelectorAll("#totr-hlinks button")].find((b) => /AUTO-FILL ON/.test(b.textContent));
-  sw.click();
-  await tick(100);
-  assert.equal(gm.get("totr_autofill"), false);
-  assert.ok([...doc.querySelectorAll("#totr-hlinks button")].some((b) => /AUTO-FILL OFF/.test(b.textContent)));
+  assert.ok(!btn(/UNDO FILL/));
 });

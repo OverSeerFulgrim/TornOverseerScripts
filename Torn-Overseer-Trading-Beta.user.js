@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.51
+// @version      0.8.52
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -82,7 +82,6 @@
     keepOff: "totr_keep_off", // 0.8.25: item ids whose "keep 1" is switched off (Fill lists them all)
     quoteCache: "totr_quote_cache", // 0.8.40: light quotes (market value, your buy price, stock) for 5 minutes
     imLowCache: "totr_im_low_cache", // 0.8.40: item-market lows read with your key, for 30 minutes
-    autoFill: "totr_autofill", // 0.8.51: Manage fills every off price when it opens (default on)
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
@@ -445,13 +444,13 @@
     if (!(Number(listed) > 0)) return null;
     const vs = vsCheapest(listed, market, nowMs);
     if (vs.gapPct == null || !(vs.gapPct > 0)) return null;
-    return { gapPct: vs.gapPct, title: `More than other bazaars, so it probably won't sell — ${vs.title}` };
+    return { gapPct: vs.gapPct, ref: Math.round(Number(listed) / (1 + vs.gapPct / 100)), title: `More than other bazaars, so it probably won't sell — ${vs.title}` };
   }
   /**
-   * 0.8.51: which Manage rows auto-fill types into when the page opens: rows on screen with a
-   * FRESH sell-list price (never a cached one) that isn't typed yet, each item once per visit
-   * (`done`), so a price you change by hand afterwards is left alone. Not selling rows have no
-   * sell-list price and are never picked. `rows` are { itemId, shown, listed, sellAt, fresh }.
+   * 0.8.52: which Manage rows PRICE FILL types into: rows on screen with a FRESH sell-list price
+   * (never a cached one) that isn't typed yet. `done` holds items already filled this visit (their
+   * undo is kept), so pressing it again leaves a price you changed by hand afterwards alone. Not
+   * selling rows have no sell-list price and are never picked. `rows` are { itemId, shown, listed, sellAt, fresh }.
    */
   function autoFillPicks(rows, done) {
     const out = [];
@@ -2699,9 +2698,9 @@
       refresh(r);
     }
 
-    // 0.8.51: auto-fill on Manage. itemId → { before (listed price or null), price typed, undone }.
+    // 0.8.52: PRICE FILL on Manage (a button — 0.8.51 filled on open, which read as a setting).
+    // itemId → { before (listed price or null), price typed, undone }.
     const autoFilled = new Map();
-    const autoFillOn = () => gmGet(STORE.autoFill, true) !== false;
     function autoFill(list) {
       const now = Date.now();
       const picks = autoFillPicks(list.map((r) => {
@@ -2742,9 +2741,11 @@
       if (tag.textContent !== "") tag.textContent = "";
       if (tag.className !== "totr-bz-state") tag.className = "totr-bz-state";
       const dollar = r.row.querySelector(".totr-dollar");
-      const alert = Boolean(st && st.off);
+      // 0.8.52: also red when the price is over the cheapest other bazaar (the red price box).
+      const overNow = isManage() ? overCheapest(listedPrice(r.price), s0 && s0.market, Date.now()) : null;
+      const alert = Boolean((st && st.off) || overNow);
       if (dollar && dollar.classList.contains("totr-dollar--alert") !== alert) dollar.classList.toggle("totr-dollar--alert", alert);
-      const title = alert ? `${st.hint} — click for what to do` : "Quick prices";
+      const title = st && st.off ? `${st.hint} — click for what to do` : overNow ? `${overNow.title} — click for what to do` : "Quick prices";
       // 0.8.23: set it only when the text changes. Torn's own tooltip takes the title away while it
       // shows; putting it back on every refresh made the browser's tooltip pop up as well (two boxes).
       if (dollar && dollar.dataset.tip !== title) { dollar.dataset.tip = title; dollar.title = title; }
@@ -2821,6 +2822,17 @@
           el("span", null, el("strong", null, st.cls === "low" ? "Under your floor." : "Off your sell-list price."), ` ${st.hint}.`,
             r.row.querySelector("[data-totr-vs]") ? ` ${r.row.querySelector("[data-totr-vs]").getAttribute("data-totr-vs")}.` : ""),
           el("button", { type: "button", class: "totr-mini", onclick: () => { fillRow(r, s.sellAt); closePopup(); } }, `Fix: fill ${fmtMoney(s.sellAt)}`));
+      }
+      // 0.8.52: the red price box — over the cheapest other bazaar, even at your sell-list price.
+      const over = !issue ? overCheapest(listedNow, s.market, Date.now()) : null;
+      if (over) {
+        const under = over.ref - 1;
+        const ok = under >= 1 && !(s.floor != null && under < Number(s.floor));
+        issue = el("div", { class: "totr-pick-issue" },
+          el("span", null, el("strong", null, "More than other bazaars."),
+            ` The cheapest other bazaar asks ${fmtMoney(over.ref)}, so this probably won't sell.`,
+            !ok && s.floor != null ? ` $1 under it would be below your floor (${fmtMoney(s.floor)}).` : ""),
+          ok ? el("button", { type: "button", class: "totr-mini", title: "$1 under the cheapest other bazaar", onclick: () => { fillRow(r, under); closePopup(); } }, `Fill ${fmtMoney(under)}`) : null);
       }
       // 0.8.42: a trader paying more is the best option on the card, so it leads.
       popup = el("div", { class: "totr totr-pick-pop", "data-totr-ui": "1", role: "dialog", "aria-label": `${name.trim()} prices` }, ...[head, trader, issue, list, foot].filter(Boolean));
@@ -2920,7 +2932,7 @@
       // price), filled exactly as its own Fill would. Rows are looked up at click time.
       const needsFill = (r) => { const s = sell.get(r.itemId); return !!(s && s.sellAt != null && canFillFrom(s, Date.now()) && !priceMatches(listedPrice(r.price), s.sellAt)); };
       const fillable = manage ? list.filter(needsFill) : [];
-      const sig = manage ? `m${off.length}:${off.map((r) => r.itemId).join(",")}:f${fillable.length}:a${autoFillOn() ? 1 : 0}u${undoable()}` : "a";
+      const sig = manage ? `m${off.length}:${off.map((r) => r.itemId).join(",")}:f${fillable.length}:u${undoable()}` : "a";
       // 0.8.47: FIX N looked the rows up when the header was DRAWN, and the header is only redrawn
       // when the count changes. Torn redraws its (virtualized) rows under us, so a click typed into
       // inputs no longer on the page and nothing happened. It now finds the off rows at click time.
@@ -2934,20 +2946,14 @@
       if (box && box.isConnected && box.dataset.sig === sig) return;
       if (box) box.remove();
       const links = manage
-        ? [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", disabled: !fillable.length, title: "Fill every row to your sell-list price, as each row's Fill would. Nothing is saved until you press Save Changes.", onclick: () => rows().filter((r) => shownRow(r) && needsFill(r)).forEach((r) => fillRow(r)) }, fillable.length ? `FILL ALL ${fillable.length}` : "FILL ALL"),
+        ? [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", disabled: !fillable.length, title: "Type your sell-list price into every row that's off it. Nothing is live until you press Save Changes; UNDO FILL puts the old prices back.", onclick: () => { autoFilled.forEach((a, id) => { if (a.undone) autoFilled.delete(id); }); autoFill(rows()); headerLinks(rows()); } }, fillable.length ? `PRICE FILL ${fillable.length}` : "PRICE FILL"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--warn", disabled: !off.length, title: off.length ? `Off target: ${off.map((r) => { const s = sell.get(r.itemId); return (s && s.name) || ((r.row.textContent || "").trim().split(/\s+x\d/)[0].slice(0, 40)) || `#${r.itemId}`; }).join(", ")}` : undefined, onclick: fixOff }, off.length ? `FIX ${off.length} OFF TARGET` : "ALL ON TARGET")]
         : [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", onclick: () => rows().filter(shownRow).forEach((r) => { if (!listedPrice(r.price)) fillRow(r); else if (r.qty && !r.qty.value && listQty(r, false)) setNativeValue(r.qty, listQty(r, false)); }) }, "FILL ALL"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--qty", onclick: () => rows().filter(shownRow).forEach(fillQty) }, "FILL QTY"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
       if (manage) {
-        // 0.8.51: auto-fill on open (on by default) and its undo. Nothing is live until Save Changes.
         const n = undoable();
-        if (n) links.push(el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Put back the prices that were there before auto-fill", onclick: undoAutoFill }, `UNDO FILL ${n}`));
-        links.push(el("button", {
-          type: "button", class: "totr-hlink" + (autoFillOn() ? " totr-hlink--ok" : ""), "aria-pressed": String(autoFillOn()),
-          title: autoFillOn() ? "On: opening Manage fills every price that's off your sell list. Click to turn off." : "Off: click to fill every off price whenever you open Manage.",
-          onclick: () => { gmSet(STORE.autoFill, !autoFillOn()); run().catch(() => {}); },
-        }, autoFillOn() ? "AUTO-FILL ON" : "AUTO-FILL OFF"));
+        if (n) links.push(el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Put back the prices that were there before PRICE FILL", onclick: undoAutoFill }, `UNDO FILL ${n}`));
       }
       links.push(el("a", { class: "totr-hlink", href: `${SITE_URL}/trading/bazaar`, target: "_blank", rel: "noopener" }, "SETTINGS"));
       links.unshift(el("button", { type: "button", id: "totr-hage", class: "totr-hlink totr-hage", onclick: reloadTargets }));
@@ -3160,7 +3166,6 @@
       }
       if (await load(list)) document.getElementById("totr-bzline")?.remove();
       list.forEach(decorate);
-      if (isManage() && autoFillOn()) autoFill(list);
       applyUseFilter(list);
       useBar(list);
       headerLinks(list);
