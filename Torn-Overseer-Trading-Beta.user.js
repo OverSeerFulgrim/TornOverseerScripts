@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.50
+// @version      0.8.51
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -82,6 +82,7 @@
     keepOff: "totr_keep_off", // 0.8.25: item ids whose "keep 1" is switched off (Fill lists them all)
     quoteCache: "totr_quote_cache", // 0.8.40: light quotes (market value, your buy price, stock) for 5 minutes
     imLowCache: "totr_im_low_cache", // 0.8.40: item-market lows read with your key, for 30 minutes
+    autoFill: "totr_autofill", // 0.8.51: Manage fills every off price when it opens (default on)
   };
   const SECRET_KEYS = new Set([STORE.tornKey, STORE.sessionToken]);
 
@@ -433,6 +434,33 @@
     }
     if (Math.abs(d) < 2) return { text: "≈", cls: "ok", off: false, hint: `Within 2% of your sell-list price (${fmtMoney(sellAt)}) — Fill to match it exactly` };
     return { text: `${d > 0 ? "+" : "−"}${pct(d)}`, cls: "ok", off: false, hint: `Listed ${pct(d)} ${d > 0 ? "over" : "under"} your sell-list price (${fmtMoney(sellAt)}); fine to leave` };
+  }
+
+  /**
+   * 0.8.51: Manage — a listed price over the cheapest other bazaar gets a red box: it probably
+   * won't sell. The cheapest is vsCheapest's trusted one (fresh, not a $1 / display listing, a
+   * one-day dip compared with the week). Null when it isn't over, or the market isn't known.
+   */
+  function overCheapest(listed, market, nowMs) {
+    if (!(Number(listed) > 0)) return null;
+    const vs = vsCheapest(listed, market, nowMs);
+    if (vs.gapPct == null || !(vs.gapPct > 0)) return null;
+    return { gapPct: vs.gapPct, title: `More than other bazaars, so it probably won't sell — ${vs.title}` };
+  }
+  /**
+   * 0.8.51: which Manage rows auto-fill types into when the page opens: rows on screen with a
+   * FRESH sell-list price (never a cached one) that isn't typed yet, each item once per visit
+   * (`done`), so a price you change by hand afterwards is left alone. Not selling rows have no
+   * sell-list price and are never picked. `rows` are { itemId, shown, listed, sellAt, fresh }.
+   */
+  function autoFillPicks(rows, done) {
+    const out = [];
+    for (const r of rows) {
+      if (!r.itemId || done.has(r.itemId) || !r.shown || !r.fresh || !(Number(r.sellAt) > 0)) continue;
+      if (priceMatches(r.listed, r.sellAt)) continue;
+      out.push(r.itemId);
+    }
+    return out;
   }
 
   /**
@@ -1833,6 +1861,8 @@
   .totr-pick--main{background:#0f2a1f;border-color:#2f6b4f}.totr-pick:disabled{opacity:.6;cursor:default}
   .totr-pick-label{flex:1}.totr-pick-profit{min-width:56px;text-align:right;font-weight:700;color:#5fe0a6}.totr-pick-profit--floor{color:#e2a6ef}
   .totr-pick-trader{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 12px 0;padding:8px 10px;border-radius:7px;border:1px solid #2f6b4f;background:#0f2a1f;font-size:12px;color:#c9d2de}.totr-pick-trader strong{color:#5fe0a6}.totr-pick-trader[hidden]{display:none}
+  input[data-totr-price="filled"]{border-color:#7cb342!important;box-shadow:0 0 0 1px #7cb342!important}
+  input[data-totr-price="over"]{border-color:#e23b3b!important;box-shadow:0 0 0 1px #e23b3b!important;color:#ff8a80!important}
   .totr-dollar--alert{color:#fff;background:#b3261e;border-color:#e23b3b;box-shadow:0 0 0 1px #e23b3b}
   .totr-pick-issue{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 12px 0;padding:8px 10px;border-radius:7px;border:1px solid #7a3a35;background:#2a1215;font-size:12px;color:#e6ebf2}.totr-pick-issue strong{color:#ff8a80}
   .totr-pick-issue--fine{border-color:#2f4f7a;background:#101a2b}.totr-pick-issue--fine strong{color:#8ab8ff}
@@ -2669,6 +2699,35 @@
       refresh(r);
     }
 
+    // 0.8.51: auto-fill on Manage. itemId → { before (listed price or null), price typed, undone }.
+    const autoFilled = new Map();
+    const autoFillOn = () => gmGet(STORE.autoFill, true) !== false;
+    function autoFill(list) {
+      const now = Date.now();
+      const picks = autoFillPicks(list.map((r) => {
+        const s = sell.get(r.itemId);
+        return { itemId: r.itemId, shown: shownRow(r), listed: listedPrice(r.price), sellAt: s ? s.sellAt : null, fresh: !!s && !isCached(s) && canFillFrom(s, now) };
+      }), autoFilled);
+      for (const id of picks) {
+        const r = list.find((x) => x.itemId === id);
+        const s = sell.get(id);
+        if (!r || !s) continue;
+        autoFilled.set(id, { before: listedPrice(r.price), price: Math.round(s.sellAt), undone: false });
+        fillRow(r);
+      }
+    }
+    function undoAutoFill() {
+      for (const r of rows()) {
+        const a = autoFilled.get(r.itemId);
+        if (!a || a.undone || listedPrice(r.price) !== a.price) continue;
+        if (a.before != null) setNativeValue(r.price, a.before); else clearNativeValue(r.price);
+        a.undone = true;
+        refresh(r);
+      }
+      headerLinks(rows());
+    }
+    const undoable = () => [...autoFilled.values()].filter((a) => !a.undone).length;
+
     function refresh(r) {
       const tag = r.row.querySelector("[data-totr-state]");
       if (!tag) return;
@@ -2689,6 +2748,18 @@
       // 0.8.23: set it only when the text changes. Torn's own tooltip takes the title away while it
       // shows; putting it back on every refresh made the browser's tooltip pop up as well (two boxes).
       if (dollar && dollar.dataset.tip !== title) { dollar.dataset.tip = title; dollar.title = title; }
+      // 0.8.51: the price box itself — red when it's over the cheapest other bazaar (it probably
+      // won't sell), green when auto-fill typed it. A data attribute, not a class: Torn's React
+      // owns the input's className.
+      if (isManage()) {
+        const listed = listedPrice(r.price);
+        const over = overCheapest(listed, s0 && s0.market, Date.now());
+        const a = autoFilled.get(r.itemId);
+        const look = over ? "over" : a && !a.undone && listed === a.price ? "filled" : "";
+        if ((r.price.dataset.totrPrice || "") !== look) { if (look) r.price.dataset.totrPrice = look; else delete r.price.dataset.totrPrice; }
+        const tip = over ? over.title : "";
+        if ((r.price.dataset.totrTip || "") !== tip) { r.price.dataset.totrTip = tip; if (tip) r.price.title = tip; else r.price.removeAttribute("title"); }
+      }
     }
 
     /** 0.8.36: Manage — the Remove column's box on a row (the row's other number input). VERIFY on live Torn. */
@@ -2849,7 +2920,7 @@
       // price), filled exactly as its own Fill would. Rows are looked up at click time.
       const needsFill = (r) => { const s = sell.get(r.itemId); return !!(s && s.sellAt != null && canFillFrom(s, Date.now()) && !priceMatches(listedPrice(r.price), s.sellAt)); };
       const fillable = manage ? list.filter(needsFill) : [];
-      const sig = manage ? `m${off.length}:${off.map((r) => r.itemId).join(",")}:f${fillable.length}` : "a";
+      const sig = manage ? `m${off.length}:${off.map((r) => r.itemId).join(",")}:f${fillable.length}:a${autoFillOn() ? 1 : 0}u${undoable()}` : "a";
       // 0.8.47: FIX N looked the rows up when the header was DRAWN, and the header is only redrawn
       // when the count changes. Torn redraws its (virtualized) rows under us, so a click typed into
       // inputs no longer on the page and nothing happened. It now finds the off rows at click time.
@@ -2868,6 +2939,16 @@
         : [el("button", { type: "button", class: "totr-hlink totr-hlink--ok", onclick: () => rows().filter(shownRow).forEach((r) => { if (!listedPrice(r.price)) fillRow(r); else if (r.qty && !r.qty.value && listQty(r, false)) setNativeValue(r.qty, listQty(r, false)); }) }, "FILL ALL"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--qty", onclick: () => rows().filter(shownRow).forEach(fillQty) }, "FILL QTY"),
            el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Empty qty and price on this tab", onclick: () => rows().filter(shownRow).forEach(clearRow) }, "CLEAR")];
+      if (manage) {
+        // 0.8.51: auto-fill on open (on by default) and its undo. Nothing is live until Save Changes.
+        const n = undoable();
+        if (n) links.push(el("button", { type: "button", class: "totr-hlink totr-hlink--clear", title: "Put back the prices that were there before auto-fill", onclick: undoAutoFill }, `UNDO FILL ${n}`));
+        links.push(el("button", {
+          type: "button", class: "totr-hlink" + (autoFillOn() ? " totr-hlink--ok" : ""), "aria-pressed": String(autoFillOn()),
+          title: autoFillOn() ? "On: opening Manage fills every price that's off your sell list. Click to turn off." : "Off: click to fill every off price whenever you open Manage.",
+          onclick: () => { gmSet(STORE.autoFill, !autoFillOn()); run().catch(() => {}); },
+        }, autoFillOn() ? "AUTO-FILL ON" : "AUTO-FILL OFF"));
+      }
       links.push(el("a", { class: "totr-hlink", href: `${SITE_URL}/trading/bazaar`, target: "_blank", rel: "noopener" }, "SETTINGS"));
       links.unshift(el("button", { type: "button", id: "totr-hage", class: "totr-hlink totr-hage", onclick: reloadTargets }));
       // 0.8.11: "WORTH $1.2m" — what the bazaar adds up to at the prices typed (filled in by updateWorth).
@@ -3079,6 +3160,7 @@
       }
       if (await load(list)) document.getElementById("totr-bzline")?.remove();
       list.forEach(decorate);
+      if (isManage() && autoFillOn()) autoFill(list);
       applyUseFilter(list);
       useBar(list);
       headerLinks(list);
@@ -4967,7 +5049,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { mvName, pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { mvName, pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, overCheapest, autoFillPicks, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

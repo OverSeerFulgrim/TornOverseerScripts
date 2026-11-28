@@ -996,3 +996,29 @@ test("0.8.50: chip tooltips name the market value Overseer priced against (Your 
   assert.equal(tr.mvName(undefined), "Torn's market value");
   assert.match(tr.stripPctLook(-15, 90, null, now, "te_mv").title, /^85% of TE's market value: at or under your deal line/);
 });
+
+test("0.8.51 overCheapest: red box only when over the trusted cheapest bazaar", () => {
+  const now = Date.parse("2026-11-28T08:00:00Z");
+  const mk = (cheapest, extra = {}) => ({ cheapest, listings: 5, bazaarAverage: cheapest, capturedAt: new Date(now - 10 * 60000).toISOString(), ...extra });
+  assert.ok(tr.overCheapest(97999 + 1, mk(97999), now));
+  assert.equal(tr.overCheapest(97999, mk(97999), now), null);
+  assert.equal(tr.overCheapest(90000, mk(97999), now), null);
+  assert.equal(tr.overCheapest(500, mk(400, { capturedAt: new Date(now - 4 * 3600000).toISOString() }), now), null, "stale market: no verdict");
+  assert.equal(tr.overCheapest(500, mk(1, { listings: 30, bazaarAverage: 400 }), now), null, "display listing set aside");
+  assert.equal(tr.overCheapest(500, null, now), null);
+  assert.equal(tr.overCheapest(null, mk(400), now), null);
+});
+
+test("0.8.51 autoFillPicks: fresh, shown, not typed yet, once per visit", () => {
+  const base = { shown: true, fresh: true, listed: 100, sellAt: 120 };
+  const rows = [
+    { ...base, itemId: 1 },
+    { ...base, itemId: 2, listed: 120 },
+    { ...base, itemId: 3, fresh: false },
+    { ...base, itemId: 4, shown: false },
+    { ...base, itemId: 5, sellAt: null },
+    { ...base, itemId: 6 },
+    { ...base, itemId: 7, listed: null },
+  ];
+  assert.deepEqual(tr.autoFillPicks(rows, new Map([[6, {}]])), [1, 7]);
+});

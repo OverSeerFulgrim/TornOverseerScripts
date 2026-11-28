@@ -17,11 +17,11 @@ test.afterEach(async () => {
 });
 const tick = (ms = 150) => new Promise((r) => setTimeout(r, ms));
 
-function page(url, html, answer, { hold = false } = {}) {
+function page(url, html, answer, { hold = false, gmExtra = [] } = {}) {
   const dom = new JSDOM(`<!doctype html><html><head></head><body>${html}</body></html>`, { url, runScripts: "outside-only", pretendToBeVisual: true });
   const w = dom.window;
   windows.push(w);
-  const gm = new Map([["totr_torn_key", "KEYAAAAAAAAAAAAA"], ["totr_session_token", "sess"], ["totr_sell_mode", "market"], ["totr_strip_height", 168]]);
+  const gm = new Map([["totr_torn_key", "KEYAAAAAAAAAAAAA"], ["totr_session_token", "sess"], ["totr_sell_mode", "market"], ["totr_strip_height", 168], ...gmExtra]);
   const calls = [];
   const held = [];
   w.GM_getValue = (k, d) => (gm.has(k) ? gm.get(k) : d);
@@ -135,7 +135,7 @@ const MANAGE_HTML = `<div><span>Manage your Bazaar</span></div><ul>
 </ul>`;
 
 test("Manage (0.8.25, 0.8.36): a price that already matches hides Fill; an off price turns the $ red", async () => {
-  const { doc } = page("https://www.torn.com/bazaar.php#/manage", MANAGE_HTML, addAnswer);
+  const { doc } = page("https://www.torn.com/bazaar.php#/manage", MANAGE_HTML, addAnswer, { gmExtra: [["totr_autofill", false]] });
   await tick(400);
   const [jemmy, weight] = doc.querySelectorAll("li");
   const fillOf = (li) => li.querySelector("[data-totr-fill]");
@@ -168,7 +168,7 @@ test("Manage $ popup (0.8.36): the issue and its fix, a trader paying more with 
     }
     return addAnswer(body);
   };
-  const { doc } = page("https://www.torn.com/bazaar.php#/manage", html, answer);
+  const { doc } = page("https://www.torn.com/bazaar.php#/manage", html, answer, { gmExtra: [["totr_autofill", false]] });
   await tick(400);
   const weight = doc.querySelectorAll("li")[1];
   weight.querySelector(".totr-dollar").click();
@@ -215,4 +215,39 @@ test("0.8.38: only changes in the page itself wake a pass — not the sidebar, c
   assert.equal(tr.passWorthy([{ target: $("energy") }, { target: $("row") }]), true);
   assert.equal(tr.passWorthy([]), false);
   dom.window.close();
+});
+
+test("Manage (0.8.51): auto-fill on open, green box, UNDO FILL, red box over the cheapest bazaar", async () => {
+  const at = new Date(Date.now() - 10 * 60000).toISOString();
+  const answer = (body) => {
+    if (body.action === "sell_prices") {
+      return { items: [
+        { itemId: 568, sellAt: 7000, ruleLabel: "Default", uses: ["oc"], market: { cheapest: 7200, listings: 5, bazaarAverage: 7200, capturedAt: at } },
+        { itemId: 10, sellAt: 300, ruleLabel: "Default", uses: ["none"], market: { cheapest: 280, listings: 5, bazaarAverage: 290, capturedAt: at } },
+      ] };
+    }
+    return { items: [], watched: [], deals: [] };
+  };
+  const { doc, gm } = page("https://www.torn.com/bazaar.php#/manage", MANAGE_HTML, answer);
+  await tick(400);
+  const [jemmy, weight] = doc.querySelectorAll("li");
+  const input = (li) => li.querySelector("input");
+  assert.equal(input(weight).value, "300", "the off price was filled on open");
+  assert.equal(input(jemmy).value, "7000", "already right: untouched");
+  assert.equal(input(jemmy).dataset.totrPrice, undefined);
+  // $300 is still over the $280 cheapest: red wins over green.
+  assert.equal(input(weight).dataset.totrPrice, "over");
+  assert.match(input(weight).title, /probably won't sell/);
+  const undo = [...doc.querySelectorAll("#totr-hlinks button")].find((b) => /UNDO FILL 1/.test(b.textContent));
+  assert.ok(undo, "UNDO FILL 1 in the header");
+  undo.click();
+  await tick(250);
+  assert.equal(input(weight).value, "350", "undo puts the old price back");
+  assert.ok(![...doc.querySelectorAll("#totr-hlinks button")].some((b) => /UNDO FILL/.test(b.textContent)));
+  // The switch turns it off (saved).
+  const sw = [...doc.querySelectorAll("#totr-hlinks button")].find((b) => /AUTO-FILL ON/.test(b.textContent));
+  sw.click();
+  await tick(100);
+  assert.equal(gm.get("totr_autofill"), false);
+  assert.ok([...doc.querySelectorAll("#totr-hlinks button")].some((b) => /AUTO-FILL OFF/.test(b.textContent)));
 });
