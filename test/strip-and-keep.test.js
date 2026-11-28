@@ -217,7 +217,7 @@ test("0.8.38: only changes in the page itself wake a pass — not the sidebar, c
   dom.window.close();
 });
 
-test("Manage (0.8.52): PRICE FILL button, green box, UNDO FILL; red box and red $ over the cheapest bazaar", async () => {
+test("Manage (0.8.56): PRICE FILL fills $1 under the cheapest bazaar when the sell list is over it; UNDO FILL; red box and red $ when over", async () => {
   const at = new Date(Date.now() - 10 * 60000).toISOString();
   const answer = (body) => {
     if (body.action === "sell_prices") {
@@ -234,32 +234,25 @@ test("Manage (0.8.52): PRICE FILL button, green box, UNDO FILL; red box and red 
   const input = (li) => li.querySelector("input");
   const btn = (re) => [...doc.querySelectorAll("#totr-hlinks button")].find((b) => re.test(b.textContent));
   assert.equal(input(weight).value, "350", "nothing is filled until the button is pressed");
-  assert.ok(!btn(/AUTO-FILL/), "no auto-fill switch");
-  btn(/PRICE FILL 1/).click();
-  await tick(250);
-  assert.equal(input(weight).value, "300");
-  assert.equal(input(jemmy).value, "7000", "already right: untouched");
-  assert.equal(input(jemmy).dataset.totrPrice, undefined);
-  assert.ok(!jemmy.querySelector(".totr-dollar").classList.contains("totr-dollar--alert"));
-  // $300 is still over the $280 cheapest: red box (wins over green) and a red $.
+  // $350 is over the $280 cheapest: red box and red $.
   assert.equal(input(weight).dataset.totrPrice, "over");
   assert.match(input(weight).title, /probably won't sell/);
   assert.ok(weight.querySelector(".totr-dollar").classList.contains("totr-dollar--alert"));
   weight.querySelector(".totr-dollar").click();
   await tick(50);
-  const issue = doc.querySelector(".totr-pick-pop .totr-pick-issue");
-  assert.match(issue.textContent, /More than other bazaars\. The cheapest other bazaar asks \$280/);
-  assert.match(issue.querySelector("button").textContent, /Fill \$279/);
+  assert.match(doc.querySelector(".totr-pick-pop").textContent, /\$1 under the cheapest bazaar/);
   doc.querySelector(".totr-pick-x").click();
+  btn(/PRICE FILL 1/).click();
+  await tick(250);
+  assert.equal(input(weight).value, "279", "$1 under the cheapest, not the $300 sell list");
+  assert.equal(input(weight).dataset.totrPrice, "filled", "green: filled and no longer over");
+  assert.ok(!weight.querySelector(".totr-dollar").classList.contains("totr-dollar--alert"));
+  assert.equal(input(jemmy).value, "7000", "already right: untouched");
+  assert.ok(btn(/ALL ON TARGET/), "nothing left for FIX: PRICE FILL and FIX agree");
   btn(/UNDO FILL 1/).click();
   await tick(250);
   assert.equal(input(weight).value, "350", "undo puts the old price back");
   assert.ok(!btn(/UNDO FILL/));
-  // 0.8.53: FIX takes the red row to $1 under the cheapest bazaar, and the click does something.
-  btn(/FIX 1 OFF TARGET/).click();
-  await tick(250);
-  assert.equal(input(weight).value, "279");
-  assert.ok(btn(/ALL ON TARGET/));
 });
 
 test("Manage (0.8.55): Torn's Undo changes puts back prices the script typed; Save Changes is the new baseline", async () => {

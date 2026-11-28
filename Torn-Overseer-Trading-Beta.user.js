@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.55
+// @version      0.8.56
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -445,6 +445,36 @@
     const vs = vsCheapest(listed, market, nowMs);
     if (vs.gapPct == null || !(vs.gapPct > 0)) return null;
     return { gapPct: vs.gapPct, ref: Math.round(Number(listed) / (1 + vs.gapPct / 100)), title: `More than other bazaars, so it probably won't sell — ${vs.title}` };
+  }
+  /**
+   * 0.8.56: the price Manage fills — your sell-list price, unless that's over the cheapest other
+   * bazaar, then $1 under it, never under your floor. 0.8.52–55 filled the sell-list price and
+   * FIX then took red rows under the cheapest, so PRICE FILL and FIX undid each other. If your
+   * own saved listing already is the cheapest (TornW3B's cheapest includes you), it is never
+   * undercut — no chasing yourself down $1 an hour; the price stays where it is unless the sell
+   * list is lower. Returns { price, listPrice, under (undercut), stuck (the floor holds it over) }.
+   */
+  function bestPrice(s, market, nowMs, saved) {
+    if (!s || !(Number(s.sellAt) > 0)) return null;
+    const listPrice = Math.round(Number(s.sellAt));
+    const floor = s.floor != null ? Math.round(Number(s.floor)) : null;
+    const cheapest = market && Number(market.cheapest) > 0 ? Number(market.cheapest) : null;
+    if (Number(saved) > 0 && cheapest != null && Math.round(Number(saved)) === Math.round(cheapest)) {
+      const price = Math.max(Math.min(listPrice, Number(saved)), floor || 1);
+      return { price, listPrice, under: price !== listPrice, stuck: false };
+    }
+    const over = overCheapest(listPrice, market, nowMs);
+    if (!over) return { price: listPrice, listPrice, under: false, stuck: false };
+    let price = over.ref - 1, stuck = false;
+    if (floor != null && price < floor) { price = floor; stuck = true; }
+    price = Math.max(1, Math.min(price, listPrice));
+    return { price, listPrice, under: price !== listPrice, stuck };
+  }
+  /** 0.8.56: a sell_prices item with Manage's best price as sellAt (the list price kept in listSellAt). */
+  function withBestPrice(it, nowMs, saved) {
+    const b = bestPrice(it, it && it.market, nowMs, saved);
+    if (!b || !b.under) return it;
+    return { ...it, sellAt: b.price, listSellAt: b.listPrice, underCheapest: true };
   }
   /**
    * 0.8.53: what FIX types into a red row ({ price }), or price null when nothing can be done.
@@ -2819,7 +2849,14 @@
       const s = sell.get(r.itemId) || {};
       const name = (nameNode(r.row) || {}).textContent || "Item";
       const choices = [];
-      if (s.sellAt != null && canFillFrom(s, Date.now())) choices.push({ label: `Sell list (${(s.ruleLabel || "").replace(/^.*?:\s*/, "") || "your rule"})${isCached(s) ? ` · ${agoText(Date.now() - s.cachedAt)}` : ""}`, price: s.sellAt, main: true });
+      if (s.sellAt != null && canFillFrom(s, Date.now())) {
+        const ruleText = `Sell list (${(s.ruleLabel || "").replace(/^.*?:\s*/, "") || "your rule"})${isCached(s) ? ` · ${agoText(Date.now() - s.cachedAt)}` : ""}`;
+        // 0.8.56: on Manage the fill price may be $1 under the cheapest bazaar; the list price stays a choice.
+        if (s.underCheapest) {
+          choices.push({ label: "$1 under the cheapest bazaar", price: s.sellAt, main: true });
+          choices.push({ label: ruleText, price: s.listSellAt });
+        } else choices.push({ label: ruleText, price: s.sellAt, main: true });
+      }
       if (s.teMarketValue && s.teMarketValue !== s.sellAt) choices.push({ label: "TE market value", price: s.teMarketValue });
       const cheapest = { label: "Cheapest bazaar now", price: null, loading: true };
       choices.push(cheapest);
@@ -3145,7 +3182,8 @@
         if (fresh.loadedAt == null) fresh.loadedAt = now; // the oldest batch is the one that matters
         const refsAt = Date.parse((res && res.referencesAt) || "");
         if (Number.isFinite(refsAt)) fresh.refsAt = fresh.refsAt == null ? refsAt : Math.min(fresh.refsAt, refsAt);
-        for (const it of (res && res.items) || []) sell.set(it.itemId, it);
+        if (isManage()) for (const r of rows()) if (r.itemId && !savedPrices.has(r.itemId)) savedPrices.set(r.itemId, listedPrice(r.price));
+        for (const it of (res && res.items) || []) sell.set(it.itemId, isManage() ? withBestPrice(it, now, savedPrices.get(it.itemId)) : it);
         for (const id of ids) if (!sell.has(id) || isCached(sell.get(id))) sell.set(id, null);
         gmSet(STORE.sellCache, sellCachePut(gmGet(STORE.sellCache, {}), (res && res.items) || [], now));
         lastError = null;
@@ -3162,7 +3200,8 @@
           // 0.8.18: show the last prices this page saw instead of nothing (labelled, and
           // Fill won't type them once they're over 10 minutes old).
           const cached = sellCacheGet(gmGet(STORE.sellCache, {}), ids.filter((id) => !sell.has(id)), Date.now());
-          for (const [id, item] of cached) sell.set(id, item);
+          if (isManage()) for (const r of rows()) if (r.itemId && !savedPrices.has(r.itemId)) savedPrices.set(r.itemId, listedPrice(r.price));
+          for (const [id, item] of cached) sell.set(id, isManage() ? withBestPrice(item, Date.now(), savedPrices.get(id)) : item);
           retryAfter = Date.now() + SELL_RETRY_MS;
           // Torn's bazaar page can sit still, so don't wait for a DOM change to ask again.
           if (IS_BROWSER) setTimeout(() => { run().catch(() => {}); }, SELL_RETRY_MS + 50);
@@ -5112,7 +5151,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { mvName, pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, fixTarget, overCheapest, autoFillPicks, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { mvName, pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, fixTarget, bestPrice, withBestPrice, overCheapest, autoFillPicks, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

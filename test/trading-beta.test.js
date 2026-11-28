@@ -1037,3 +1037,22 @@ test("0.8.53 fixTarget: $1 under the cheapest when over it, never under the floo
   // Off (under the sell list), no fresh market → the sell-list price.
   assert.deepEqual(tr.fixTarget(20000, { sellAt: 25000 }, null, now, true), { price: 25000, stuck: false });
 });
+
+test("0.8.56 bestPrice: sell list, or $1 under the cheapest bazaar, never under the floor, never undercut yourself", () => {
+  const now = Date.parse("2026-11-28T19:00:00Z");
+  const mk = (cheapest) => ({ cheapest, listings: 5, bazaarAverage: cheapest, capturedAt: new Date(now - 10 * 60000).toISOString() });
+  // Toner: sell list $333, cheapest $300 (someone else) → $299.
+  assert.deepEqual(tr.bestPrice({ sellAt: 333, floor: 0 }, mk(300), now, 327), { price: 299, listPrice: 333, under: true, stuck: false });
+  // Thermite: sell list $94,337, cheapest $91,000, floor $91,800 → held at the floor.
+  assert.deepEqual(tr.bestPrice({ sellAt: 94337, floor: 91800 }, mk(91000), now, 97998), { price: 91800, listPrice: 94337, under: true, stuck: true });
+  // Under the cheapest already: the sell list.
+  assert.deepEqual(tr.bestPrice({ sellAt: 14998 }, mk(15200), now, 14849), { price: 14998, listPrice: 14998, under: false, stuck: false });
+  // You ARE the cheapest ($300 saved, cheapest $300): keep $300, don't undercut yourself.
+  assert.deepEqual(tr.bestPrice({ sellAt: 333 }, mk(300), now, 300), { price: 300, listPrice: 333, under: true, stuck: false });
+  // ...but a lower sell list still wins.
+  assert.equal(tr.bestPrice({ sellAt: 280 }, mk(300), now, 300).price, 280);
+  // No market: the sell list.
+  assert.equal(tr.bestPrice({ sellAt: 333 }, null, now, 327).price, 333);
+  const it = tr.withBestPrice({ itemId: 1, sellAt: 333, market: mk(300) }, now, 327);
+  assert.equal(it.sellAt, 299); assert.equal(it.listSellAt, 333);
+});
