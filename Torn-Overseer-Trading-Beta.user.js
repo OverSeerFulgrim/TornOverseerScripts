@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.47
+// @version      0.8.48
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -2610,7 +2610,7 @@
         if (vs.label && !manage) box.append(el("span", { class: `totr-vs totr-vs--${vs.band}`, title: vs.title }, vs.label));
         else if (vs.label) vsTitle = [`Sell-list price vs the cheapest bazaar: ${vs.label}`, vs.title].filter(Boolean).join(" — ");
       } else {
-        box.append(el("span", { class: "totr-muted", title: (s && s.ruleLabel) || "" }, s && s.reason === "unknown_category" ? "Open the Bazaar tab on the site" : "Priced by hand"));
+        box.append(el("span", { class: "totr-muted", title: (s && s.ruleLabel) || "" }, s && s.reason === "unknown_category" ? "Open the Bazaar tab on the site" : s && s.reason === "priced_by_hand" ? "Not selling" : "Priced by hand"));
       }
       box.append(el("button", { class: "totr-dollar", type: "button", "aria-label": "Quick prices", onclick: (e) => openPopup(r, e.currentTarget) }, "$"));
       box.append(el("span", { class: "totr-bz-state", "data-totr-state": "1", "data-totr-vs": vsTitle || null }));
@@ -2948,10 +2948,11 @@
     function statusLine(list) {
       let line = document.getElementById("totr-bzline");
       const loaded = list.filter((r) => sell.get(r.itemId));
-      const byHand = loaded.filter((r) => sell.get(r.itemId).sellAt == null).length;
+      const byHand = loaded.filter((r) => sell.get(r.itemId).sellAt == null && sell.get(r.itemId).reason !== "priced_by_hand").length;
+      const notSelling = loaded.filter((r) => sell.get(r.itemId).reason === "priced_by_hand").length;
       const oldest = loaded.reduce((m, r) => { const s = sell.get(r.itemId); return isCached(s) ? Math.min(m, s.cachedAt) : m; }, Infinity);
       const cachedNote = Number.isFinite(oldest) ? ` · showing prices from ${agoText(Date.now() - oldest)}, refreshing…` : "";
-      const text = lastError ? `Overseer: ${lastError}${cachedNote}` : `Overseer prices from your sell list${byHand ? ` · ${byHand} priced by hand` : ""}${stockNote ? ` · ${stockNote}` : ""} · v${VERSION}`;
+      const text = lastError ? `Overseer: ${lastError}${cachedNote}` : `Overseer prices from your sell list${byHand ? ` · ${byHand} priced by hand` : ""}${notSelling ? ` · ${notSelling} not selling` : ""}${stockNote ? ` · ${stockNote}` : ""} · v${VERSION}`;
       if (line && line.isConnected) { if (line.textContent !== text) line.textContent = text; return; }
       const anchor = listAnchor(list);
       if (!anchor) return;
