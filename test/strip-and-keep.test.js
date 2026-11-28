@@ -261,3 +261,26 @@ test("Manage (0.8.52): PRICE FILL button, green box, UNDO FILL; red box and red 
   assert.equal(input(weight).value, "279");
   assert.ok(btn(/ALL ON TARGET/));
 });
+
+test("Manage (0.8.55): Torn's Undo changes puts back prices the script typed; Save Changes is the new baseline", async () => {
+  const html = `<div><span>Manage your Bazaar</span></div><div><button class="save">Save Changes</button><span class="undo">Undo changes</span></div>` + MANAGE_HTML.replace(/^<div><span>Manage your Bazaar<\/span><\/div>/, "");
+  const { doc } = page("https://www.torn.com/bazaar.php#/manage", html, addAnswer);
+  await tick(400);
+  const weight = doc.querySelectorAll("li")[1];
+  const input = weight.querySelector("input");
+  const btn = (re) => [...doc.querySelectorAll("#totr-hlinks button")].find((b) => re.test(b.textContent));
+  btn(/PRICE FILL 1/).click();
+  await tick(250);
+  assert.equal(input.value, "300");
+  doc.querySelector(".undo").click();
+  await tick(250);
+  assert.equal(input.value, "350", "Torn's Undo changes restored the saved price");
+  assert.ok(!btn(/UNDO FILL/));
+  btn(/PRICE FILL 1/).click();
+  await tick(250);
+  doc.querySelector("button.save").click();
+  await tick(150);
+  doc.querySelector(".undo").click();
+  await tick(250);
+  assert.equal(input.value, "300", "after Save, Undo has nothing of ours to put back");
+});

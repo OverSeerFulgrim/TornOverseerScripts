@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.54
+// @version      0.8.55
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -2636,6 +2636,7 @@
 
     function decorate(r) {
       if (!r.itemId) return;
+      if (isManage() && !savedPrices.has(r.itemId)) savedPrices.set(r.itemId, listedPrice(r.price));
       const s = sell.get(r.itemId);
       if (s === undefined) return; // not loaded yet
       const stale = s && s.sellAt != null && !canFillFrom(s, Date.now());
@@ -2744,6 +2745,31 @@
       headerLinks(rows());
     }
     const undoable = () => [...autoFilled.values()].filter((a) => !a.undone).length;
+    // 0.8.55: Torn's own "Undo changes" did nothing to prices the script typed — Torn resets its
+    // copy, but the boxes kept our numbers. Manage remembers each row's price as first seen (the
+    // saved one); after Torn's Undo changes runs, any box still differing gets it back. Save
+    // Changes makes the current prices the new baseline.
+    const savedPrices = new Map();
+    function tornUndo() {
+      for (const r of rows()) {
+        if (!savedPrices.has(r.itemId)) continue;
+        const was = savedPrices.get(r.itemId);
+        if (listedPrice(r.price) === was) continue;
+        if (was != null) setNativeValue(r.price, was); else clearNativeValue(r.price);
+        refresh(r);
+      }
+      autoFilled.forEach((a) => { a.undone = true; });
+      headerLinks(rows());
+    }
+    if (IS_BROWSER) {
+      document.addEventListener("click", (e) => {
+        if (!isManage() || !e.target || !e.target.closest || e.target.closest("[data-totr-ui]")) return;
+        const hit = e.target.closest("a, button, span, div");
+        const text = hit ? (hit.textContent || "").trim() : "";
+        if (/^undo changes$/i.test(text)) setTimeout(tornUndo, 60);
+        else if (/^save changes$/i.test(text)) setTimeout(() => { savedPrices.clear(); autoFilled.clear(); for (const r of rows()) savedPrices.set(r.itemId, listedPrice(r.price)); headerLinks(rows()); }, 60);
+      }, true);
+    }
 
     function refresh(r) {
       const tag = r.row.querySelector("[data-totr-state]");
