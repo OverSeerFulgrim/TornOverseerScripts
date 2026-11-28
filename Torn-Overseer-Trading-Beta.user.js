@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Overseer Trading (beta)
 // @namespace    torn-overseer
-// @version      0.8.49
+// @version      0.8.50
 // @description  Beta of the Overseer trading module: prices trades from your Overseer pricelist, fills your bazaar from your Overseer sell list, shows cheaper bazaars on the item market, a Price check on any item, after-fee profit on the stock market, and deal alerts for your buy list on every page. Fills boxes only — never presses a Torn button for you.
 // @author       OverSeerFulgrim
 // @license      All rights reserved
@@ -626,9 +626,11 @@
    * and "−15.0% vs MV".
    */
   function pctMvLabel(pct) { return `${Math.round(100 + pct)}% MV`; }
-  function stripPctLook(pct, dealPct, stock, nowMs) {
+  /** 0.8.50: which market value Overseer priced against ("Your prices follow" on Setup). */
+  function mvName(source) { return source === "te_mv" ? "TE's market value" : "Torn's market value"; }
+  function stripPctLook(pct, dealPct, stock, nowMs, source) {
     const dealLine = -(100 - dealPct);
-    const of = `${Math.round(100 + pct)}% of Torn's market value`;
+    const of = `${Math.round(100 + pct)}% of ${mvName(source)}`;
     if (pct > 0) return { cls: "totr-chip--warn", title: `${of}: over it` };
     if (pct > dealLine) return { cls: "totr-chip--dim", title: `${of}: under it, but not at your deal line (${dealPct}%)` };
     const stuck = notSellingLine(stock, nowMs);
@@ -2897,7 +2899,7 @@
     function applyUseFilter(list) {
       for (const r of list) {
         const s = sell.get(r.itemId);
-        const hide = !matchesUse(s ? s.uses : null, useFilter);
+        const hide = useFilter === "ready" ? !readyToFill(r) : useFilter === "unpriced" ? !notPriced(r) : !matchesUse(s ? s.uses : null, useFilter);
         const slot = slotOf(r);
         if (slot !== r.row && r.row.dataset.totrUseHidden === "1") { delete r.row.dataset.totrUseHidden; r.row.style.display = ""; }
         if (hide && slot.dataset.totrUseHidden !== "1") { slot.dataset.totrUseHidden = "1"; slot.style.display = "none"; }
@@ -2925,8 +2927,23 @@
         n.dataset.totrMoved = n.style.translate;
       });
     }
+    /**
+     * 0.8.50 (plan step 14, the approved "Bazaar Add page — condensed rows and filters" mockup):
+     * state chips beside the use colours. Ready to fill = has a fresh sell-list price that is not
+     * already typed (and, on Add, something left to list after Keep 1). Not priced = no sell-list
+     * price: priced by hand, switched off, or unknown.
+     */
+    function readyToFill(r) {
+      const s = sell.get(r.itemId);
+      if (!s || s.sellAt == null || !canFillFrom(s, Date.now())) return false;
+      if (priceMatches(listedPrice(r.price), s.sellAt)) return false;
+      return isManage() || listQty(r, false) > 0;
+    }
+    function notPriced(r) { const s = sell.get(r.itemId); return !!s && s.sellAt == null; }
     function useBar(list) {
       const counts = Object.fromEntries(ITEM_USES.map((u) => [u, 0]));
+      const ready = list.filter(readyToFill).length;
+      const unpriced = list.filter(notPriced).length;
       let any = false;
       for (const r of list) {
         const s = sell.get(r.itemId);
@@ -2934,12 +2951,18 @@
       }
       let bar = document.getElementById("totr-usebar");
       if (!any && useFilter == null) { bar?.remove(); return; } // an older server: no tags, no chips
-      const sig = `${useFilter}|${ITEM_USES.map((u) => counts[u]).join(",")}`;
+      const sig = `${useFilter}|${ready}|${unpriced}|${ITEM_USES.map((u) => counts[u]).join(",")}`;
       if (bar && bar.isConnected && bar.dataset.sig === sig) return;
       const pick = (u) => { useFilter = useFilter === u ? null : u; applyUseFilter(rows()); useBar(rows()); };
       const next = el("div", { id: "totr-usebar", class: "totr-usebar", "data-totr-ui": "1", "data-sig": sig },
         el("span", null, "Show"),
         el("button", { type: "button", "aria-pressed": String(useFilter == null), onclick: () => pick(null) }, "All"),
+        ready || useFilter === "ready"
+          ? el("button", { type: "button", "aria-pressed": String(useFilter === "ready"), title: "Rows with a sell-list price you haven't typed in yet", onclick: () => pick("ready") }, `Ready to fill ${ready}`)
+          : null,
+        unpriced || useFilter === "unpriced"
+          ? el("button", { type: "button", "aria-pressed": String(useFilter === "unpriced"), title: "Rows with no sell-list price: priced by hand, not selling, or no rule", onclick: () => pick("unpriced") }, `Not priced ${unpriced}`)
+          : null,
         ...ITEM_USES.filter((u) => counts[u] || useFilter === u).map((u) =>
           el("button", { type: "button", "aria-pressed": String(useFilter === u), title: USE_HINT[u], onclick: () => pick(u) }, el("span", { class: `totr-sq totr-sq--${u}` }), `${USE_LABEL[u]} ${counts[u]}`)));
       if (bar && bar.isConnected) { bar.replaceWith(next); return; }
@@ -3292,7 +3315,7 @@
         // 0.8.10: green only at or under your deal % of MV (−10% or better at the default 90) —
         // a −0.6% listing used to glow the same green as −17%, and read as a deal.
         if (pct == null) return null;
-        const { cls, title } = stripPctLook(pct, dealPct, d && d.stock, Date.now());
+        const { cls, title } = stripPctLook(pct, dealPct, d && d.stock, Date.now(), d && d.mvSource);
         return el("span", { class: "totr-chip " + cls, title }, pctMvLabel(pct));
       }
       // 0.8.31: judged against the live floor on this page — the other bazaars in this strip and
@@ -3623,7 +3646,7 @@
         else if (v && mode === "bazaar") { label = `RESELL +${fmtMoney(v.resale.profit)}`; cls = "ok"; title = v.title; }
         else if (!hasQuality(c.card) && marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now()) != null) {
           const n = marketPctDeal(mode, c.price, q.marketValue, dealPct, q.stock, Date.now());
-          label = `${n}% MV`; cls = "ok"; title = `${n}% of Torn's market value: at or under your deal line (${dealPct}%)`;
+          label = `${n}% MV`; cls = "ok"; title = `${n}% of ${mvName(q.mvSource)}: at or under your deal line (${dealPct}%)`;
         }
         if (!label) continue;
         c.card.style.boxShadow = cls === "buy" ? "inset 0 0 0 3px #4c8dff" : "inset 0 0 0 3px #5fe0a6";
@@ -4944,7 +4967,7 @@
 
   if (!IS_BROWSER) {
     if (typeof module === "object" && module && module.exports) {
-      module.exports = { pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
+      module.exports = { mvName, pctMvLabel, undersellAdvice, traderProfileUrl, QUOTE_CACHE_MS, lowCachePut, lowCacheGet, sheetSpot, changeKind, passWorthy, WATCH_NOISE, dealsPollDue, DEALS_CLAIM_MS, passDelay, marketPctDeal, stripPctLook, isTimeoutError, withRegion, RETRY_READS, sellCachePut, sellCacheGet, canFillFrom, SELL_CACHE_FILL_MS, keyStatusLabel, usesOf, keepsOne, keepQty, reserveQty, matchesUse, keepOffIds, toggleKeepOff, priceMatches, ITEM_USES, stripCards, stripCountLabel, stripMinHeight, STRIP_SHOW, isTradingPage, dealKey, unseenDeals, dealMinOf, splitDealsByMin, dealBadge, itemMarketDealFor, mergeDeals, pickMarketChecks, minutesAgo, priceLineIndex, liveMarketDeals, prefs, saveSessionToken, keyTag, vsCheapest, targetsAge, parseStock, maxAffordable, tradeSignature, routeFor, parseTradeHash, parseItemLine, parseItemNode, rarityFromClasses, pendingMoneyFor, fillMoneyBlocked, parseMoney, fmtMoney, clampPct, driftPct, manageVerdict, MANAGE_OFF_PCT, fixPrice, moneyGuard, compareVersions, stockSnapshotItems, snapshotDue, settleOnce, addFillEvent, tradeFillEvents, FILL_EVENT_CAP, netAfterFee, flipAtMarket, traderOver, notSellingLine, sellModeOf, showsMarketPct, resaleFor, resaleLabel, resaleVerdict, realisticResale, belowCost, itemMarketLowFrom, verdictIsGreen, bazaarWorth, prefillQty, freeLabel, balanceStock, isMaxLabel, stockSaleFee, stockPayout, stockLotNet, stockBreakeven, perkSharesFor, stockVerdict, perkWarning, sellPreview, portfolioSummary };
     }
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });

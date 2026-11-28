@@ -988,3 +988,11 @@ test("0.8.46: every % of market value chip reads \"85% MV\", and its tooltip nam
   assert.match(tr.stripPctLook(4, 90, null, now).title, /^104% of Torn's market value: over it$/);
   assert.match(tr.stripPctLook(-5, 90, null, now).title, /95% of Torn's market value: under it, but not at your deal line \(90%\)/);
 });
+
+test("0.8.50: chip tooltips name the market value Overseer priced against (Your prices follow)", () => {
+  const now = Date.parse("2026-11-27T12:00:00Z");
+  assert.equal(tr.mvName("te_mv"), "TE's market value");
+  assert.equal(tr.mvName("torn_mv"), "Torn's market value");
+  assert.equal(tr.mvName(undefined), "Torn's market value");
+  assert.match(tr.stripPctLook(-15, 90, null, now, "te_mv").title, /^85% of TE's market value: at or under your deal line/);
+});
